@@ -1501,12 +1501,14 @@ function dismissedInLane(rows, keyFn) {
 // no knowledge of locally dismissed rows. Subtract the user's dismissals so a
 // dismissed item also drops its tile/nav count — keeping the number in sync with
 // the filtered list. Only lanes with dismissable rows are adjusted (see
-// dismissKey): Failing CI workflow runs, and flagged/unknown pipeline traces.
+// dismissKey): Failing CI workflow runs, failed CD runs, and flagged/unknown
+// pipeline traces.
 function adjustedSummary(data) {
   const summary = (data && data.summary) || {};
   return {
     ...summary,
     failingPrs: Math.max(0, (summary.failingPrs ?? 0) - dismissedInLane(data?.actions?.failed, actionKey)),
+    failedCd: Math.max(0, (summary.failedCd ?? 0) - dismissedInLane(data?.cd?.failed, actionKey)),
     flaggedJourneys: Math.max(0, (summary.flaggedJourneys ?? 0) - dismissedInLane(data?.traces?.flagged, traceDismissKeys)),
     tracingUnknown: Math.max(0, (summary.tracingUnknown ?? 0) - dismissedInLane(data?.traces?.unknown, traceDismissKeys))
   };
@@ -1541,7 +1543,7 @@ function displayCounts(data) {
     runningPrs: filteredVisibleRows([...(data?.pullRequests?.running || []), ...(data?.actions?.running || [])]).length,
     runningCd: filteredVisibleRows(data?.cd?.running).length,
     finishedCd: filteredVisibleRows(data?.cd?.finished).length,
-    failedCd: filteredVisibleRows(data?.cd?.failed).length,
+    failedCd: filteredVisibleRows(data?.cd?.failed, actionKey).length,
     runningDeployments: filteredVisibleRows(data?.deployments?.running).length,
     busyRunners: filteredVisibleRows(data?.runners?.busy).length,
     flaggedJourneys: traceFlagged,
@@ -1697,12 +1699,14 @@ function render() {
 }
 
 // Returns stable dismiss keys for a dismissable row, else an empty array.
-// Failing-CI workflow runs are dismissable; so are flagged/unknown pipeline
-// traces. Trace rows also recognize legacy key shapes so older localStorage
-// dismissals keep hiding the same PR journey after app updates.
+// Failing-CI workflow runs are dismissable; so are failed CD runs and
+// flagged/unknown pipeline traces. Trace rows also recognize legacy key
+// shapes so older localStorage dismissals keep hiding the same PR journey
+// after app updates.
 function dismissKeys(row) {
   if (!row) return [];
   if (state.view === "fail" && row.kind === "workflowRun") return normalizeDismissKeys(actionKey(row));
+  if (state.view === "failedCd") return normalizeDismissKeys(actionKey(row));
   if (state.view === "pipelineTraces" && (row.status === "flagged" || row.status === "unknown")) {
     return traceDismissKeys(row);
   }
@@ -1931,8 +1935,11 @@ function renderCdRow(row, view, viewKey) {
     : timeDetail;
   const tagClass = viewKey === "failedCd" ? `tag tag-${statusClass(status)}` : "tag";
   const phaseBadge = renderPhaseBadge(row);
+  const keys = viewKey === "failedCd" ? dismissKeys(row) : [];
+  const dismissed = anyDismissed(keys);
+  const dismissButton = keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   return `
-    <article class="row${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
         <div class="repo">${escapeHtml(row.repo)}</div>
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
@@ -1940,7 +1947,10 @@ function renderCdRow(row, view, viewKey) {
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
       <div class="tag-group"><div class="${tagClass}">${escapeHtml(status)}</div>${phaseBadge}</div>
       <div class="meta">${escapeHtml(detail)}</div>
-      ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
+      <div class="row-actions">
+        ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
+        ${dismissButton}
+      </div>
     </article>
   `;
 }
