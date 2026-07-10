@@ -116,7 +116,22 @@ function workflowRun(repo, runNumber) {
   };
 }
 
-async function openDashboard({ view = "pipelineTraces", failedRuns = [] } = {}) {
+function cdRun(repo, runNumber) {
+  return {
+    repo,
+    workflow: "CD",
+    runNumber,
+    title: `CD run ${runNumber} on ${repo}`,
+    branch: "main",
+    status: "completed",
+    conclusion: "failure",
+    failureReason: "Deploy API to DOKS failed",
+    createdAt: "2026-06-04T11:00:00Z",
+    url: `https://github.com/${repo}/actions/runs/${runNumber}`
+  };
+}
+
+async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedCdRuns = [] } = {}) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
 
@@ -127,9 +142,16 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [] } = {}) 
     localStorage.removeItem("pr-deck:traces:v1");
   }, view);
 
-  const statusBody = failedRuns.length
-    ? { ...statusFixture, actions: { ...statusFixture.actions, failed: failedRuns } }
-    : statusFixture;
+  const statusBody = {
+    ...statusFixture,
+    summary: {
+      ...statusFixture.summary,
+      ...(failedRuns.length ? { failingPrs: failedRuns.length } : {}),
+      ...(failedCdRuns.length ? { failedCd: failedCdRuns.length } : {})
+    },
+    ...(failedRuns.length ? { actions: { ...statusFixture.actions, failed: failedRuns } } : {}),
+    ...(failedCdRuns.length ? { cd: { ...statusFixture.cd, failed: failedCdRuns } } : {})
+  };
 
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -218,6 +240,54 @@ test("Dismiss all works on the Failing CI lane (workflow-run rows)", { skip }, a
     await page.click("[data-restore-all]");
     await page.waitForSelector("[data-dismiss-all]");
     assert.equal(await page.locator("[data-dismiss-key]").count(), 2, "both runs restored");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Dismiss all works on the Failed CD lane", { skip }, async () => {
+  const { browser, page } = await openDashboard({
+    view: "failedCd",
+    failedCdRuns: [cdRun("acme/alpha", "#1"), cdRun("acme/bravo", "#2")]
+  });
+  try {
+    await page.waitForSelector("[data-dismiss-all]");
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 2, "both failed CD runs show a per-row Dismiss");
+    assert.match(await page.locator(".dismiss-bar-label").innerText(), /2 items shown/);
+    assert.equal(await page.locator("#navFailedCd").innerText(), "2", "nav count starts at 2");
+
+    await page.click("[data-dismiss-all]");
+    await page.waitForSelector("[data-restore-all]");
+    assert.match(await page.locator(".dismiss-bar-label").innerText(), /2 dismissed items/);
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 0, "no actionable rows remain visible");
+    assert.equal(await page.locator("#navFailedCd").innerText(), "0", "nav count drops to 0 once all are dismissed");
+
+    await page.click("[data-restore-all]");
+    await page.waitForSelector("[data-dismiss-all]");
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 2, "both failed CD runs restored");
+    assert.equal(await page.locator("#navFailedCd").innerText(), "2", "nav count restored");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Dismissing a single Failed CD run hides it and updates the nav count", { skip }, async () => {
+  const { browser, page } = await openDashboard({
+    view: "failedCd",
+    failedCdRuns: [cdRun("acme/alpha", "#1"), cdRun("acme/bravo", "#2")]
+  });
+  try {
+    await page.waitForSelector("[data-dismiss-key]");
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 2);
+
+    await page.locator("[data-dismiss-key]").first().click();
+    await page.waitForFunction(() => document.querySelectorAll("[data-dismiss-key]").length === 1);
+    assert.equal(await page.locator("#navFailedCd").innerText(), "1", "nav count drops after a single dismiss");
+    assert.equal(await page.locator("[data-dismiss-all]").count(), 0, "no bulk control for a lone remaining row");
+
+    await page.locator("[data-dismiss-key]").first().click();
+    await page.waitForFunction(() => document.querySelectorAll("[data-dismiss-key]").length === 0);
+    assert.equal(await page.locator("#navFailedCd").innerText(), "0", "nav count drops to 0 after both dismissed");
   } finally {
     await browser.close();
   }
