@@ -239,7 +239,7 @@ test("dismissed pipeline traces stay dismissed after a server restart (reload)",
 test("legacy trace dismiss keys still hide the same PR journey", { skip }, async () => {
   const { browser, page } = await openDashboard({
     view: "pipelineTraces",
-    dismissed: { "trace:acme/bravo:2": "2026-06-10T12:00:00Z" }
+    dismissed: { "trace:acme/bravo:2": new Date().toISOString() }
   });
   try {
     await page.click('button[data-trace-filter="unknown"]');

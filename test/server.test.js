@@ -969,6 +969,60 @@ test("pipeline traces flag merged PRs that do not complete production CD", () =>
   assert.match(traces.flagged[0].reason, /deploy failed/);
 });
 
+test("pipeline traces flag running workflows only after four hours", () => {
+  const now = Date.parse("2026-06-01T12:00:00Z");
+  const openPr = {
+    repo: "acme/app",
+    number: 14,
+    numberLabel: "#14",
+    title: "Run long CI",
+    url: "https://github.com/acme/app/pull/14",
+    state: "running",
+    createdAt: "2026-06-01T07:00:00Z",
+    updatedAt: "2026-06-01T08:00:00Z"
+  };
+  const mergedPr = {
+    pr: {
+      number: 15,
+      title: "Run long CD",
+      html_url: "https://github.com/acme/app/pull/15",
+      merged_at: "2026-06-01T07:00:00Z",
+      merge_commit_sha: "def456",
+      base: { ref: "main" },
+      user: { login: "dev" }
+    }
+  };
+  const runningCd = {
+    repo: "acme/app",
+    workflow: "Deploy Production",
+    runNumber: "#46",
+    status: "in_progress",
+    branch: "main",
+    headSha: "def456",
+    createdAt: "2026-06-01T08:00:00Z",
+    updatedAt: "2026-06-01T11:59:00Z",
+    url: "https://github.com/acme/app/actions/runs/46"
+  };
+
+  const atFourHours = buildPipelineTraces({
+    now,
+    pullRequests: [openPr],
+    mergedPullRequestsByRepo: new Map([["acme/app", [mergedPr]]]),
+    cdRowsByRepo: new Map([["acme/app", [runningCd]]])
+  });
+  assert.equal(atFourHours.flagged.length, 0);
+  assert.equal(atFourHours.active.length, 2);
+
+  const overFourHours = buildPipelineTraces({
+    now: now + 1,
+    pullRequests: [openPr],
+    mergedPullRequestsByRepo: new Map([["acme/app", [mergedPr]]]),
+    cdRowsByRepo: new Map([["acme/app", [runningCd]]])
+  });
+  assert.equal(overFourHours.flagged.length, 2);
+  assert.ok(overFourHours.flagged.every((trace) => /still running/i.test(trace.reason)));
+});
+
 test("pipeline traces mark successful production CD as completed", () => {
   const traces = buildPipelineTraces({
     now: Date.parse("2026-06-01T12:00:00Z"),
