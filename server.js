@@ -218,9 +218,9 @@ const RUNNING_DEPLOYMENT_STATES = new Set(["queued", "pending", "in_progress"]);
 const SUCCESSFUL_DEPLOYMENT_STATES = new Set(["success"]);
 const AUTO_MERGE_DELAY_MS = 15 * 1000;
 const AUTO_MERGE_SCAN_MS = 60 * 1000;
-const TRACE_CI_SLA_MS = 30 * 60 * 1000;
+const TRACE_CI_SLA_MS = 4 * 60 * 60 * 1000;
 const TRACE_CD_START_SLA_MS = 15 * 60 * 1000;
-const TRACE_PROD_COMPLETE_SLA_MS = 45 * 60 * 1000;
+const TRACE_PROD_COMPLETE_SLA_MS = 4 * 60 * 60 * 1000;
 const FAILURE_REASON_LABELS = {
   FAILURE: "failed",
   ERROR: "errored",
@@ -2037,7 +2037,7 @@ function buildOpenPullRequestTrace(pr, { now = Date.now() } = {}) {
     lastEvidenceAt: pr.updatedAt || startedAt,
     nextAction: { label: "Open PR", url: pr.url },
     evidence: [traceEvidence("pull_request", `${pr.numberLabel} opened`, pr.url, startedAt)],
-    rule: { source: "auto", maxStageAgeMinutes: 30 },
+    rule: { source: "auto", maxStageAgeMinutes: TRACE_CI_SLA_MS / 60000 },
     stages: baseStages
   };
 

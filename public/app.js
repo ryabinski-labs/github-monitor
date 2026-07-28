@@ -18,15 +18,15 @@ const NOTIFIED_MAX = 1000;
 const PHASE_AGE_MAX = 500;
 const PHASE_AGE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PHASE_THRESHOLDS_MS = {
-  ci_running: 30 * 60 * 1000,
+  ci_running: 4 * 60 * 60 * 1000,
   merge_pending: 2 * 60 * 1000,
   auto_merge_waiting: 5 * 60 * 1000,
   passing_ci: 8 * 60 * 60 * 1000,
   no_ci: 24 * 60 * 60 * 1000,
   failing_ci: 2 * 60 * 60 * 1000,
   conflicts: 24 * 60 * 60 * 1000,
-  action_running: 30 * 60 * 1000,
-  cd_running: 45 * 60 * 1000,
+  action_running: 4 * 60 * 60 * 1000,
+  cd_running: 4 * 60 * 60 * 1000,
   deployment_running: 45 * 60 * 1000,
   runner_busy: 2 * 60 * 60 * 1000
 };
@@ -726,7 +726,7 @@ function decoratePhase(row, phase, key, fallbackEnteredAt = "") {
     phaseEnteredAt: entry?.enteredAt || "",
     phaseAgeMs: ageMs,
     phaseThresholdMs: thresholdMs,
-    phaseStale: Boolean(thresholdMs && ageMs >= thresholdMs)
+    phaseStale: Boolean(thresholdMs && ageMs > thresholdMs)
   };
 }
 
