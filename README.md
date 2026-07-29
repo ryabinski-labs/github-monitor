@@ -82,6 +82,7 @@ Token scopes you need depend on what you want to see:
 | Read-only PR & Actions monitoring | Repository read |
 | Self-hosted runner visibility | Actions runner access (owner or repo) |
 | Merging PRs from the dashboard | Write to the target repository |
+| Optional deep-queue Dependabot cleanup | Actions and pull requests write |
 
 > GitHub App permissions for the equivalent capabilities are documented in [docs/github-app-setup.md](docs/github-app-setup.md).
 
@@ -97,6 +98,7 @@ Token scopes you need depend on what you want to see:
 - Quota-aware pausing: when quota runs low, auto-refresh pauses and the manual refresh button is disabled until the reset window
 - Browser notifications and an in-app inbox for CI/CD completions and new conflicts
 - Optional **auto-merge** countdown for passing PRs with completed checks
+- Optional automatic Dependabot cleanup when queued CI/CD workflows reach the configured threshold
 
 ## How it works
 
@@ -125,6 +127,8 @@ flowchart LR
 
 **Dismissing runs.** Only the *latest* completed run per lane (workflow + branch) surfaces under Failing CI, so a retried-and-passed run resolves the failure and stale older failures don't pile up. Remaining failing runs (post-merge CI, Dependabot, etc.) can be dismissed to clear them from the list; use **Show** in the dismissed bar to review or **Restore** them. Dismissals are a per-user view preference kept in your browser's `localStorage` and auto-expire after 30 days — there is deliberately **no server-side or external database** (e.g. DynamoDB), keeping the tool local-first and zero-dependency. Because they live in `localStorage`, dismissals **survive restarting the server and reloading the page**, but are scoped to that one browser profile — a different browser, machine, or incognito window starts with a clean slate. A dismissed lane reappears on its own if a brand-new run later fails.
 
+**Deep-queue cleanup.** This destructive server-side policy is **disabled by default**. Set `DEPENDABOT_QUEUE_THRESHOLD` to a positive integer to opt in. Once enabled, the server checks the selected owners every minute; when that many unique GitHub Actions runs are queued, it cancels every active Dependabot-triggered workflow run and closes every open Dependabot PR in scope. Discovery is paginated, cleanup attempts have a five-minute cooldown, and low GitHub API quota pauses mutation. Use `DEPENDABOT_QUEUE_OWNERS` as a comma-separated owner allowlist; when omitted, all owners accessible to the credential are included. The credential must have Actions and pull-request write access.
+
 ## Configuration
 
 All optional except your chosen auth path. Set via environment or `.env`.
@@ -136,6 +140,8 @@ All optional except your chosen auth path. Set via environment or `.env`.
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Path to the App's private key (`0600`, kept outside the repo) |
 | `PORT` | Dashboard port (default `4177`) |
 | `OPEN_PRS_JOBS` | Parallelism for the open-PR scan |
+| `DEPENDABOT_QUEUE_THRESHOLD` | Queued workflow-run depth (`1`–`5000`) that enables and triggers Dependabot cleanup (disabled by default) |
+| `DEPENDABOT_QUEUE_OWNERS` | Optional comma-separated owner allowlist for automatic cleanup |
 | `ETAG_CACHE_DISABLED` | Set to `1` to disable conditional-request caching (debugging) |
 
 ### Dashboard controls

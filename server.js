@@ -9,6 +9,11 @@ import { fileURLToPath } from "node:url";
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
+try {
+  process.loadEnvFile(join(__dirname, ".env"));
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
 const publicDir = join(__dirname, "public");
 const port = Number(process.env.PORT || 4177);
 const githubApiBase = "https://api.github.com";
@@ -210,6 +215,13 @@ const PRODUCTION_TARGET_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const MERGED_PR_CACHE_TTL_MS = 10 * 60 * 1000;
 const RECENT_COMMIT_CACHE_TTL_MS = 5 * 60 * 1000;
 const RUNNING_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
+const DEPENDABOT_LOGIN = "dependabot[bot]";
+const DEPENDABOT_QUEUE_MAX_THRESHOLD = 5000;
+const DEPENDABOT_QUEUE_THRESHOLD = parseDependabotQueueThreshold(process.env.DEPENDABOT_QUEUE_THRESHOLD);
+const DEPENDABOT_QUEUE_OWNERS = parseOwners(process.env.DEPENDABOT_QUEUE_OWNERS);
+const DEPENDABOT_CLEANUP_COOLDOWN_MS = 5 * 60 * 1000;
+const DEPENDABOT_QUEUE_SCAN_MS = 60 * 1000;
+const DEPENDABOT_CLEANUP_JOBS = 4;
 const FAILED_RUN_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
 const SKIPPED_RUN_CONCLUSIONS = new Set(["skipped"]);
 const FAILED_JOB_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
@@ -253,6 +265,18 @@ const autoMergeState = {
   running: false,
   timer: null,
   lastScanAt: null,
+  lastError: ""
+};
+
+const dependabotCleanupState = {
+  running: false,
+  timer: null,
+  queueDepth: 0,
+  lastAttemptAt: 0,
+  blockedUntil: 0,
+  lastScanAt: null,
+  lastCompletedAt: null,
+  lastResult: null,
   lastError: ""
 };
 
@@ -463,7 +487,10 @@ async function getInstallationToken(ownerHint) {
     throw new Error("GitHub App has no installations. Install the app on at least one account.");
   }
   const lookupKey = ownerHint ? String(ownerHint).toLowerCase() : null;
-  const installation = (lookupKey && installations.get(lookupKey)) || installations.values().next().value;
+  if (lookupKey && !installations.has(lookupKey)) {
+    throw new HttpError(403, `GitHub App is not installed for owner ${ownerHint}.`);
+  }
+  const installation = lookupKey ? installations.get(lookupKey) : installations.values().next().value;
   const cacheKey = installation.accountLogin.toLowerCase();
   const nowSeconds = Math.floor(Date.now() / 1000);
   const cached = installationTokensByOwner.get(cacheKey);
@@ -708,6 +735,13 @@ function quotaState(rateLimit) {
   return { status: "ok", blocked: false, tightest, resetAt, retryAfterSeconds: 0 };
 }
 
+function currentQuotaIsBlocked() {
+  const quota = quotaState(snapshotRateLimit(scanMetrics.getStore() || createScanMetrics()));
+  if (!quota.blocked) return false;
+  const resetAt = new Date(quota.resetAt || 0).getTime();
+  return !Number.isFinite(resetAt) || resetAt > Date.now();
+}
+
 function recommendRefresh(summary, options, rateLimit) {
   const activeCount = summary.runningPrs + summary.runningCd + summary.runningDeployments + summary.busyRunners;
   const problemCount = summary.failingPrs + summary.failedCd;
@@ -789,6 +823,20 @@ async function githubRestAll(path, pickItems, perPage = 100, query = {}, ownerHi
   return results;
 }
 
+async function githubRestAllWithinQuota(path, pickItems, perPage = 100, query = {}, ownerHint) {
+  const results = [];
+  for (let page = 1; page <= 50; page += 1) {
+    if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for Dependabot cleanup.");
+    const json = await githubRestPage(path, page, perPage, query, ownerHint);
+    if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for Dependabot cleanup.");
+    const items = pickItems(json);
+    if (!items.length) break;
+    results.push(...items);
+    if (items.length < perPage) break;
+  }
+  return results;
+}
+
 async function mapLimit(items, limit, mapper) {
   const output = [];
   let index = 0;
@@ -827,6 +875,33 @@ function parseJobs(value) {
   const jobs = Number(value || process.env.OPEN_PRS_JOBS || 4);
   if (!Number.isInteger(jobs) || jobs < 1) return 4;
   return Math.min(jobs, 16);
+}
+
+function parseDependabotQueueThreshold(value, fallback = 0) {
+  if (value == null || value === "") return fallback;
+  const threshold = Number(value);
+  if (!Number.isInteger(threshold) || threshold < 0 || threshold > DEPENDABOT_QUEUE_MAX_THRESHOLD) return fallback;
+  return threshold;
+}
+
+function isDependabotLogin(value) {
+  return String(value || "").toLowerCase() === DEPENDABOT_LOGIN;
+}
+
+function isDependabotWorkflowRun(run) {
+  return isDependabotLogin(run?.actor?.login || run?.actor) ||
+    isDependabotLogin(run?.triggering_actor?.login || run?.triggeringActor);
+}
+
+function dependabotQueueDepth(runs) {
+  return uniqueBy(
+    (runs || []).filter((run) => run?.status === "queued"),
+    (run) => `${run.repo || ""}:${run.runId || run.id || run.url || JSON.stringify(run)}`
+  ).length;
+}
+
+function shouldCleanDependabotQueue(queueDepth, threshold = DEPENDABOT_QUEUE_THRESHOLD) {
+  return threshold > 0 && queueDepth >= threshold;
 }
 
 function parseOwners(value) {
@@ -1578,8 +1653,7 @@ async function selectedOwners(me, ownerFilter) {
   const all = await allOwners(me);
   if (!ownerFilter || !ownerFilter.length) return all;
   const wanted = new Set(ownerFilter.map((value) => String(value).toLowerCase()));
-  const filtered = all.filter((owner) => wanted.has(owner.toLowerCase()));
-  return filtered.length ? filtered : all;
+  return all.filter((owner) => wanted.has(owner.toLowerCase()));
 }
 
 function openPullRequestSearchQuery(qualifier, value) {
@@ -2618,6 +2692,232 @@ async function fetchBusyRunners({ includeRepoRunners, repos, pullRequests, mode,
   );
 }
 
+async function fetchDependabotWorkloadForRepo(repo) {
+  const errors = [];
+  const pullRequests = await githubRestAllWithinQuota(
+    `/repos/${repo}/pulls`,
+    (json) => (Array.isArray(json) ? json : []),
+    100,
+    { state: "open" }
+  ).catch((error) => {
+    errors.push(`${repo} pull requests: ${error.message}`);
+    return [];
+  });
+  const runGroups = await mapLimit([...RUNNING_RUN_STATUSES], 2, async (status) => {
+    try {
+      return await githubRestAllWithinQuota(
+        `/repos/${repo}/actions/runs`,
+        (json) => json?.workflow_runs || [],
+        100,
+        { status }
+      );
+    } catch (error) {
+      errors.push(`${repo} ${status} runs: ${error.message}`);
+      return [];
+    }
+  });
+  return {
+    pullRequests: pullRequests
+      .filter((pr) => isDependabotLogin(pr.user?.login))
+      .map((pr) => ({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" })),
+    runs: uniqueBy(runGroups.flat().filter(isDependabotWorkflowRun), (run) => run.id)
+      .map((run) => ({
+        repo,
+        runId: run.id,
+        workflow: run.name || "Workflow",
+        url: run.html_url || ""
+      })),
+    errors
+  };
+}
+
+async function cleanupDependabotWorkload({ repos, jobs = 4 }) {
+  const groups = await mapLimit(repos || [], jobs, fetchDependabotWorkloadForRepo);
+  const pullRequests = uniqueBy(groups.flatMap((group) => group.pullRequests), (pr) => `${pr.repo}#${pr.number}`);
+  const runs = uniqueBy(groups.flatMap((group) => group.runs), (run) => `${run.repo}:${run.runId}`);
+  const errors = groups.flatMap((group) => group.errors || []);
+  if (currentQuotaIsBlocked()) {
+    errors.push("GitHub API quota became too low before Dependabot mutations started.");
+    return { closedPullRequests: [], cancelledRuns: [], errors };
+  }
+
+  const cancelledRuns = (await mapLimit(runs, jobs, async (run) => {
+    try {
+      if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for cancellation.");
+      await githubRequest(`/repos/${run.repo}/actions/runs/${run.runId}/cancel`, { method: "POST" });
+      return run;
+    } catch (error) {
+      if (error.status !== 404 && error.status !== 409) {
+        errors.push(`${run.repo} run ${run.runId}: ${error.message}`);
+      }
+      return null;
+    }
+  })).filter(Boolean);
+
+  const closedPullRequests = (await mapLimit(pullRequests, jobs, async (pr) => {
+    try {
+      if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for pull request closure.");
+      const result = await githubRequest(`/repos/${pr.repo}/pulls/${pr.number}`, {
+        method: "PATCH",
+        body: { state: "closed" }
+      });
+      if (result?.state !== "closed") throw new Error("GitHub did not close the pull request");
+      autoMergeState.candidates.delete(autoMergeKey(pr.repo, pr.number));
+      return pr;
+    } catch (error) {
+      errors.push(`${pr.repo}#${pr.number}: ${error.message}`);
+      return null;
+    }
+  })).filter(Boolean);
+
+  for (const repo of repos || []) {
+    githubValueCache.delete(`actions:${repo}`);
+    for (const key of githubValueCache.keys()) {
+      if (key.startsWith(`workflow-runs:${repo}:`)) githubValueCache.delete(key);
+    }
+  }
+
+  return { closedPullRequests, cancelledRuns, errors };
+}
+
+function dependabotCleanupSnapshot() {
+  return {
+    enabled: DEPENDABOT_QUEUE_THRESHOLD > 0,
+    threshold: DEPENDABOT_QUEUE_THRESHOLD,
+    owners: DEPENDABOT_QUEUE_OWNERS,
+    queueDepth: dependabotCleanupState.queueDepth,
+    running: dependabotCleanupState.running,
+    lastScanAt: dependabotCleanupState.lastScanAt,
+    blockedUntil: dependabotCleanupState.blockedUntil
+      ? new Date(dependabotCleanupState.blockedUntil).toISOString()
+      : null,
+    lastCompletedAt: dependabotCleanupState.lastCompletedAt,
+    closedPullRequests: dependabotCleanupState.lastResult?.closedPullRequests.length || 0,
+    cancelledRuns: dependabotCleanupState.lastResult?.cancelledRuns.length || 0,
+    lastError: dependabotCleanupState.lastError
+  };
+}
+
+async function fetchQueuedRunsForRepo(repo, limit) {
+  const runs = [];
+  for (let page = 1; page <= 50; page += 1) {
+    if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for queue discovery.");
+    const json = await githubRestPage(`/repos/${repo}/actions/runs`, page, 100, { status: "queued" });
+    if (currentQuotaIsBlocked()) throw new HttpError(429, "GitHub API quota is too low for queue discovery.");
+    const items = json?.workflow_runs || [];
+    runs.push(...items);
+    if (items.length < 100 || runs.length >= limit) break;
+  }
+  return runs.map((run) => ({ repo, runId: run.id || null, status: run.status || "", url: run.html_url || "" }));
+}
+
+async function runDependabotQueueScan({
+  threshold = DEPENDABOT_QUEUE_THRESHOLD,
+  owners = DEPENDABOT_QUEUE_OWNERS,
+  jobs = DEPENDABOT_CLEANUP_JOBS,
+  now = Date.now()
+} = {}) {
+  if (threshold <= 0 || dependabotCleanupState.running) return null;
+  if (now < dependabotCleanupState.blockedUntil) return null;
+  if (dependabotCleanupState.lastAttemptAt && now - dependabotCleanupState.lastAttemptAt < DEPENDABOT_CLEANUP_COOLDOWN_MS) {
+    return null;
+  }
+  const knownQuota = quotaState(snapshotRateLimit(createScanMetrics()));
+  const knownResetAt = new Date(knownQuota.resetAt || 0).getTime();
+  if (knownQuota.blocked && (!Number.isFinite(knownResetAt) || knownResetAt > now)) {
+    dependabotCleanupState.lastError = "Dependabot cleanup paused because GitHub API quota is low.";
+    dependabotCleanupState.blockedUntil = Number.isFinite(knownResetAt)
+      ? Math.max(now + DEPENDABOT_CLEANUP_COOLDOWN_MS, knownResetAt + 30 * 1000)
+      : now + DEPENDABOT_CLEANUP_COOLDOWN_MS;
+    return null;
+  }
+  dependabotCleanupState.running = true;
+  dependabotCleanupState.lastError = "";
+  try {
+    const metrics = createScanMetrics();
+    let repos = [];
+    let repositoryErrors = [];
+    let queuedGroups = [];
+    await scanMetrics.run(metrics, async () => {
+      const me = await getAccount();
+      const selected = await selectedOwners(me, owners);
+      if (owners.length && !selected.length) {
+        throw new Error("No DEPENDABOT_QUEUE_OWNERS matched an accessible GitHub owner.");
+      }
+      const repoGroups = await mapLimit(selected, jobs, async (owner) => {
+        try {
+          return { repos: await fetchOwnerRepos(owner, me), errors: [] };
+        } catch (error) {
+          return { repos: [], errors: [`${owner} repositories: ${error.message}`] };
+        }
+      });
+      repos = [...new Set(repoGroups.flatMap((group) => group.repos))].sort();
+      repositoryErrors = repoGroups.flatMap((group) => group.errors);
+      queuedGroups = await mapLimit(repos, jobs, async (repo) => {
+        try {
+          return { runs: await fetchQueuedRunsForRepo(repo, threshold), errors: [] };
+        } catch (error) {
+          return { runs: [], errors: [`${repo} queued runs: ${error.message}`] };
+        }
+      });
+    });
+    const queuedRuns = queuedGroups.flatMap((group) => group.runs);
+    const discoveryErrors = [...repositoryErrors, ...queuedGroups.flatMap((group) => group.errors)];
+    dependabotCleanupState.queueDepth = dependabotQueueDepth(queuedRuns);
+    dependabotCleanupState.lastScanAt = new Date(now).toISOString();
+    dependabotCleanupState.lastError = discoveryErrors.join("; ");
+    if (!shouldCleanDependabotQueue(dependabotCleanupState.queueDepth, threshold)) return null;
+
+    const quota = quotaState(snapshotRateLimit(metrics));
+    if (quota.blocked) {
+      dependabotCleanupState.lastError = "Dependabot cleanup paused because GitHub API quota is low.";
+      const resetAt = new Date(quota.resetAt || 0).getTime();
+      dependabotCleanupState.blockedUntil = Number.isFinite(resetAt)
+        ? Math.max(now + DEPENDABOT_CLEANUP_COOLDOWN_MS, resetAt + 30 * 1000)
+        : now + DEPENDABOT_CLEANUP_COOLDOWN_MS;
+      return null;
+    }
+    dependabotCleanupState.lastAttemptAt = now;
+    const result = await cleanupDependabotWorkload({ repos, jobs });
+    dependabotCleanupState.lastResult = result;
+    dependabotCleanupState.lastCompletedAt = new Date().toISOString();
+    dependabotCleanupState.lastError = [...discoveryErrors, ...result.errors].join("; ");
+    return result;
+  } catch (error) {
+    dependabotCleanupState.lastError = error.message || "Dependabot cleanup failed";
+    return null;
+  } finally {
+    dependabotCleanupState.running = false;
+  }
+}
+
+function clearDependabotQueueTimer() {
+  if (!dependabotCleanupState.timer) return;
+  clearTimeout(dependabotCleanupState.timer);
+  dependabotCleanupState.timer = null;
+}
+
+function scheduleDependabotQueueScan(delayMs = 0) {
+  if (DEPENDABOT_QUEUE_THRESHOLD <= 0 || dependabotCleanupState.timer) return;
+  dependabotCleanupState.timer = setTimeout(async () => {
+    dependabotCleanupState.timer = null;
+    await runDependabotQueueScan();
+    scheduleDependabotQueueScan(DEPENDABOT_QUEUE_SCAN_MS);
+  }, Math.max(0, delayMs));
+}
+
+function resetDependabotCleanupState() {
+  clearDependabotQueueTimer();
+  dependabotCleanupState.running = false;
+  dependabotCleanupState.queueDepth = 0;
+  dependabotCleanupState.lastAttemptAt = 0;
+  dependabotCleanupState.blockedUntil = 0;
+  dependabotCleanupState.lastScanAt = null;
+  dependabotCleanupState.lastCompletedAt = null;
+  dependabotCleanupState.lastResult = null;
+  dependabotCleanupState.lastError = "";
+}
+
 async function buildBusyRunnerData(requestUrl) {
   const params = requestUrl.searchParams;
   const mode = normalizeMode(params.get("mode"));
@@ -2733,6 +3033,10 @@ async function buildDashboardData(requestUrl) {
   };
   const rateLimit = snapshotRateLimit(scanMetrics.getStore() || createScanMetrics());
   const warnings = buildDashboardWarnings(rateLimit, summary, { mode, jobs, includeCd, includeRunners, includeRepoRunners });
+  const cleanupSnapshot = dependabotCleanupSnapshot();
+  if (cleanupSnapshot.lastError) {
+    warnings.push(`Dependabot cleanup: ${cleanupSnapshot.lastError}`);
+  }
 
   return {
     account: me,
@@ -2760,7 +3064,8 @@ async function buildDashboardData(requestUrl) {
     runners: {
       busy: busyRunners.sort((a, b) => `${a.scope}/${a.name}`.localeCompare(`${b.scope}/${b.name}`))
     },
-    autoMerge: autoMergeSnapshot()
+    autoMerge: autoMergeSnapshot(),
+    dependabotCleanup: cleanupSnapshot
   };
 }
 
@@ -3210,6 +3515,8 @@ if (isMain) {
   server.listen(port, "127.0.0.1", () => {
     console.log(`GitHub Monitor dashboard: http://127.0.0.1:${port}`);
     console.log(`Auth mode: ${APP_AUTH_ENABLED ? `GitHub App (id ${GITHUB_APP_ID})` : "Personal access token"}`);
+    console.log(`Dependabot queue cleanup: ${DEPENDABOT_QUEUE_THRESHOLD > 0 ? `enabled at ${DEPENDABOT_QUEUE_THRESHOLD} queued runs` : "disabled"}`);
+    scheduleDependabotQueueScan(0);
   });
 }
 
@@ -3251,6 +3558,14 @@ export {
   signAppJwt,
   installationTokenIsValid,
   parseOwners,
+  parseDependabotQueueThreshold,
+  isDependabotLogin,
+  isDependabotWorkflowRun,
+  dependabotQueueDepth,
+  shouldCleanDependabotQueue,
+  cleanupDependabotWorkload,
+  runDependabotQueueScan,
+  resetDependabotCleanupState,
   sameAutoMergeOwners,
   server
 };

@@ -39,6 +39,14 @@ import {
   buildAppJwtPayload,
   signAppJwt,
   installationTokenIsValid,
+  parseDependabotQueueThreshold,
+  isDependabotLogin,
+  isDependabotWorkflowRun,
+  dependabotQueueDepth,
+  shouldCleanDependabotQueue,
+  cleanupDependabotWorkload,
+  runDependabotQueueScan,
+  resetDependabotCleanupState,
   server
 } from "../server.js";
 
@@ -214,6 +222,32 @@ test("auto merge only targets passing pull requests with reported checks", () =>
 test("open pull request searches exclude archived repositories", () => {
   assert.equal(openPullRequestSearchQuery("owner", "dev"), "is:pr state:open archived:false owner:dev");
   assert.equal(openPullRequestSearchQuery("author", "dev"), "is:pr state:open archived:false author:dev");
+});
+
+test("deep queue threshold is configurable and can be disabled", () => {
+  assert.equal(parseDependabotQueueThreshold(undefined), 0);
+  assert.equal(parseDependabotQueueThreshold("35"), 35);
+  assert.equal(parseDependabotQueueThreshold("0"), 0);
+  assert.equal(parseDependabotQueueThreshold("invalid"), 0);
+  assert.equal(parseDependabotQueueThreshold("5001"), 0);
+  assert.equal(shouldCleanDependabotQueue(19, 20), false);
+  assert.equal(shouldCleanDependabotQueue(20, 20), true);
+  assert.equal(shouldCleanDependabotQueue(100, 0), false);
+});
+
+test("Dependabot workflow detection is exact and queue depth deduplicates runs", () => {
+  assert.equal(isDependabotLogin("dependabot[bot]"), true);
+  assert.equal(isDependabotLogin("Dependabot[bot]"), true);
+  assert.equal(isDependabotLogin("dependabot-preview[bot]"), false);
+  assert.equal(isDependabotWorkflowRun({ actor: { login: "dependabot[bot]" } }), true);
+  assert.equal(isDependabotWorkflowRun({ triggering_actor: { login: "dependabot[bot]" } }), true);
+  assert.equal(isDependabotWorkflowRun({ actor: { login: "maintainer" } }), false);
+  assert.equal(dependabotQueueDepth([
+    { repo: "acme/app", runId: 1, status: "queued" },
+    { repo: "acme/app", runId: 1, status: "queued" },
+    { repo: "acme/app", runId: 2, status: "in_progress" },
+    { repo: "acme/app", runId: 3, status: "completed" }
+  ]), 1);
 });
 
 test("refresh recommendations pause when GitHub API quota is low", () => {
@@ -804,6 +838,267 @@ test("dashboard includes running non-CD workflow runs in CI running work", async
     ]);
   } finally {
     await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("deep queue cleanup closes Dependabot PRs and cancels every active Dependabot run", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4990",
+      "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+      "x-ratelimit-resource": "core"
+    };
+
+    if (requestUrl.pathname === "/repos/deep-queue-fixture/app/pulls" && options.method === "GET") {
+      return Response.json([
+        { number: 7, title: "Bump runtime", html_url: "https://github.com/deep-queue-fixture/app/pull/7", user: { login: "dependabot[bot]" } },
+        { number: 8, title: "Human change", html_url: "https://github.com/deep-queue-fixture/app/pull/8", user: { login: "maintainer" } }
+      ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/deep-queue-fixture/app/actions/runs" && options.method === "GET") {
+      const status = requestUrl.searchParams.get("status");
+      const workflowRuns = status === "queued"
+        ? [
+            { id: 70, name: "CI", status, html_url: "https://github.com/deep-queue-fixture/app/actions/runs/70", actor: { login: "dependabot[bot]" } },
+            { id: 71, name: "CI", status, html_url: "https://github.com/deep-queue-fixture/app/actions/runs/71", actor: { login: "maintainer" } }
+          ]
+        : status === "in_progress"
+          ? [{ id: 72, name: "CodeQL", status, html_url: "https://github.com/deep-queue-fixture/app/actions/runs/72", triggering_actor: { login: "dependabot[bot]" } }]
+          : [];
+      return Response.json({ workflow_runs: workflowRuns }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/deep-queue-fixture/app/pulls/7" && options.method === "PATCH") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return Response.json({ state: "closed" }, { headers });
+    }
+    if (/\/repos\/deep-queue-fixture\/app\/actions\/runs\/(70|72)\/cancel/.test(requestUrl.pathname) && options.method === "POST") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return new Response(null, { status: 202, headers });
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  try {
+    const result = await cleanupDependabotWorkload({ repos: ["deep-queue-fixture/app"], jobs: 2 });
+    assert.deepEqual(result.errors, []);
+    assert.deepEqual(result.closedPullRequests.map((pr) => pr.number), [7]);
+    assert.deepEqual(result.cancelledRuns.map((run) => run.runId).sort(), [70, 72]);
+    assert.deepEqual(mutations.sort(), [
+      "PATCH /repos/deep-queue-fixture/app/pulls/7",
+      "POST /repos/deep-queue-fixture/app/actions/runs/70/cancel",
+      "POST /repos/deep-queue-fixture/app/actions/runs/72/cancel"
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("cleanup preserves successful discoveries when one active-status request fails", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4990",
+      "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+      "x-ratelimit-resource": "core"
+    };
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/pulls" && options.method === "GET") {
+      return Response.json([
+        { number: 9, title: "Bump dependency", html_url: "https://github.com/partial-cleanup-fixture/app/pull/9", user: { login: "dependabot[bot]" } }
+      ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/actions/runs" && options.method === "GET") {
+      const status = requestUrl.searchParams.get("status");
+      if (status === "waiting") return Response.json({ message: "temporary failure" }, { status: 500, headers });
+      const workflowRuns = status === "queued"
+        ? [{ id: 90, name: "CI", status, actor: { login: "dependabot[bot]" } }]
+        : [];
+      return Response.json({ workflow_runs: workflowRuns }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/pulls/9" && options.method === "PATCH") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return Response.json({ state: "closed" }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/actions/runs/90/cancel" && options.method === "POST") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return new Response(null, { status: 202, headers });
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  try {
+    const result = await cleanupDependabotWorkload({ repos: ["partial-cleanup-fixture/app"], jobs: 2 });
+    assert.equal(result.closedPullRequests.length, 1);
+    assert.equal(result.cancelledRuns.length, 1);
+    assert.equal(result.errors.length, 1);
+    assert.match(result.errors[0], /waiting runs: temporary failure/);
+    assert.deepEqual(mutations.sort(), [
+      "PATCH /repos/partial-cleanup-fixture/app/pulls/9",
+      "POST /repos/partial-cleanup-fixture/app/actions/runs/90/cancel"
+    ]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("cleanup stops before mutations when discovery exhausts GitHub quota", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+  let getRequests = 0;
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    if (options.method === "GET") getRequests += 1;
+    const remaining = requestUrl.pathname.endsWith("/actions/runs") ? "0" : "1000";
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": remaining,
+      "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+      "x-ratelimit-resource": "core"
+    };
+    if (/^\/repos\/quota-cleanup-fixture\/app-\d+\/pulls$/.test(requestUrl.pathname) && options.method === "GET") {
+      return Response.json([
+        { number: 10, title: "Bump dependency", user: { login: "dependabot[bot]" } }
+      ], { headers });
+    }
+    if (/^\/repos\/quota-cleanup-fixture\/app-\d+\/actions\/runs$/.test(requestUrl.pathname) && options.method === "GET") {
+      return Response.json({
+        workflow_runs: [{ id: 100, status: requestUrl.searchParams.get("status"), actor: { login: "dependabot[bot]" } }]
+      }, { headers });
+    }
+    if (["PATCH", "POST"].includes(options.method)) {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  resetObservedRateBuckets();
+  try {
+    const repos = Array.from({ length: 10 }, (_, index) => `quota-cleanup-fixture/app-${index + 1}`);
+    const result = await cleanupDependabotWorkload({ repos, jobs: 2 });
+    assert.deepEqual(result.closedPullRequests, []);
+    assert.deepEqual(result.cancelledRuns, []);
+    assert.equal(result.errors.some((error) => /quota/i.test(error)), true);
+    assert.deepEqual(mutations, []);
+    assert.ok(getRequests <= 6, `expected quota abort to bound discovery requests, received ${getRequests}`);
+  } finally {
+    resetObservedRateBuckets();
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("background queue scan paginates queued runs and observes its cooldown", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+  let requestCount = 0;
+  const now = Date.parse("2026-07-29T12:00:00Z");
+
+  globalThis.fetch = async (url, options = {}) => {
+    requestCount += 1;
+    const requestUrl = new URL(String(url));
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4900",
+      "x-ratelimit-reset": String(Math.floor(now / 1000) + 3600),
+      "x-ratelimit-resource": "core"
+    };
+    if (requestUrl.pathname === "/user") return Response.json({ login: "queue-scheduler-user" }, { headers });
+    if (requestUrl.pathname === "/user/orgs") return Response.json([{ login: "queue-scheduler-owner" }], { headers });
+    if (requestUrl.pathname === "/orgs/queue-scheduler-owner/repos") {
+      return Response.json([{ full_name: "queue-scheduler-owner/app", archived: false }], { headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/pulls" && options.method === "GET") {
+      return Response.json([
+        { number: 11, title: "Bump dependency", html_url: "https://github.com/queue-scheduler-owner/app/pull/11", user: { login: "dependabot[bot]" } }
+      ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/actions/runs" && options.method === "GET") {
+      const status = requestUrl.searchParams.get("status");
+      const page = Number(requestUrl.searchParams.get("page") || 1);
+      if (status === "queued" && page === 1) {
+        return Response.json({
+          workflow_runs: Array.from({ length: 100 }, (_, index) => ({
+            id: index + 1,
+            status: "queued",
+            actor: { login: "maintainer" }
+          }))
+        }, { headers });
+      }
+      if (status === "queued" && page === 2) {
+        return Response.json({
+          workflow_runs: [{ id: 101, status: "queued", actor: { login: "dependabot[bot]" } }]
+        }, { headers });
+      }
+      return Response.json({ workflow_runs: [] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/actions/runs/101/cancel" && options.method === "POST") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return new Response(null, { status: 202, headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/pulls/11" && options.method === "PATCH") {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return Response.json({ state: "closed" }, { headers });
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  resetDependabotCleanupState();
+  resetObservedRateBuckets();
+  try {
+    const result = await runDependabotQueueScan({
+      threshold: 101,
+      owners: ["queue-scheduler-owner"],
+      jobs: 2,
+      now
+    });
+    assert.equal(result.closedPullRequests.length, 1);
+    assert.deepEqual(result.cancelledRuns.map((run) => run.runId), [101]);
+    assert.deepEqual(mutations.sort(), [
+      "PATCH /repos/queue-scheduler-owner/app/pulls/11",
+      "POST /repos/queue-scheduler-owner/app/actions/runs/101/cancel"
+    ]);
+
+    const requestsAfterCleanup = requestCount;
+    const cooldownResult = await runDependabotQueueScan({
+      threshold: 101,
+      owners: ["queue-scheduler-owner"],
+      jobs: 2,
+      now: now + 1000
+    });
+    assert.equal(cooldownResult, null);
+    assert.equal(requestCount, requestsAfterCleanup);
+  } finally {
+    resetDependabotCleanupState();
+    resetObservedRateBuckets();
     globalThis.fetch = previousFetch;
     if (previousToken == null) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = previousToken;
