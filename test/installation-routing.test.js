@@ -358,6 +358,30 @@ test("App auth: owners filter restricts dashboard scope and uses matching instal
   });
 });
 
+test("App auth: an unknown owner filter fails closed", async () => {
+  const graphqlRequestLog = [];
+  await runWithStubbedFetch({ graphqlRequestLog }, async (realFetch) => {
+    const listener = await new Promise((resolve) => {
+      const l = server.listen(0, "127.0.0.1", () => resolve(l));
+    });
+    try {
+      const { port } = listener.address();
+      const response = await realFetch(
+        `http://127.0.0.1:${port}/api/status?mode=all&jobs=1&includeCd=0&includeRunners=0&owners=missing-owner`
+      );
+      const data = await response.json();
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(data.options.owners, ["missing-owner"]);
+      assert.equal(data.summary.repos, 0);
+      assert.deepEqual(data.pullRequests.pass, []);
+      assert.equal(graphqlRequestLog.some((entry) => /owner:/.test(entry.q)), false);
+    } finally {
+      await new Promise((resolve, reject) => listener.close((error) => (error ? reject(error) : resolve())));
+    }
+  });
+});
+
 test("parseOwners handles comma-strings, arrays, blanks, and dedup", () => {
   assert.deepEqual(parseOwners(null), []);
   assert.deepEqual(parseOwners(""), []);
