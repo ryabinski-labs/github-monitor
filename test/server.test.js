@@ -44,6 +44,7 @@ import {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  hasFailedCiSignal,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
@@ -862,9 +863,16 @@ test("deep queue cleanup closes Dependabot PRs and cancels every active Dependab
 
     if (requestUrl.pathname === "/repos/deep-queue-fixture/app/pulls" && options.method === "GET") {
       return Response.json([
-        { number: 7, title: "Bump runtime", html_url: "https://github.com/deep-queue-fixture/app/pull/7", user: { login: "dependabot[bot]" } },
-        { number: 8, title: "Human change", html_url: "https://github.com/deep-queue-fixture/app/pull/8", user: { login: "maintainer" } }
+        { number: 7, title: "Bump runtime", html_url: "https://github.com/deep-queue-fixture/app/pull/7", user: { login: "dependabot[bot]" }, head: { sha: "sha7" } },
+        { number: 8, title: "Human change", html_url: "https://github.com/deep-queue-fixture/app/pull/8", user: { login: "maintainer" }, head: { sha: "sha8" } }
       ], { headers });
+    }
+    // REST reports lowercase check-run status/conclusion, unlike the GraphQL enums.
+    if (requestUrl.pathname === "/repos/deep-queue-fixture/app/commits/sha7/check-runs") {
+      return Response.json({ check_runs: [{ status: "completed", conclusion: "failure" }] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/deep-queue-fixture/app/commits/sha7/status") {
+      return Response.json({ statuses: [] }, { headers });
     }
     if (requestUrl.pathname === "/repos/deep-queue-fixture/app/actions/runs" && options.method === "GET") {
       const status = requestUrl.searchParams.get("status");
@@ -923,8 +931,14 @@ test("cleanup preserves successful discoveries when one active-status request fa
     };
     if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/pulls" && options.method === "GET") {
       return Response.json([
-        { number: 9, title: "Bump dependency", html_url: "https://github.com/partial-cleanup-fixture/app/pull/9", user: { login: "dependabot[bot]" } }
+        { number: 9, title: "Bump dependency", html_url: "https://github.com/partial-cleanup-fixture/app/pull/9", user: { login: "dependabot[bot]" }, head: { sha: "sha9" } }
       ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/commits/sha9/check-runs") {
+      return Response.json({ check_runs: [{ status: "completed", conclusion: "failure" }] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/commits/sha9/status") {
+      return Response.json({ statuses: [] }, { headers });
     }
     if (requestUrl.pathname === "/repos/partial-cleanup-fixture/app/actions/runs" && options.method === "GET") {
       const status = requestUrl.searchParams.get("status");
@@ -1038,8 +1052,14 @@ test("background queue scan paginates queued runs and observes its cooldown", as
     }
     if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/pulls" && options.method === "GET") {
       return Response.json([
-        { number: 11, title: "Bump dependency", html_url: "https://github.com/queue-scheduler-owner/app/pull/11", user: { login: "dependabot[bot]" } }
+        { number: 11, title: "Bump dependency", html_url: "https://github.com/queue-scheduler-owner/app/pull/11", user: { login: "dependabot[bot]" }, head: { sha: "sha11" } }
       ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/commits/sha11/check-runs") {
+      return Response.json({ check_runs: [{ status: "completed", conclusion: "failure" }] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/commits/sha11/status") {
+      return Response.json({ statuses: [] }, { headers });
     }
     if (requestUrl.pathname === "/repos/queue-scheduler-owner/app/actions/runs" && options.method === "GET") {
       const status = requestUrl.searchParams.get("status");
@@ -1103,6 +1123,90 @@ test("background queue scan paginates queued runs and observes its cooldown", as
     if (previousToken == null) delete process.env.GITHUB_TOKEN;
     else process.env.GITHUB_TOKEN = previousToken;
   }
+});
+
+test("a shallow queue still closes Dependabot PRs with failing CI without cancelling runs", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+  const now = Date.parse("2026-07-31T14:10:00Z");
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4900",
+      "x-ratelimit-reset": String(Math.floor(now / 1000) + 3600),
+      "x-ratelimit-resource": "core"
+    };
+    if (requestUrl.pathname === "/user") return Response.json({ login: "shallow-queue-user" }, { headers });
+    if (requestUrl.pathname === "/user/orgs") return Response.json([{ login: "shallow-queue-owner" }], { headers });
+    if (requestUrl.pathname === "/orgs/shallow-queue-owner/repos") {
+      return Response.json([{ full_name: "shallow-queue-owner/app", archived: false }], { headers });
+    }
+    if (requestUrl.pathname === "/repos/shallow-queue-owner/app/pulls" && options.method === "GET") {
+      return Response.json([
+        { number: 12, title: "Bump failing dep", user: { login: "dependabot[bot]" }, head: { sha: "fail-sha" } },
+        { number: 13, title: "Bump green dep", user: { login: "dependabot[bot]" }, head: { sha: "pass-sha" } }
+      ], { headers });
+    }
+    if (requestUrl.pathname === "/repos/shallow-queue-owner/app/commits/fail-sha/check-runs") {
+      return Response.json({ check_runs: [{ status: "completed", conclusion: "failure" }] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/shallow-queue-owner/app/commits/pass-sha/check-runs") {
+      return Response.json({ check_runs: [{ status: "completed", conclusion: "success" }] }, { headers });
+    }
+    if (/\/repos\/shallow-queue-owner\/app\/commits\/(fail|pass)-sha\/status$/.test(requestUrl.pathname)) {
+      return Response.json({ statuses: [] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/shallow-queue-owner/app/actions/runs" && options.method === "GET") {
+      // One lone queued Dependabot run — far below the threshold.
+      const status = requestUrl.searchParams.get("status");
+      const workflowRuns = status === "queued"
+        ? [{ id: 200, name: "CI", status, actor: { login: "dependabot[bot]" } }]
+        : [];
+      return Response.json({ workflow_runs: workflowRuns }, { headers });
+    }
+    if (["PATCH", "POST"].includes(options.method)) {
+      mutations.push(`${options.method} ${requestUrl.pathname}`);
+      return Response.json({ state: "closed" }, { headers });
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  resetDependabotCleanupState();
+  resetObservedRateBuckets();
+  try {
+    const result = await runDependabotQueueScan({
+      threshold: 10,
+      owners: ["shallow-queue-owner"],
+      jobs: 2,
+      now
+    });
+    assert.deepEqual(result.closedPullRequests.map((pr) => pr.number), [12]);
+    assert.deepEqual(result.cancelledRuns, []);
+    assert.deepEqual(mutations, ["PATCH /repos/shallow-queue-owner/app/pulls/12"]);
+  } finally {
+    resetDependabotCleanupState();
+    resetObservedRateBuckets();
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("failing CI detection accepts REST lowercase check runs and legacy commit statuses", () => {
+  assert.equal(hasFailedCiSignal([{ status: "completed", conclusion: "failure" }], []), true);
+  assert.equal(hasFailedCiSignal([{ status: "completed", conclusion: "startup_failure" }], []), true);
+  assert.equal(hasFailedCiSignal([{ status: "COMPLETED", conclusion: "FAILURE" }], []), true);
+  assert.equal(hasFailedCiSignal([], [{ state: "failure" }]), true);
+  assert.equal(hasFailedCiSignal([{ status: "completed", conclusion: "success" }], [{ state: "success" }]), false);
+  assert.equal(hasFailedCiSignal([{ status: "completed", conclusion: "skipped" }], []), false);
+  // An in-flight run that has not concluded must not read as a failure.
+  assert.equal(hasFailedCiSignal([{ status: "in_progress", conclusion: null }], []), false);
+  assert.equal(hasFailedCiSignal(undefined, undefined), false);
 });
 
 test("failed non-CD workflow runs stay in failing CI until a newer same-lane success resolves them", () => {
