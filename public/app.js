@@ -1505,9 +1505,12 @@ function dismissedInLane(rows, keyFn) {
 // pipeline traces.
 function adjustedSummary(data) {
   const summary = (data && data.summary) || {};
+  const failDismissed =
+    dismissedInLane(data?.actions?.failed, actionKey) +
+    dismissedInLane(data?.pullRequests?.fail, prKey);
   return {
     ...summary,
-    failingPrs: Math.max(0, (summary.failingPrs ?? 0) - dismissedInLane(data?.actions?.failed, actionKey)),
+    failingPrs: Math.max(0, (summary.failingPrs ?? 0) - failDismissed),
     failedCd: Math.max(0, (summary.failedCd ?? 0) - dismissedInLane(data?.cd?.failed, actionKey)),
     flaggedJourneys: Math.max(0, (summary.flaggedJourneys ?? 0) - dismissedInLane(data?.traces?.flagged, traceDismissKeys)),
     tracingUnknown: Math.max(0, (summary.tracingUnknown ?? 0) - dismissedInLane(data?.traces?.unknown, traceDismissKeys))
@@ -1537,7 +1540,7 @@ function displayCounts(data) {
     noCiPrs: filteredVisibleRows(data?.pullRequests?.noCi).length,
     failingPrs: filteredVisibleRows(
       [...(data?.pullRequests?.fail || []), ...(data?.actions?.failed || [])],
-      (row) => row.kind === "workflowRun" && actionKey(row)
+      (row) => (row.kind === "workflowRun" ? actionKey(row) : prKey(row))
     ).length,
     conflictPrs: filteredVisibleRows(data?.pullRequests?.conflicts).length,
     runningPrs: filteredVisibleRows([...(data?.pullRequests?.running || []), ...(data?.actions?.running || [])]).length,
@@ -1705,7 +1708,9 @@ function render() {
 // after app updates.
 function dismissKeys(row) {
   if (!row) return [];
-  if (state.view === "fail" && row.kind === "workflowRun") return normalizeDismissKeys(actionKey(row));
+  if (state.view === "fail") {
+    return normalizeDismissKeys(row.kind === "workflowRun" ? actionKey(row) : prKey(row));
+  }
   if (state.view === "failedCd") return normalizeDismissKeys(actionKey(row));
   if (state.view === "pipelineTraces" && (row.status === "flagged" || row.status === "unknown")) {
     return traceDismissKeys(row);
@@ -1816,7 +1821,7 @@ function mergeBlockReason(row) {
   return "";
 }
 
-function renderPrActions(row) {
+function renderPrActions(row, dismissButton = "") {
   const key = mergeKey(row.repo, row.number);
   const reason = mergeBlockReason(row);
   const isMerging = state.merging.has(key);
@@ -1874,6 +1879,7 @@ function renderPrActions(row) {
       ${mergeButton}
       ${closeButton}
       <a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open PR</a>
+      ${dismissButton}
     </div>
   `;
 }
@@ -1899,8 +1905,11 @@ function renderPrRow(row, view) {
     ? `<span class="draft-pill" title="Draft pull request">Draft</span>`
     : "";
   const phaseBadge = renderPhaseBadge(row);
+  const keys = dismissKeys(row);
+  const dismissed = anyDismissed(keys);
+  const dismissButton = keys.length ? renderDismissButton(keys, `${row.repo} ${row.numberLabel || `#${row.number}`}`) : "";
   return `
-    <article class="row${row.hasConflict ? " row-conflict" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${dismissed ? " row-dismissed" : ""}${row.hasConflict ? " row-conflict" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
         <div class="repo">${escapeHtml(row.repo)}</div>
         <div class="title">${escapeHtml(row.title)}</div>
@@ -1913,7 +1922,7 @@ function renderPrRow(row, view) {
         ${phaseBadge}
       </div>
       <div class="meta">${escapeHtml(detail)}</div>
-      ${renderPrActions(row)}
+      ${renderPrActions(row, dismissButton)}
     </article>
   `;
 }
