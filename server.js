@@ -2703,6 +2703,34 @@ async function fetchDependabotWorkloadForRepo(repo) {
     errors.push(`${repo} pull requests: ${error.message}`);
     return [];
   });
+
+  const dependabotPrs = pullRequests.filter((pr) => isDependabotLogin(pr.user?.login));
+  const failingPrs = [];
+
+  for (const pr of dependabotPrs) {
+    const headSha = pr.head?.sha;
+    if (!headSha) {
+      failingPrs.push({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" });
+      continue;
+    }
+    try {
+      const [checkRunsJson, statusJson] = await Promise.all([
+        githubRequest(`/repos/${repo}/commits/${headSha}/check-runs`).catch(() => null),
+        githubRequest(`/repos/${repo}/commits/${headSha}/status`).catch(() => null)
+      ]);
+      const checkRuns = checkRunsJson?.check_runs || [];
+      const statuses = statusJson?.statuses || [];
+      const hasFailedCheck = checkRuns.some((cr) => cr.status === "COMPLETED" && FAILED_CHECK_CONCLUSIONS.has(String(cr.conclusion || "").toUpperCase())) ||
+        statuses.some((st) => FAILED_CHECK_CONCLUSIONS.has(String(st.state || "").toUpperCase()));
+
+      if (hasFailedCheck) {
+        failingPrs.push({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" });
+      }
+    } catch (error) {
+      errors.push(`${repo} PR #${pr.number} CI check status: ${error.message}`);
+    }
+  }
+
   const runGroups = await mapLimit([...RUNNING_RUN_STATUSES], 2, async (status) => {
     try {
       return await githubRestAllWithinQuota(
@@ -2717,9 +2745,7 @@ async function fetchDependabotWorkloadForRepo(repo) {
     }
   });
   return {
-    pullRequests: pullRequests
-      .filter((pr) => isDependabotLogin(pr.user?.login))
-      .map((pr) => ({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" })),
+    pullRequests: failingPrs,
     runs: uniqueBy(runGroups.flat().filter(isDependabotWorkflowRun), (run) => run.id)
       .map((run) => ({
         repo,
