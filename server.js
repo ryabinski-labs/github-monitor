@@ -2692,7 +2692,18 @@ async function fetchBusyRunners({ includeRepoRunners, repos, pullRequests, mode,
   );
 }
 
-async function fetchDependabotWorkloadForRepo(repo) {
+// The REST check-runs API reports lowercase `status`/`conclusion`; the GraphQL
+// checks used elsewhere report uppercase enums. Normalise before comparing.
+function hasFailedCiSignal(checkRuns, statuses) {
+  const failedCheckRun = (checkRuns || []).some((run) =>
+    String(run?.status || "").toUpperCase() === "COMPLETED" &&
+    FAILED_CHECK_CONCLUSIONS.has(String(run?.conclusion || "").toUpperCase())
+  );
+  return failedCheckRun ||
+    (statuses || []).some((status) => FAILED_CHECK_CONCLUSIONS.has(String(status?.state || "").toUpperCase()));
+}
+
+async function fetchDependabotWorkloadForRepo(repo, { includeRuns = true } = {}) {
   const errors = [];
   const pullRequests = await githubRestAllWithinQuota(
     `/repos/${repo}/pulls`,
@@ -2709,27 +2720,24 @@ async function fetchDependabotWorkloadForRepo(repo) {
 
   for (const pr of dependabotPrs) {
     const headSha = pr.head?.sha;
-    if (!headSha) {
-      failingPrs.push({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" });
-      continue;
-    }
+    // Without a head SHA there is no CI evidence to judge; closing blind would
+    // discard passing updates, so leave the pull request alone.
+    if (!headSha) continue;
     try {
       const [checkRunsJson, statusJson] = await Promise.all([
         githubRequest(`/repos/${repo}/commits/${headSha}/check-runs`).catch(() => null),
         githubRequest(`/repos/${repo}/commits/${headSha}/status`).catch(() => null)
       ]);
-      const checkRuns = checkRunsJson?.check_runs || [];
-      const statuses = statusJson?.statuses || [];
-      const hasFailedCheck = checkRuns.some((cr) => cr.status === "COMPLETED" && FAILED_CHECK_CONCLUSIONS.has(String(cr.conclusion || "").toUpperCase())) ||
-        statuses.some((st) => FAILED_CHECK_CONCLUSIONS.has(String(st.state || "").toUpperCase()));
 
-      if (hasFailedCheck) {
+      if (hasFailedCiSignal(checkRunsJson?.check_runs, statusJson?.statuses)) {
         failingPrs.push({ repo, number: pr.number, title: pr.title || "", url: pr.html_url || "" });
       }
     } catch (error) {
       errors.push(`${repo} PR #${pr.number} CI check status: ${error.message}`);
     }
   }
+
+  if (!includeRuns) return { pullRequests: failingPrs, runs: [], errors };
 
   const runGroups = await mapLimit([...RUNNING_RUN_STATUSES], 2, async (status) => {
     try {
@@ -2757,8 +2765,10 @@ async function fetchDependabotWorkloadForRepo(repo) {
   };
 }
 
-async function cleanupDependabotWorkload({ repos, jobs = 4 }) {
-  const groups = await mapLimit(repos || [], jobs, fetchDependabotWorkloadForRepo);
+async function cleanupDependabotWorkload({ repos, jobs = 4, cancelRuns = true }) {
+  const groups = await mapLimit(repos || [], jobs, (repo) =>
+    fetchDependabotWorkloadForRepo(repo, { includeRuns: cancelRuns })
+  );
   const pullRequests = uniqueBy(groups.flatMap((group) => group.pullRequests), (pr) => `${pr.repo}#${pr.number}`);
   const runs = uniqueBy(groups.flatMap((group) => group.runs), (run) => `${run.repo}:${run.runId}`);
   const errors = groups.flatMap((group) => group.errors || []);
@@ -2892,7 +2902,10 @@ async function runDependabotQueueScan({
     dependabotCleanupState.queueDepth = dependabotQueueDepth(queuedRuns);
     dependabotCleanupState.lastScanAt = new Date(now).toISOString();
     dependabotCleanupState.lastError = discoveryErrors.join("; ");
-    if (!shouldCleanDependabotQueue(dependabotCleanupState.queueDepth, threshold)) return null;
+    // Cancelling in-flight runs is the destructive half and stays gated on queue
+    // depth. Closing Dependabot PRs whose CI already failed is safe at any depth,
+    // so it runs on every pass — a lone failing PR should not wait for a backlog.
+    const cancelRuns = shouldCleanDependabotQueue(dependabotCleanupState.queueDepth, threshold);
 
     const quota = quotaState(snapshotRateLimit(metrics));
     if (quota.blocked) {
@@ -2904,7 +2917,7 @@ async function runDependabotQueueScan({
       return null;
     }
     dependabotCleanupState.lastAttemptAt = now;
-    const result = await cleanupDependabotWorkload({ repos, jobs });
+    const result = await cleanupDependabotWorkload({ repos, jobs, cancelRuns });
     dependabotCleanupState.lastResult = result;
     dependabotCleanupState.lastCompletedAt = new Date().toISOString();
     dependabotCleanupState.lastError = [...discoveryErrors, ...result.errors].join("; ");
@@ -3589,6 +3602,7 @@ export {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  hasFailedCiSignal,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
