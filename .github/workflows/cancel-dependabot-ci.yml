@@ -1,0 +1,47 @@
+name: Cancel competing Dependabot CI/CD
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - CodeQL PR
+      - Dependency Review
+    types:
+      - requested
+
+permissions:
+  actions: write
+
+jobs:
+  cancel-when-busy:
+    if: ${{ github.event.workflow_run.actor.login == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel Dependabot run when another workflow is active
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          active_runs="$({
+            gh api "repos/$REPOSITORY/actions/runs?status=queued&per_page=100"
+            gh api "repos/$REPOSITORY/actions/runs?status=in_progress&per_page=100"
+          } | jq -s '[.[].workflow_runs[]]')"
+
+          competing_run="$(jq -r \
+            --argjson run_id "$RUN_ID" \
+            --arg workflow_name "$WORKFLOW_NAME" \
+            'first(.[] | select(.id != $run_id and .name != $workflow_name and .actor.login != "dependabot[bot]") | .html_url) // ""' \
+            <<<"$active_runs")"
+
+          if [[ -z "$competing_run" ]]; then
+            echo "No non-Dependabot workflow is active; keeping this run."
+            exit 0
+          fi
+
+          echo "Cancelling Dependabot run because another workflow is active: $competing_run"
+          gh api --method POST "repos/$REPOSITORY/actions/runs/$RUN_ID/cancel"
