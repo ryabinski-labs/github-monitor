@@ -131,7 +131,20 @@ function cdRun(repo, runNumber) {
   };
 }
 
-async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedCdRuns = [] } = {}) {
+function failingPr(repo, number, author = "dependabot[bot]") {
+  return {
+    repo,
+    number,
+    numberLabel: `#${number}`,
+    title: `bump dependencies in ${repo}`,
+    author,
+    state: "fail",
+    checkCount: 1,
+    url: `https://github.com/${repo}/pull/${number}`
+  };
+}
+
+async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedPrs = [], failedCdRuns = [] } = {}) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
 
@@ -142,12 +155,17 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedC
     localStorage.removeItem("pr-deck:traces:v1");
   }, view);
 
+  const totalFailing = failedRuns.length + failedPrs.length;
   const statusBody = {
     ...statusFixture,
     summary: {
       ...statusFixture.summary,
-      ...(failedRuns.length ? { failingPrs: failedRuns.length } : {}),
+      ...(totalFailing ? { failingPrs: totalFailing } : {}),
       ...(failedCdRuns.length ? { failedCd: failedCdRuns.length } : {})
+    },
+    pullRequests: {
+      ...statusFixture.pullRequests,
+      ...(failedPrs.length ? { fail: failedPrs } : {})
     },
     ...(failedRuns.length ? { actions: { ...statusFixture.actions, failed: failedRuns } } : {}),
     ...(failedCdRuns.length ? { cd: { ...statusFixture.cd, failed: failedCdRuns } } : {})
@@ -288,6 +306,24 @@ test("Dismissing a single Failed CD run hides it and updates the nav count", { s
     await page.locator("[data-dismiss-key]").first().click();
     await page.waitForFunction(() => document.querySelectorAll("[data-dismiss-key]").length === 0);
     assert.equal(await page.locator("#navFailedCd").innerText(), "0", "nav count drops to 0 after both dismissed");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Dismissing a failing Dependabot PR in Failing CI lane hides it and updates failing count", { skip }, async () => {
+  const { browser, page } = await openDashboard({
+    view: "fail",
+    failedPrs: [failingPr("ryabinski-labs/icelandphotomap-ui", 779, "dependabot[bot]")]
+  });
+  try {
+    await page.waitForSelector("[data-dismiss-key]");
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 1, "failing Dependabot PR has a Dismiss button");
+    assert.equal(await page.locator("#metricFailing").innerText(), "1", "failing metric starts at 1");
+
+    await page.locator("[data-dismiss-key]").click();
+    await page.waitForFunction(() => document.querySelectorAll("article.row").length === 0);
+    assert.equal(await page.locator("#metricFailing").innerText(), "0", "failing metric drops to 0 after dismiss");
   } finally {
     await browser.close();
   }
