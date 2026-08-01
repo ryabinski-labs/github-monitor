@@ -98,7 +98,7 @@ Token scopes you need depend on what you want to see:
 - Quota-aware pausing: when quota runs low, auto-refresh pauses and the manual refresh button is disabled until the reset window
 - Browser notifications and an in-app inbox for CI/CD completions and new conflicts
 - Optional **auto-merge** countdown for passing PRs with completed checks
-- Optional automatic Dependabot cleanup: closes PRs with failing CI, and cancels queued runs once they reach the configured threshold
+- Optional automatic Dependabot cleanup: closes PRs with failing CI, cancels queued runs once they reach the configured threshold, and auto-dismisses failed Dependabot runs from Failing CI
 
 ## How it works
 
@@ -131,6 +131,7 @@ flowchart LR
 
 - **Closes failing Dependabot PRs at any queue depth.** Every open Dependabot PR whose head commit has a completed check run or commit status in a failed conclusion is closed — a lone red PR is not left waiting for a backlog to form. PRs with passing, pending, or unknown CI are never touched.
 - **Cancels active Dependabot runs only past the threshold.** When that many unique GitHub Actions runs are queued, it also cancels every active Dependabot-triggered workflow run in scope.
+- **Auto-dismisses failed Dependabot runs.** Dependabot's own update runs (for example `dependabot/dependabot-updates`) fail on Dependabot's schedule with no pull request to close and no active run to cancel, so cleanup can never resolve them and they would otherwise sit in Failing CI forever. With cleanup enabled they arrive pre-dismissed: out of the list and the Failing CI tile, still reachable behind the dismissed bar's **Show** toggle, and marked *Auto-dismissed*. This is a view-only decision — nothing is written to your `localStorage` dismissals, and **Restore all** never touches them.
 
 Discovery is paginated, cleanup attempts have a five-minute cooldown, and low GitHub API quota pauses mutation. Use `DEPENDABOT_QUEUE_OWNERS` as a comma-separated owner allowlist; when omitted, all owners accessible to the credential are included. The credential must have Actions and pull-request write access.
 

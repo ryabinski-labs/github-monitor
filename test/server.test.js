@@ -44,6 +44,7 @@ import {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
@@ -249,6 +250,25 @@ test("Dependabot workflow detection is exact and queue depth deduplicates runs",
     { repo: "acme/app", runId: 2, status: "in_progress" },
     { repo: "acme/app", runId: 3, status: "completed" }
   ]), 1);
+});
+
+test("failed Dependabot runs arrive pre-dismissed only when cleanup is enabled", () => {
+  const runs = [
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#13", dependabot: true, conclusion: "failure" },
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#14", conclusion: "failure" }
+  ];
+
+  const disabled = markAutoDismissedDependabotRuns(runs, { enabled: false });
+  assert.equal(disabled[0].autoDismissed, undefined);
+  assert.equal(disabled[1].autoDismissed, undefined);
+
+  const enabled = markAutoDismissedDependabotRuns(runs, { enabled: true });
+  assert.equal(enabled[0].autoDismissed, true);
+  assert.match(enabled[0].autoDismissReason, /Dependabot/);
+  assert.equal(enabled[1].autoDismissed, undefined);
+  // The caller's rows are never mutated in place.
+  assert.equal(runs[0].autoDismissed, undefined);
+  assert.deepEqual(markAutoDismissedDependabotRuns(undefined, { enabled: true }), []);
 });
 
 test("refresh recommendations pause when GitHub API quota is low", () => {

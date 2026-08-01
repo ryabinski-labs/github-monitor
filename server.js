@@ -904,6 +904,19 @@ function shouldCleanDependabotQueue(queueDepth, threshold = DEPENDABOT_QUEUE_THR
   return threshold > 0 && queueDepth >= threshold;
 }
 
+// Dependabot's own update runs (`dynamic/dependabot/dependabot-updates` and the
+// like) fail on Dependabot's schedule with no pull request to close and no
+// completed run to cancel — cleanup can never resolve them, so they sit in
+// Failing CI forever. When cleanup is opted in, hand them to the dashboard
+// pre-dismissed: they leave the actionable list and the tile counts but stay
+// reachable behind the dismissed bar's "Show" toggle.
+function markAutoDismissedDependabotRuns(runs, { enabled = DEPENDABOT_QUEUE_THRESHOLD > 0 } = {}) {
+  if (!enabled || !Array.isArray(runs)) return runs || [];
+  return runs.map((run) => (run?.dependabot
+    ? { ...run, autoDismissed: true, autoDismissReason: "Dependabot run — auto-dismissed by cleanup" }
+    : run));
+}
+
 function parseOwners(value) {
   if (value == null) return [];
   const raw = Array.isArray(value) ? value : String(value).split(",");
@@ -2559,6 +2572,7 @@ async function fetchActionsForRepo(repo) {
         ...((run.pull_requests || []).some((item) => item.number)
           ? { pullRequestNumbers: (run.pull_requests || []).map((item) => item.number).filter(Boolean) }
           : {}),
+        ...(isDependabotWorkflowRun(run) ? { dependabot: true } : {}),
         title: run.display_title || run.name || "",
         url: run.html_url || "",
         failureReason: await fetchWorkflowRunFailureReason(repo, run)
@@ -3012,7 +3026,9 @@ async function buildDashboardData(requestUrl) {
 
   if (repos.length) {
     const actionGroups = await mapLimit(repos, jobs, fetchActionsForRepo);
-    failedActions = uniqueBy(actionGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run));
+    failedActions = markAutoDismissedDependabotRuns(
+      uniqueBy(actionGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
+    );
     runningActions = uniqueBy(actionGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
     pullRequests = applyActionRunEvidenceToPullRequests(pullRequests, { runningActions, failedActions });
   }
@@ -3602,6 +3618,7 @@ export {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
   cleanupDependabotWorkload,
   runDependabotQueueScan,

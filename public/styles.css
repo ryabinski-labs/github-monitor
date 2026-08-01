@@ -935,6 +935,15 @@ button.metric.active .metric-dot {
 .row-dismiss:hover { color: var(--ink); background: var(--paper); }
 .row-dismiss:focus-visible { outline: 2px solid var(--accent, var(--ink)); outline-offset: 2px; }
 
+/* Static counterpart of .row-dismiss for rows the server dismissed on its own:
+   it explains the state rather than offering an action, so no hover/focus. */
+.row-dismiss-auto {
+  display: inline-flex;
+  align-items: center;
+  cursor: default;
+  color: var(--muted);
+}
+
 .row-dismissed { opacity: 0.55; }
 .row-dismissed:hover { opacity: 1; }
 
