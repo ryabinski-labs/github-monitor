@@ -382,7 +382,12 @@ function visibleDismissKeyGroups() {
   const query = state.filter.trim().toLowerCase();
   const rows = view.rows(data) || [];
   const filtered = query ? rows.filter((row) => rowText(row).includes(query)) : rows;
-  return filtered.map((row) => dismissKeys(row)).filter((keys) => keys.length);
+  // Auto-dismissed rows are the server's call, not the user's: bulk dismiss and
+  // bulk restore both leave them alone.
+  return filtered
+    .filter((row) => !isAutoDismissed(row))
+    .map((row) => dismissKeys(row))
+    .filter((keys) => keys.length);
 }
 
 function dismissAllVisible() {
@@ -586,6 +591,21 @@ function matchingDismissKey(keys) {
 
 function anyDismissed(keys) {
   return Boolean(matchingDismissKey(keys));
+}
+
+// Rows the server already dismissed for us (today: failed Dependabot runs, when
+// Dependabot cleanup is enabled). They behave exactly like a locally dismissed
+// row — hidden from the list and the counts, revealed by "Show" — but are not
+// written to localStorage, so "Restore all" never fights the server over them.
+function isAutoDismissed(row) {
+  return Boolean(row?.autoDismissed);
+}
+
+// Whether a row is hidden from the active list, for any reason.
+function rowIsDismissed(row, keys) {
+  if (isAutoDismissed(row)) return true;
+  const list = normalizeDismissKeys(keys === undefined ? dismissKeys(row) : keys);
+  return list.length > 0 && anyDismissed(list);
 }
 
 function flattenTraces(traces) {
@@ -1488,13 +1508,11 @@ function updateTabTitle(data) {
   document.title = failing > 0 ? `(${failing}) PR Command Deck` : "PR Command Deck";
 }
 
-// Counts how many rows in a lane the user has locally dismissed.
+// Counts how many rows in a lane are dismissed — locally by the user, or
+// automatically by the server (see isAutoDismissed).
 function dismissedInLane(rows, keyFn) {
   if (!Array.isArray(rows)) return 0;
-  return rows.reduce((count, row) => {
-    const keys = normalizeDismissKeys(keyFn(row));
-    return count + (keys.length && anyDismissed(keys) ? 1 : 0);
-  }, 0);
+  return rows.reduce((count, row) => count + (rowIsDismissed(row, keyFn(row)) ? 1 : 0), 0);
 }
 
 // The scoreboard tiles and rail counts come from the server summary, which has
@@ -1522,8 +1540,7 @@ function filteredVisibleRows(rows, isDismissable = () => false) {
   const list = Array.isArray(rows) ? rows : [];
   return list.filter((row) => {
     if (query && !rowText(row).includes(query)) return false;
-    const keys = normalizeDismissKeys(isDismissable(row));
-    return !(keys.length && anyDismissed(keys));
+    return !rowIsDismissed(row, isDismissable(row));
   });
 }
 
@@ -1684,6 +1701,7 @@ function render() {
   let dismissedCount = 0;
   let activeDismissable = 0;
   for (const row of filtered) {
+    if (isAutoDismissed(row)) { dismissedCount += 1; continue; }
     const keys = dismissKeys(row);
     if (!keys.length) continue;
     if (anyDismissed(keys)) dismissedCount += 1;
@@ -1691,7 +1709,7 @@ function render() {
   }
   const rows = state.showDismissed
     ? filtered
-    : filtered.filter((row) => { const keys = dismissKeys(row); return !(keys.length && anyDismissed(keys)); });
+    : filtered.filter((row) => !rowIsDismissed(row));
   syncFilterUI(rows.length, all.length);
 
   const body = rows.length
@@ -2413,8 +2431,11 @@ function renderWorkflowRunRow(row, view) {
     ? [`Reason: ${failureDetail(row, "CI failed")}`, timeDetail].filter(Boolean).join(" · ")
     : timeDetail;
   const keys = dismissKeys(row);
-  const dismissed = anyDismissed(keys);
-  const dismissButton = keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
+  const auto = isAutoDismissed(row);
+  const dismissed = auto || anyDismissed(keys);
+  const dismissButton = auto
+    ? `<span class="row-dismiss row-dismiss-auto" title="${escapeHtml(row.autoDismissReason || "Dismissed automatically")}">Auto-dismissed</span>`
+    : keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   const phaseBadge = renderPhaseBadge(row);
   return `
     <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
