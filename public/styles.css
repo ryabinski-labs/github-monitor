@@ -1,9 +1,52 @@
 :root {
+  --paper: #10161d;
+  --paper-warm: #17212a;
+  --paper-strong: #1b2630;
+  --paper-card: #202c37;
+  --surface-hover: #293844;
+  --ink: #eef3f5;
+  --ink-deep: #080c10;
+  --ink-soft: #364651;
+  --muted: #91a0aa;
+  --muted-strong: #c0cad0;
+  --line: rgba(214, 228, 235, 0.12);
+  --line-strong: rgba(214, 228, 235, 0.24);
+
+  --green: #66cf91;
+  --green-soft: #193d2a;
+  --red: #ff7a70;
+  --red-soft: #482629;
+  --amber: #efb75d;
+  --amber-soft: #49391d;
+  --blue: #70bef1;
+  --blue-soft: #193d55;
+  --violet: #c39af5;
+  --violet-soft: #36284c;
+  --gray: #a5b2ba;
+  --gray-soft: #2b3943;
+  --glow-red: rgba(255, 122, 112, 0.10);
+  --glow-blue: rgba(112, 190, 241, 0.12);
+
+  --serif: ui-serif, Georgia, "Times New Roman", serif;
+  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 14px 34px -22px rgba(0, 0, 0, 0.72);
+  --shadow-soft: 0 1px 0 rgba(255, 255, 255, 0.045) inset, 0 8px 22px -16px rgba(0, 0, 0, 0.58);
+  --radius: 6px;
+  --radius-pill: 999px;
+
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
   --paper: #f3eee2;
   --paper-warm: #ece5d3;
   --paper-strong: #faf6ec;
   --paper-card: #fdfaf2;
+  --surface-hover: #ffffff;
   --ink: #14181f;
+  --ink-deep: #000000;
   --ink-soft: #d8d3c4;
   --muted: #7a7568;
   --muted-strong: #5d5a51;
@@ -22,15 +65,11 @@
   --violet-soft: #e0d4ee;
   --gray: #87806f;
   --gray-soft: #e3ddcf;
-
-  --serif: ui-serif, Georgia, "Times New Roman", serif;
-  --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --glow-red: rgba(168, 54, 43, 0.06);
+  --glow-blue: rgba(31, 92, 140, 0.06);
 
   --shadow-card: 0 1px 0 rgba(255, 252, 240, 0.9) inset, 0 14px 34px -22px rgba(40, 32, 16, 0.28);
   --shadow-soft: 0 1px 0 rgba(255, 252, 240, 0.6) inset, 0 8px 22px -16px rgba(40, 32, 16, 0.18);
-  --radius: 6px;
-  --radius-pill: 999px;
 
   color-scheme: light;
 }
@@ -50,8 +89,8 @@ body {
   font-family: var(--sans);
   font-optical-sizing: auto;
   background:
-    radial-gradient(1100px 700px at 88% -10%, rgba(168, 54, 43, 0.06), transparent 60%),
-    radial-gradient(900px 600px at -10% 12%, rgba(31, 92, 140, 0.06), transparent 58%),
+    radial-gradient(1100px 700px at 88% -10%, var(--glow-red), transparent 60%),
+    radial-gradient(900px 600px at -10% 12%, var(--glow-blue), transparent 58%),
     var(--paper);
   background-attachment: fixed;
 }
@@ -196,7 +235,7 @@ kbd {
   border-color: var(--ink);
   transition: background 200ms ease, transform 160ms ease;
 }
-.refresh:hover:not(:disabled) { background: #000; }
+.refresh:hover:not(:disabled) { background: var(--ink-deep); }
 .refresh:active { transform: translateY(1px); }
 .refresh:disabled { opacity: 0.55; cursor: not-allowed; }
 .refresh.loading { cursor: progress; }
@@ -334,7 +373,7 @@ kbd {
   color: var(--paper-strong);
   border-color: var(--ink);
 }
-.owner-picker-action-primary:hover { background: #000; }
+.owner-picker-action-primary:hover { background: var(--ink-deep); }
 
 /* —————————————————————— META STRIP —————————————————————— */
 .meta-strip {
@@ -479,7 +518,7 @@ button.metric { cursor: pointer; }
 button.metric:hover {
   transform: translateY(-1px);
   border-color: var(--line-strong);
-  box-shadow: 0 1px 0 rgba(255, 252, 240, 0.9) inset, 0 18px 36px -22px rgba(40, 32, 16, 0.32);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06) inset, 0 18px 36px -22px rgba(0, 0, 0, 0.76);
 }
 
 button.metric:focus-visible {
@@ -519,6 +558,35 @@ button.metric.active .metric-dot {
   font-weight: 600;
   color: var(--ink);
   font-feature-settings: "tnum";
+}
+
+.appearance-picker {
+  display: inline-flex;
+  gap: 7px;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 7px 0 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--paper-strong);
+  color: var(--muted-strong);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.appearance-picker:focus-within { border-color: var(--ink); }
+
+.appearance-picker select {
+  min-height: 24px;
+  padding: 0 20px 0 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
 }
 
 .metric-label {
@@ -616,7 +684,7 @@ button.metric.active .metric-dot {
 .error-panel.warning {
   border-color: rgba(181, 127, 45, 0.32);
   background: rgba(181, 127, 45, 0.12);
-  color: #7b5420;
+  color: var(--amber);
 }
 
 .toast-region {
@@ -804,7 +872,7 @@ button.metric.active .metric-dot {
 
 .filter-box:focus-within {
   border-color: var(--ink);
-  background: white;
+  background: var(--surface-hover);
 }
 
 .filter-box input {
@@ -879,8 +947,8 @@ button.metric.active .metric-dot {
 .row:hover {
   transform: translateY(-1px);
   border-color: var(--line-strong);
-  background: white;
-  box-shadow: 0 14px 28px -22px rgba(40, 32, 16, 0.24);
+  background: var(--surface-hover);
+  box-shadow: 0 14px 28px -22px rgba(0, 0, 0, 0.72);
 }
 
 .row-main { min-width: 0; }
@@ -1780,6 +1848,8 @@ button.metric.active .metric-dot {
 
 @media (max-width: 720px) {
   .shell { width: min(100vw - 20px, 1480px); }
+  .topbar { grid-template-columns: 1fr; gap: 10px; }
+  .controls { justify-content: flex-start; }
   .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .rail { grid-template-columns: 1fr; }
   .segmented { width: 100%; }
@@ -1879,7 +1949,7 @@ button.metric.active .metric-dot {
   background: var(--red);
 }
 .row.row-conflict:hover {
-  background: color-mix(in srgb, var(--red-soft) 18%, white);
+  background: color-mix(in srgb, var(--red-soft) 58%, var(--surface-hover));
 }
 
 /* —————————————————————— INBOX BELL —————————————————————— */
@@ -1949,8 +2019,8 @@ button.metric.active .metric-dot {
   border-radius: var(--radius);
   background: var(--paper-card);
   box-shadow:
-    0 1px 0 rgba(255, 252, 240, 0.9) inset,
-    0 24px 50px -28px rgba(40, 32, 16, 0.5);
+    0 1px 0 rgba(255, 255, 255, 0.06) inset,
+    0 24px 50px -28px rgba(0, 0, 0, 0.78);
   overflow: hidden;
   animation: inbox-in 160ms ease-out;
 }
