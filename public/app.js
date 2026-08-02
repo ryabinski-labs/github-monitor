@@ -52,6 +52,7 @@ const state = {
   view: persisted.view || "fail",
   traceFilter: persisted.traceFilter || "flagged",
   filter: persisted.filter || "",
+  theme: persisted.theme === "light" ? "light" : "dark",
   notifications: persisted.notifications !== false,
   owners: Array.isArray(persisted.owners) ? persisted.owners.filter((value) => typeof value === "string" && value.trim()) : [],
   accounts: [],
@@ -181,6 +182,7 @@ const els = {
   filter: document.querySelector("#filter"),
   filterClear: document.querySelector("#filterClear"),
   filterCount: document.querySelector("#filterCount"),
+  theme: document.querySelector("#theme"),
   toastRegion: document.querySelector("#toastRegion"),
   inboxToggle: document.querySelector("#inboxToggle"),
   inboxBadge: document.querySelector("#inboxBadge"),
@@ -476,6 +478,7 @@ function persist() {
         view: state.view,
         traceFilter: state.traceFilter,
         filter: state.filter,
+        theme: state.theme,
         autoMerge: state.autoMerge,
         notifications: state.notifications,
         owners: state.owners
@@ -1506,6 +1509,12 @@ async function refresh({ source = "manual" } = {}) {
 function updateTabTitle(data) {
   const failing = adjustedSummary(data).failingPrs ?? 0;
   document.title = failing > 0 ? `(${failing}) PR Command Deck` : "PR Command Deck";
+}
+
+function applyTheme(theme) {
+  state.theme = theme === "light" ? "light" : "dark";
+  document.documentElement.dataset.theme = state.theme;
+  els.theme.value = state.theme;
 }
 
 // Counts how many rows in a lane are dismissed — locally by the user, or
@@ -2890,7 +2899,12 @@ document.querySelectorAll("button.metric").forEach((button) => {
 });
 
 els.autoMerge.checked = state.autoMerge;
+applyTheme(state.theme);
 els.refresh.addEventListener("click", () => refresh());
+els.theme.addEventListener("change", () => {
+  applyTheme(els.theme.value);
+  persist();
+});
 els.includeCd.addEventListener("change", refresh);
 els.includeRunners.addEventListener("change", refresh);
 els.autoRefresh.addEventListener("change", () => {

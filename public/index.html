@@ -5,6 +5,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PR Command Deck</title>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <script>
+      try {
+        const settings = JSON.parse(localStorage.getItem("pr-deck:v1") || "{}");
+        document.documentElement.dataset.theme = settings.theme === "light" ? "light" : "dark";
+      } catch {
+        document.documentElement.dataset.theme = "dark";
+      }
+    </script>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -25,6 +33,13 @@
             <span class="repo-chip-label">Repos</span>
             <strong id="metricRepos">0</strong>
           </span>
+          <label class="appearance-picker" title="Choose the dashboard color theme">
+            <span>Appearance</span>
+            <select id="theme" aria-label="Dashboard appearance">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+          </label>
           <div class="segmented" role="group" aria-label="Scope">
             <button class="segment active" type="button" data-mode="all" aria-pressed="true">All</button>
             <button class="segment" type="button" data-mode="owned" aria-pressed="false">Owned</button>
