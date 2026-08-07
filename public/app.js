@@ -1735,6 +1735,9 @@ function render() {
 // after app updates.
 function dismissKeys(row) {
   if (!row) return [];
+  if (row.kind === "workflowRun" && ["fail", "running"].includes(state.view)) {
+    return normalizeDismissKeys(actionKey(row));
+  }
   if (state.view === "fail") {
     return normalizeDismissKeys(row.kind === "workflowRun" ? actionKey(row) : prKey(row));
   }

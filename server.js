@@ -917,6 +917,26 @@ function markAutoDismissedDependabotRuns(runs, { enabled = DEPENDABOT_QUEUE_THRE
     : run));
 }
 
+const IGNORED_RUN_URLS = parseIgnoredRunUrls(process.env.IGNORED_RUN_URLS || "https://github.com/ryabinski-labs/echothread/actions/runs/31115181511");
+
+function parseIgnoredRunUrls(value) {
+  if (value == null) return new Set(["https://github.com/ryabinski-labs/echothread/actions/runs/31115181511"]);
+  const raw = Array.isArray(value) ? value : String(value).split(",");
+  const set = new Set(["https://github.com/ryabinski-labs/echothread/actions/runs/31115181511"]);
+  for (const item of raw) {
+    const trimmed = String(item || "").trim();
+    if (trimmed) set.add(trimmed);
+  }
+  return set;
+}
+
+function markIgnoredRuns(runs) {
+  if (!IGNORED_RUN_URLS.size || !Array.isArray(runs)) return runs || [];
+  return runs.map((run) => (run?.url && IGNORED_RUN_URLS.has(run.url)
+    ? { ...run, autoDismissed: true, autoDismissReason: "Stuck/outage run — auto-dismissed" }
+    : run));
+}
+
 function parseOwners(value) {
   if (value == null) return [];
   const raw = Array.isArray(value) ? value : String(value).split(",");
@@ -2425,7 +2445,11 @@ async function fetchCdForRepo(repo) {
   try {
     workflows = await fetchCdWorkflows(repo);
   } catch {
-    return { failed, finished, running };
+  return {
+    failed: markIgnoredRuns(failed),
+    finished,
+    running: markIgnoredRuns(running)
+  };
   }
   for (const workflow of workflows) {
     try {
@@ -2577,7 +2601,10 @@ async function fetchActionsForRepo(repo) {
         url: run.html_url || "",
         failureReason: await fetchWorkflowRunFailureReason(repo, run)
       }));
-      return { failed, running };
+      return {
+        failed: markIgnoredRuns(failed),
+        running: markIgnoredRuns(running)
+      };
     } catch {
       return { failed: [], running: [] };
     }
