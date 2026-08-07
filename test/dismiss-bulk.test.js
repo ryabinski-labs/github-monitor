@@ -144,7 +144,7 @@ function failingPr(repo, number, author = "dependabot[bot]") {
   };
 }
 
-async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedPrs = [], failedCdRuns = [] } = {}) {
+async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedPrs = [], failedCdRuns = [], runningRuns = [], runningPrs = [] } = {}) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
 
@@ -156,19 +156,29 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedP
   }, view);
 
   const totalFailing = failedRuns.length + failedPrs.length;
+  const totalRunning = runningRuns.length + runningPrs.length;
   const statusBody = {
     ...statusFixture,
     summary: {
       ...statusFixture.summary,
       ...(totalFailing ? { failingPrs: totalFailing } : {}),
-      ...(failedCdRuns.length ? { failedCd: failedCdRuns.length } : {})
+      ...(failedCdRuns.length ? { failedCd: failedCdRuns.length } : {}),
+      ...(totalRunning ? { runningPrs: totalRunning } : {})
     },
     pullRequests: {
       ...statusFixture.pullRequests,
-      ...(failedPrs.length ? { fail: failedPrs } : {})
+      ...(failedPrs.length ? { fail: failedPrs } : {}),
+      ...(runningPrs.length ? { running: runningPrs } : {})
     },
-    ...(failedRuns.length ? { actions: { ...statusFixture.actions, failed: failedRuns } } : {}),
-    ...(failedCdRuns.length ? { cd: { ...statusFixture.cd, failed: failedCdRuns } } : {})
+    actions: {
+      ...statusFixture.actions,
+      ...(failedRuns.length ? { failed: failedRuns } : {}),
+      ...(runningRuns.length ? { running: runningRuns } : {})
+    },
+    cd: {
+      ...statusFixture.cd,
+      ...(failedCdRuns.length ? { failed: failedCdRuns } : {})
+    }
   };
 
   await page.route("**/*", async (route) => {
@@ -324,6 +334,51 @@ test("Dismissing a failing Dependabot PR in Failing CI lane hides it and updates
     await page.locator("[data-dismiss-key]").click();
     await page.waitForFunction(() => document.querySelectorAll("article.row").length === 0);
     assert.equal(await page.locator("#metricFailing").innerText(), "0", "failing metric drops to 0 after dismiss");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("An auto-dismissed running CI run drops the CI Running metric and nav count to 0", { skip }, async () => {
+  const autoDismissedRun = {
+    ...workflowRun("ryabinski-labs/echothread", 571),
+    status: "in_progress",
+    conclusion: null,
+    autoDismissed: true,
+    autoDismissReason: "Stuck/outage run — auto-dismissed"
+  };
+  const { browser, page } = await openDashboard({
+    view: "running",
+    runningRuns: [autoDismissedRun]
+  });
+  try {
+    await page.waitForSelector(".dismiss-bar-label");
+    assert.equal(await page.locator("#metricRunning").innerText(), "0", "CI Running top metric is 0 when run is auto-dismissed");
+    assert.equal(await page.locator("#navRunning").innerText(), "0", "CI Running rail nav count is 0 when run is auto-dismissed");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Dismissing a running CI workflow run drops the CI Running tile and nav count", { skip }, async () => {
+  const runningRun = {
+    ...workflowRun("acme/alpha", 201),
+    status: "in_progress",
+    conclusion: null
+  };
+  const { browser, page } = await openDashboard({
+    view: "running",
+    runningRuns: [runningRun]
+  });
+  try {
+    await page.waitForSelector("[data-dismiss-key]");
+    assert.equal(await page.locator("#metricRunning").innerText(), "1", "CI Running metric starts at 1");
+    assert.equal(await page.locator("#navRunning").innerText(), "1", "CI Running nav count starts at 1");
+
+    await page.locator("[data-dismiss-key]").click();
+    await page.waitForFunction(() => document.querySelectorAll("article.row").length === 0);
+    assert.equal(await page.locator("#metricRunning").innerText(), "0", "CI Running metric drops to 0 after dismiss");
+    assert.equal(await page.locator("#navRunning").innerText(), "0", "CI Running nav count drops to 0 after dismiss");
   } finally {
     await browser.close();
   }
