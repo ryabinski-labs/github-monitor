@@ -172,6 +172,9 @@ const els = {
   autoMerge: document.querySelector("#autoMerge"),
   notifications: document.querySelector("#notifications"),
   refresh: document.querySelector("#refresh"),
+  refreshPauseNotice: document.querySelector("#refreshPauseNotice"),
+  refreshPauseTitle: document.querySelector("#refreshPauseTitle"),
+  refreshPauseDetail: document.querySelector("#refreshPauseDetail"),
   nextRefresh: document.querySelector("#nextRefresh"),
   rateLimit: document.querySelector("#rateLimit"),
   loading: document.querySelector("#loading"),
@@ -1305,6 +1308,34 @@ function quotaBlockMessage(block) {
   return `${block.resource} API quota is low${quota}. Refresh is paused until ${formatTime(block.retryAt)}.`;
 }
 
+function renderRefreshPauseNotice(quotaBlock) {
+  let title = "";
+  let detail = "";
+  let reason = "";
+
+  if (quotaBlock) {
+    const quota = Number.isFinite(Number(quotaBlock.remaining)) && Number.isFinite(Number(quotaBlock.limit))
+      ? ` (${quotaBlock.remaining}/${quotaBlock.limit})`
+      : "";
+    title = "Live updates paused";
+    detail = `${quotaBlock.resource} API quota is too low${quota}. No new GitHub data will be pulled until ${formatTime(quotaBlock.retryAt)}. Pulling resumes automatically.`;
+    reason = "quota";
+  } else if (!els.autoRefresh.checked) {
+    title = "Automatic pulling paused";
+    detail = "New GitHub data will only be pulled when you use Refresh. Turn Auto back on to resume automatic updates.";
+    reason = "manual";
+  }
+
+  const hidden = !reason;
+  if (!hidden) {
+    if (els.refreshPauseTitle.textContent !== title) els.refreshPauseTitle.textContent = title;
+    if (els.refreshPauseDetail.textContent !== detail) els.refreshPauseDetail.textContent = detail;
+    els.refreshPauseNotice.dataset.reason = reason;
+  }
+  els.refreshPauseNotice.classList.toggle("hidden", hidden);
+  els.refreshPauseNotice.setAttribute("aria-hidden", hidden ? "true" : "false");
+}
+
 function rateLimitTooltip(tightest, quotaState, quotaBlock, rateLimit) {
   if (!tightest) {
     return "GitHub API quota is not available until the first scan finishes.";
@@ -1388,6 +1419,7 @@ function renderRefreshStatus() {
     els.rateLimit.title = "GitHub API quota will appear after the first scan finishes.";
     els.rateLimit.setAttribute("aria-label", els.rateLimit.title);
   }
+  renderRefreshPauseNotice(quotaBlock);
   updateRefreshButtonState();
 }
 
@@ -3061,8 +3093,13 @@ els.content.addEventListener("click", (event) => {
 /* keyboard shortcuts */
 document.addEventListener("keydown", (event) => {
   const target = event.target;
-  const inField = target instanceof HTMLElement &&
-    (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+  const inputType = target instanceof HTMLInputElement ? target.type : "";
+  const inField = target instanceof HTMLElement && (
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT" ||
+    target.isContentEditable ||
+    (target.tagName === "INPUT" && ["email", "number", "password", "search", "tel", "text", "url"].includes(inputType))
+  );
 
   if (event.key === "Escape" && target === els.filter) {
     state.filter = "";
