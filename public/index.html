@@ -117,6 +117,27 @@
           </button>
         </section>
 
+        <section
+          id="refreshPauseNotice"
+          class="refresh-pause-notice hidden"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          aria-hidden="true"
+        >
+          <span class="refresh-pause-symbol" aria-hidden="true">
+            <svg viewBox="0 0 24 24">
+              <rect x="6" y="4" width="4" height="16" rx="1" />
+              <rect x="14" y="4" width="4" height="16" rx="1" />
+            </svg>
+          </span>
+          <span class="refresh-pause-copy">
+            <strong id="refreshPauseTitle">Live updates paused</strong>
+            <span id="refreshPauseDetail"></span>
+          </span>
+          <span class="refresh-pause-stale">Data may be stale</span>
+        </section>
+
         <aside
           id="inboxPanel"
           class="inbox-panel hidden"
