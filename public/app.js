@@ -39,6 +39,8 @@ const QUOTA_SLOW_RATIO = 0.15;
 // QUOTA_ABSOLUTE_LIMIT_FLOOR in server.js.
 const QUOTA_ABSOLUTE_LIMIT_FLOOR = 1000;
 const DISMISSED_KEY = "pr-deck:dismissed:v1";
+const RERUN_REQUESTED_KEY = "pr-deck:rerun-requested:v1";
+const RERUN_REQUESTED_TTL_MS = 60 * 1000;
 // Dismissals are a local per-user view preference (no server/cloud state — see
 // the state-architecture note in the README). They auto-expire so the list
 // can't grow forever and a brand-new run for the same lane reappears on its own.
@@ -76,6 +78,8 @@ const state = {
   merged: new Set(),
   closing: new Set(),
   closed: new Set(),
+  rerunning: new Set(),
+  rerunRequested: loadRecentReruns(),
   autoMerges: new Map(),
   autoMergeTicker: null,
   autoMergeFollowUpTimer: null
@@ -346,6 +350,35 @@ function loadDismissed() {
   } catch {
     return {};
   }
+}
+
+function loadRecentReruns() {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(RERUN_REQUESTED_KEY) || "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const cutoff = Date.now() - RERUN_REQUESTED_TTL_MS;
+    const pruned = {};
+    for (const [key, at] of Object.entries(raw)) {
+      const time = new Date(at).getTime();
+      if (Number.isFinite(time) && time >= cutoff) pruned[key] = at;
+    }
+    sessionStorage.setItem(RERUN_REQUESTED_KEY, JSON.stringify(pruned));
+    return pruned;
+  } catch {
+    return {};
+  }
+}
+
+function rerunWasRequested(key) {
+  const time = new Date(state.rerunRequested[key] || 0).getTime();
+  return Number.isFinite(time) && time >= Date.now() - RERUN_REQUESTED_TTL_MS;
+}
+
+function markRerunRequested(key) {
+  state.rerunRequested[key] = new Date().toISOString();
+  try {
+    sessionStorage.setItem(RERUN_REQUESTED_KEY, JSON.stringify(state.rerunRequested));
+  } catch {}
 }
 
 function savePhaseAges() {
@@ -1887,6 +1920,59 @@ function mergeBlockReason(row) {
   return "";
 }
 
+function rerunKey(repo, runId) {
+  return `${repo}:${runId}`;
+}
+
+function failedRunsForRow(row) {
+  const source = Array.isArray(row?.failedRuns) && row.failedRuns.length
+    ? row.failedRuns
+    : row?.runId ? [{ runId: row.runId, workflow: row.workflow, url: row.url }] : [];
+  const seen = new Set();
+  return source.filter((run) => {
+    const runId = Number(run?.runId);
+    if (!Number.isSafeInteger(runId) || runId < 1 || seen.has(runId)) return false;
+    seen.add(runId);
+    return true;
+  }).map((run) => ({ ...run, runId: Number(run.runId) }));
+}
+
+function renderRerunButton(row) {
+  const runs = failedRunsForRow(row);
+  if (!row?.repo || !runs.length) return "";
+  const keys = runs.map((run) => rerunKey(row.repo, run.runId));
+  const isRerunning = keys.some((key) => state.rerunning.has(key));
+  const isQueued = keys.every(rerunWasRequested);
+  const label = isQueued
+    ? "Rerun queued"
+    : isRerunning
+    ? "Rerunning"
+    : runs.length > 1 ? `Rerun ${runs.length} workflows` : "Rerun failed";
+  const target = runs.length > 1
+    ? `${runs.length} failed workflows for ${row.repo}`
+    : `${[runs[0].workflow || row.workflow || "workflow", row.runNumber].filter(Boolean).join(" ")} in ${row.repo}`;
+  const ariaLabel = isQueued
+    ? `Rerun queued for ${target}`
+    : isRerunning
+    ? `Rerunning ${target}`
+    : runs.length > 1 ? `Rerun ${target}` : `Rerun failed jobs for ${target}`;
+  return `<button
+    class="rerun-button"
+    type="button"
+    data-repo="${escapeHtml(row.repo)}"
+    data-run-ids="${escapeHtml(runs.map((run) => run.runId).join(","))}"
+    data-multiple="${runs.length > 1 ? "true" : "false"}"
+    data-rerun-label="${escapeHtml(target)}"
+    data-state="${isQueued ? "queued" : isRerunning ? "loading" : "ready"}"
+    aria-label="${escapeHtml(ariaLabel)}"
+    title="${escapeHtml(isQueued ? "GitHub accepted the rerun request" : isRerunning ? "Requesting a rerun from GitHub" : `Rerun only failed jobs and their dependent jobs for ${target}`)}"
+    ${isQueued || isRerunning ? "disabled" : ""}
+  >
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.34 5.66M20 5v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>${escapeHtml(label)}</span>
+  </button>`;
+}
+
 function renderPrActions(row, dismissButton = "") {
   const key = mergeKey(row.repo, row.number);
   const reason = mergeBlockReason(row);
@@ -1942,6 +2028,7 @@ function renderPrActions(row, dismissButton = "") {
     : "";
   return `
     <div class="row-actions">
+      ${row.state === "fail" ? renderRerunButton(row) : ""}
       ${mergeButton}
       ${closeButton}
       <a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open PR</a>
@@ -2023,6 +2110,7 @@ function renderCdRow(row, view, viewKey) {
       <div class="tag-group"><div class="${tagClass}">${escapeHtml(status)}</div>${phaseBadge}</div>
       <div class="meta">${escapeHtml(detail)}</div>
       <div class="row-actions">
+        ${viewKey === "failedCd" ? renderRerunButton(row) : ""}
         ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
         ${dismissButton}
       </div>
@@ -2112,7 +2200,7 @@ function renderTraceRow(row) {
           <div class="title">${escapeHtml(row.numberLabel || `#${row.prNumber}`)} ${escapeHtml(row.title)}</div>
         </div>
         <div class="tag tag-${escapeHtml(statusClass(row.severity || row.status))}">${escapeHtml(status)}</div>
-        <div class="trace-head-actions">${action}${dismissButton}</div>
+        <div class="trace-head-actions">${renderRerunButton(row)}${action}${dismissButton}</div>
       </div>
       <p class="trace-reason">${escapeHtml(row.reason || "Pipeline state is being traced.")}</p>
       ${renderTraceStages(row.stages || [])}
@@ -2443,7 +2531,10 @@ function renderFinishedCdRow(row, view) {
         <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
         <div class="tag tag-${escapeHtml(statusTone)}" role="status" aria-label="${escapeHtml(tagAriaLabel)}">${tagLabel}</div>
         <div class="meta">${escapeHtml(timeDetail)}</div>
-        ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
+        <div class="row-actions">
+          ${outcome === "failure" ? renderRerunButton(row) : ""}
+          ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
+        </div>
       </div>
       <div class="cd-review">
         <div class="review-summary">
@@ -2495,6 +2586,7 @@ function renderWorkflowRunRow(row, view) {
       <div class="tag-group"><div class="tag">${escapeHtml(status)}</div>${phaseBadge}</div>
       <div class="meta">${escapeHtml(detail)}</div>
       <div class="row-actions">
+        ${row.conclusion ? renderRerunButton(row) : ""}
         ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
         ${dismissButton}
       </div>
@@ -2877,6 +2969,48 @@ async function closePullRequest(button) {
   }
 }
 
+async function rerunFailedJobs(button) {
+  const repo = button.dataset.repo;
+  const runIds = String(button.dataset.runIds || "")
+    .split(",")
+    .map(Number)
+    .filter((runId) => Number.isSafeInteger(runId) && runId > 0);
+  const label = button.dataset.rerunLabel || repo;
+  const pending = runIds.filter((runId) => {
+    const key = rerunKey(repo, runId);
+    return !state.rerunning.has(key) && !rerunWasRequested(key);
+  });
+  if (!repo || !pending.length) return;
+
+  pending.forEach((runId) => state.rerunning.add(rerunKey(repo, runId)));
+  setError("");
+  render();
+  const results = await Promise.allSettled(pending.map(async (runId) => {
+    const response = await fetch("/api/actions/rerun-failed", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo, runId })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.queued) {
+      throw new Error(data.error || data.message || `Unable to rerun workflow run ${runId}`);
+    }
+    markRerunRequested(rerunKey(repo, runId));
+    return runId;
+  }));
+
+  pending.forEach((runId) => state.rerunning.delete(rerunKey(repo, runId)));
+  const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason?.message || "Rerun failed");
+  render();
+  if (errors.length) {
+    const message = errors.length === 1 ? errors[0] : `${errors.length} rerun requests failed. ${errors[0]}`;
+    setError(message);
+    return;
+  }
+  showToast("Rerun queued", `${label}. GitHub will rerun failed jobs and their dependents.`);
+  await refreshAfterMutation("rerun");
+}
+
 /* —— wiring —— */
 document.querySelectorAll(".segment").forEach((button) => {
   button.addEventListener("click", () => setMode(button.dataset.mode));
@@ -3043,6 +3177,14 @@ els.content.addEventListener("click", (event) => {
     state.showDismissed = !state.showDismissed;
     render();
   }
+});
+
+els.content.addEventListener("click", (event) => {
+  const button = event.target.closest(".rerun-button");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  rerunFailedJobs(button);
 });
 
 els.content.addEventListener("click", (event) => {

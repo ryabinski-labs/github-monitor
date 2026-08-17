@@ -81,6 +81,7 @@ Token scopes you need depend on what you want to see:
 |---|---|
 | Read-only PR & Actions monitoring | Repository read |
 | Self-hosted runner visibility | Actions runner access (owner or repo) |
+| Rerunning failed CI/CD jobs | Actions write |
 | Merging PRs from the dashboard | Write to the target repository |
 | Optional deep-queue Dependabot cleanup | Actions and pull requests write |
 
@@ -98,6 +99,7 @@ Token scopes you need depend on what you want to see:
 - Quota-aware pausing: when quota runs low, auto-refresh pauses and the manual refresh button is disabled until the reset window
 - Browser notifications and an in-app inbox for CI/CD completions and new conflicts
 - Optional **auto-merge** countdown for passing PRs with completed checks
+- One-click reruns for failed CI/CD jobs and their dependent jobs, available on failed run, PR, and pipeline-trace cards
 - Optional automatic Dependabot cleanup: closes PRs with failing CI, cancels queued runs once they reach the configured threshold, and auto-dismisses failed Dependabot runs from Failing CI
 
 ## How it works
@@ -126,6 +128,8 @@ flowchart LR
 **Adaptive refresh.** The server reads GitHub rate-limit headers on every response and returns the requests used, per-resource quota/remaining/reset, and a recommended next refresh time. The browser refreshes faster when PRs, CD actions, deployments, or runners are active, and slows down when things are quiet, expensive audits are on, or quota gets tight. Under GitHub App auth, each installation has its own quota bucket; the footer chip shows the *tightest* bucket and how many others exist (hover for the full breakdown). The notification inbox lives in `localStorage` and prunes entries older than 24h. Each alert is announced once and never re-fires for the same event across reloads, server restarts, or a pipeline briefly dropping out of the scan window (a per-tag ledger in `localStorage` tracks what was already announced), and events whose latest evidence is more than a few days old are not announced at all.
 
 **Dismissing runs.** Only the *latest* completed run per lane (workflow + branch) surfaces under Failing CI, so a retried-and-passed run resolves the failure and stale older failures don't pile up. Remaining failing runs (post-merge CI, Dependabot, etc.) can be dismissed to clear them from the list; use **Show** in the dismissed bar to review or **Restore** them. Dismissals are a per-user view preference kept in your browser's `localStorage` and auto-expire after 30 days — there is deliberately **no server-side or external database** (e.g. DynamoDB), keeping the tool local-first and zero-dependency. Because they live in `localStorage`, dismissals **survive restarting the server and reloading the page**, but are scoped to that one browser profile — a different browser, machine, or incognito window starts with a clean slate. A dismissed lane reappears on its own if a brand-new run later fails.
+
+**Rerunning failed jobs.** Failed GitHub Actions runs expose **Rerun failed**, which asks GitHub to rerun only failed jobs and their dependent jobs. A failed PR with more than one failed workflow queues each workflow from the same control. The button changes to **Rerun queued** after GitHub accepts the request; the normal adaptive refresh then replaces the stale failure with the new run state. The credential needs Actions write access.
 
 **Dependabot cleanup.** This destructive server-side policy is **disabled by default**. Set `DEPENDABOT_QUEUE_THRESHOLD` to a positive integer to opt in. Once enabled, the server checks the selected owners every minute and does two things:
 

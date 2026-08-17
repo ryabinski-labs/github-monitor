@@ -79,6 +79,8 @@ const PR_SEARCH_GRAPHQL = `
                         conclusion
                         checkSuite {
                           workflowRun {
+                            databaseId
+                            url
                             workflow {
                               name
                             }
@@ -138,6 +140,8 @@ const PR_BY_NUMBER_GRAPHQL = `
                       conclusion
                       checkSuite {
                         workflowRun {
+                          databaseId
+                          url
                           workflow {
                             name
                           }
@@ -207,6 +211,7 @@ const CD_WORKFLOW_CACHE_TTL_MS = 15 * 60 * 1000;
 const WORKFLOW_RUN_CACHE_TTL_MS = 60 * 1000;
 const RUNNING_ACTION_CACHE_TTL_MS = 60 * 1000;
 const RUNNING_DEPLOYMENT_CACHE_TTL_MS = 60 * 1000;
+const RERUN_DEDUP_TTL_MS = 60 * 1000;
 const OWNER_REPOS_CACHE_TTL_MS = 5 * 60 * 1000;
 const DEPLOYMENT_TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
 // A repo's deploy target almost never changes; cache it (and the "none found"
@@ -215,6 +220,7 @@ const PRODUCTION_TARGET_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const MERGED_PR_CACHE_TTL_MS = 10 * 60 * 1000;
 const RECENT_COMMIT_CACHE_TTL_MS = 5 * 60 * 1000;
 const RUNNING_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
+const recentRerunRequests = new Map();
 const DEPENDABOT_LOGIN = "dependabot[bot]";
 const DEPENDABOT_QUEUE_MAX_THRESHOLD = 5000;
 const DEPENDABOT_QUEUE_THRESHOLD = parseDependabotQueueThreshold(process.env.DEPENDABOT_QUEUE_THRESHOLD);
@@ -970,6 +976,13 @@ function parsePullNumber(value) {
   return number;
 }
 
+function parseRunId(value) {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
+    throw new HttpError(400, "Expected a positive workflow run ID.");
+  }
+  return value;
+}
+
 function isWithinFailedCdWindow(value, now = Date.now()) {
   const time = new Date(value).getTime();
   return Number.isFinite(time) && now - time <= FAILED_CD_MAX_AGE_MS;
@@ -1073,6 +1086,21 @@ function failureReasonFromChecks(checks) {
     failedChecks,
     failureReason: `${failedChecks.slice(0, 3).join(", ")}${suffix}`
   };
+}
+
+function failedWorkflowRunsFromChecks(checks) {
+  const runs = new Map();
+  for (const check of checks.filter(checkFailed)) {
+    const workflowRun = check.__typename === "CheckRun" ? check.checkSuite?.workflowRun : null;
+    const runId = Number(workflowRun?.databaseId);
+    if (!Number.isSafeInteger(runId) || runId < 1 || runs.has(runId)) continue;
+    runs.set(runId, {
+      runId,
+      workflow: workflowRun.workflow?.name || check.name || "Workflow",
+      url: workflowRun.url || ""
+    });
+  }
+  return [...runs.values()];
 }
 
 function cdFailureReason(conclusion) {
@@ -1611,13 +1639,15 @@ function classifyPullRequest(pr) {
   }
   if (checks.every(checkFinished)) {
     const failure = failureReasonFromChecks(checks);
+    const failedRuns = failedWorkflowRunsFromChecks(checks);
     return {
       ...base,
       state: checks.some(checkFailed) ? "fail" : "pass",
       checkCount: checks.length,
       runningChecks: [],
       failedChecks: failure.failedChecks,
-      failureReason: failure.failureReason
+      failureReason: failure.failureReason,
+      failedRuns
     };
   }
   return {
@@ -2165,6 +2195,7 @@ function buildOpenPullRequestTrace(pr, { now = Date.now() } = {}) {
       status: "flagged",
       severity: "critical",
       reason: pr.failureReason || "CI failed before this PR could continue toward production.",
+      failedRuns: pr.failedRuns || [],
       stages: baseStages.map((stage) => stage.key === "ci_complete" ? { ...stage, status: "blocked" } : stage)
     };
   }
@@ -2297,6 +2328,7 @@ function buildMergedPullRequestTrace(pr, cdRows, { now = Date.now(), includeCd =
       status: "flagged",
       severity: "critical",
       reason: failed.failureReason || "Production CD failed after this PR merged.",
+      failedRuns: failed.runId ? [{ runId: failed.runId, workflow: failed.workflow || "CD", url: failed.url || "" }] : [],
       nextAction: { label: "Open failed run", url: failed.url },
       lastEvidenceAt: failed.updatedAt || failed.createdAt || base.lastEvidenceAt,
       stages: stages.map((stage) => stage.key === "prod_complete" ? { ...stage, status: "blocked", at: failed.createdAt, url: failed.url } : stage)
@@ -2570,6 +2602,7 @@ async function fetchActionsForRepo(repo) {
         .filter((run) => !isCdWorkflowRun(run))
         .map((run) => ({
           kind: "workflowRun",
+          ...(run.id ? { runId: run.id } : {}),
           createdAt: run.created_at || "",
           repo,
           workflow: run.name || "Workflow",
@@ -2585,6 +2618,7 @@ async function fetchActionsForRepo(repo) {
         }));
       const failed = await mapLimit(selectFailedActionRuns(runs), 4, async (run) => ({
         kind: "workflowRun",
+        ...(run.id ? { runId: run.id } : {}),
         createdAt: run.updated_at || run.created_at || "",
         repo,
         workflow: run.name || "Workflow",
@@ -2638,7 +2672,10 @@ function applyActionRunEvidenceToPullRequests(pullRequests, { runningActions = [
         state: "fail",
         checkCount: Math.max(pr.checkCount || 0, failed.length),
         failedChecks: failed.map((run) => `${run.workflow} ${run.runNumber}`),
-        failureReason: failed.map((run) => failureDetailFromRun(run)).filter(Boolean).join(", ") || "CI failed"
+        failureReason: failed.map((run) => failureDetailFromRun(run)).filter(Boolean).join(", ") || "CI failed",
+        failedRuns: failed
+          .filter((run) => Number.isSafeInteger(Number(run.runId)) && Number(run.runId) > 0)
+          .map((run) => ({ runId: Number(run.runId), workflow: run.workflow || "Workflow", url: run.url || "" }))
       };
     }
     return pr;
@@ -2847,14 +2884,16 @@ async function cleanupDependabotWorkload({ repos, jobs = 4, cancelRuns = true })
     }
   })).filter(Boolean);
 
-  for (const repo of repos || []) {
-    githubValueCache.delete(`actions:${repo}`);
-    for (const key of githubValueCache.keys()) {
-      if (key.startsWith(`workflow-runs:${repo}:`)) githubValueCache.delete(key);
-    }
-  }
+  for (const repo of repos || []) invalidateWorkflowRunCaches(repo);
 
   return { closedPullRequests, cancelledRuns, errors };
+}
+
+function invalidateWorkflowRunCaches(repo) {
+  githubValueCache.delete(`actions:${repo}`);
+  for (const key of githubValueCache.keys()) {
+    if (key.startsWith(`workflow-runs:${repo}:`)) githubValueCache.delete(key);
+  }
 }
 
 function dependabotCleanupSnapshot() {
@@ -3507,6 +3546,44 @@ async function closePullRequest(req, res) {
   });
 }
 
+async function rerunFailedJobs(req, res) {
+  if (req.method !== "POST") {
+    throw new HttpError(405, "Method not allowed");
+  }
+
+  const body = await readJsonBody(req);
+  const { repo } = parseRepo(body.repo);
+  const runId = parseRunId(body.runId);
+  const key = `${repo}:${runId}`;
+  const now = Date.now();
+  for (const [candidate, entry] of recentRerunRequests.entries()) {
+    if (now - entry.startedAt >= RERUN_DEDUP_TTL_MS) recentRerunRequests.delete(candidate);
+  }
+  let entry = recentRerunRequests.get(key);
+  const duplicate = Boolean(entry);
+  if (!entry) {
+    entry = {
+      startedAt: now,
+      promise: githubRequest(`/repos/${repo}/actions/runs/${runId}/rerun-failed-jobs`, { method: "POST" })
+    };
+    recentRerunRequests.set(key, entry);
+  }
+  try {
+    await entry.promise;
+  } catch (error) {
+    if (recentRerunRequests.get(key) === entry) recentRerunRequests.delete(key);
+    throw error;
+  }
+  invalidateWorkflowRunCaches(repo);
+  await sendJson(res, 200, {
+    queued: true,
+    duplicate,
+    message: "Failed jobs queued for rerun.",
+    repo,
+    runId
+  });
+}
+
 async function sendStatic(req, res) {
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
   const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
@@ -3576,6 +3653,10 @@ const server = http.createServer(async (req, res) => {
     }
     if (requestUrl.pathname === "/api/pull-request/close") {
       await closePullRequest(req, res);
+      return;
+    }
+    if (requestUrl.pathname === "/api/actions/rerun-failed") {
+      await rerunFailedJobs(req, res);
       return;
     }
     if (requestUrl.pathname === "/api/health") {

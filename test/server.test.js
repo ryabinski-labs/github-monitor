@@ -110,6 +110,45 @@ test("pull requests without CI are classified instead of dropped", () => {
   assert.equal(pr.hasConflict, false);
 });
 
+test("failed pull requests retain unique workflow run identities for reruns", () => {
+  const workflowRun = {
+    databaseId: 987654,
+    url: "https://github.com/owner/a/actions/runs/987654",
+    workflow: { name: "CI" }
+  };
+  const pr = classifyPullRequest({
+    number: 14,
+    title: "Fix checkout",
+    url: "https://github.com/owner/a/pull/14",
+    isDraft: false,
+    mergeable: "MERGEABLE",
+    author: { login: "dev" },
+    repository: { nameWithOwner: "owner/a", isArchived: false },
+    commits: {
+      nodes: [{
+        commit: {
+          statusCheckRollup: {
+            contexts: {
+              nodes: [
+                { __typename: "CheckRun", name: "unit", status: "COMPLETED", conclusion: "FAILURE", checkSuite: { workflowRun } },
+                { __typename: "CheckRun", name: "browser", status: "COMPLETED", conclusion: "FAILURE", checkSuite: { workflowRun } },
+                { __typename: "StatusContext", context: "external", state: "FAILURE" }
+              ]
+            }
+          }
+        }
+      }]
+    }
+  });
+
+  assert.equal(pr.state, "fail");
+  assert.deepEqual(pr.failedRuns, [{
+    runId: 987654,
+    workflow: "CI",
+    url: "https://github.com/owner/a/actions/runs/987654"
+  }]);
+});
+
 test("running Actions evidence moves PRs out of the no-CI bucket", () => {
   const [pr] = applyActionRunEvidenceToPullRequests(
     [
@@ -629,6 +668,86 @@ test("security headers restrict privileged local dashboard surfaces", () => {
   assert.equal(SECURITY_HEADERS["referrer-policy"], "no-referrer");
 });
 
+test("failed-job rerun endpoint validates input and queues the GitHub mutation", async () => {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  const mutations = [];
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    mutations.push({ path: requestUrl.pathname, method: options.method });
+    return new Response(null, {
+      status: 201,
+      headers: {
+        "x-ratelimit-limit": "5000",
+        "x-ratelimit-remaining": "4990",
+        "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+        "x-ratelimit-resource": "core"
+      }
+    });
+  };
+
+  const testServer = await new Promise((resolve) => {
+    const listener = server.listen(0, "127.0.0.1", () => resolve(listener));
+  });
+
+  try {
+    const { port } = testServer.address();
+    const response = await previousFetch(`http://127.0.0.1:${port}/api/actions/rerun-failed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "acme/app", runId: 987654 })
+    });
+    const data = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(data, {
+      queued: true,
+      duplicate: false,
+      message: "Failed jobs queued for rerun.",
+      repo: "acme/app",
+      runId: 987654
+    });
+    assert.deepEqual(mutations, [{
+      path: "/repos/acme/app/actions/runs/987654/rerun-failed-jobs",
+      method: "POST"
+    }]);
+
+    const duplicateResponse = await previousFetch(`http://127.0.0.1:${port}/api/actions/rerun-failed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "acme/app", runId: 987654 })
+    });
+    assert.equal(duplicateResponse.status, 200);
+    assert.equal((await duplicateResponse.json()).duplicate, true);
+    assert.equal(mutations.length, 1);
+
+    const invalidResponse = await previousFetch(`http://127.0.0.1:${port}/api/actions/rerun-failed`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo: "acme/app", runId: "not-a-run" })
+    });
+    assert.equal(invalidResponse.status, 400);
+    assert.match((await invalidResponse.json()).error, /positive workflow run ID/);
+    assert.equal(mutations.length, 1);
+
+    for (const runId of [true, [88]]) {
+      const malformedResponse = await previousFetch(`http://127.0.0.1:${port}/api/actions/rerun-failed`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ repo: "acme/app", runId })
+      });
+      assert.equal(malformedResponse.status, 400);
+    }
+    assert.equal(mutations.length, 1);
+  } finally {
+    await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
 test("runner status endpoint returns only busy runners", async () => {
   const previousFetch = globalThis.fetch;
   const previousToken = process.env.GITHUB_TOKEN;
@@ -832,6 +951,7 @@ test("dashboard includes running non-CD workflow runs in CI running work", async
     assert.deepEqual(data.actions.failed, [
       {
         kind: "workflowRun",
+        runId: 45,
         createdAt: data.actions.failed[0].createdAt,
         repo: "acme/app",
         workflow: "ci",

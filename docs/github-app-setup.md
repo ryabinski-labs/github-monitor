@@ -39,7 +39,7 @@ The App is yours: each operator stands up their own. The project does not run a 
 
    | Permission | Access | Why |
    | --- | --- | --- |
-   | Actions | Read-only, or Read & write | Read workflow runs and runners; write is required only when deep-queue cleanup is enabled |
+   | Actions | Read-only, or Read & write | Read workflow runs and runners; write is required for failed-job reruns or deep-queue cleanup |
    | Checks | Read-only | CheckRun data in the PR `statusCheckRollup` GraphQL field |
    | Commit statuses | Read-only | Legacy StatusContext data in the PR `statusCheckRollup` GraphQL field |
    | Contents | Read & write | Read commits, trees, file content; delete merged PR head branches |
