@@ -1186,7 +1186,7 @@ button.metric.active .metric-dot {
   justify-self: end;
 }
 
-.open-link, .merge-button, .close-button {
+.open-link, .merge-button, .close-button, .rerun-button {
   display: inline-flex;
   gap: 4px;
   justify-content: center;
@@ -1204,6 +1204,33 @@ button.metric.active .metric-dot {
   letter-spacing: 0.08em;
   text-transform: uppercase;
   transition: background 160ms ease, color 160ms ease;
+}
+.rerun-button {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--paper-strong);
+  white-space: nowrap;
+}
+.rerun-button svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+.rerun-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--blue) 82%, black);
+  background: color-mix(in srgb, var(--blue) 82%, black);
+}
+.rerun-button:disabled {
+  cursor: wait;
+  opacity: 0.82;
+}
+.rerun-button[data-state="loading"] svg { animation: spin 0.9s linear infinite; }
+.rerun-button[data-state="queued"] {
+  border-color: color-mix(in srgb, var(--green) 58%, var(--line-strong));
+  background: var(--green-soft);
+  color: var(--green);
+  cursor: default;
+  opacity: 1;
 }
 .merge-button {
   border-color: var(--green);
@@ -1264,7 +1291,8 @@ button.metric.active .metric-dot {
 .open-link:hover::after { transform: translate(1px, -1px); }
 .open-link:focus-visible,
 .merge-button:focus-visible,
-.close-button:focus-visible {
+.close-button:focus-visible,
+.rerun-button:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
@@ -1925,6 +1953,24 @@ button.metric.active .metric-dot {
 }
 
 /* —————————————————————— RESPONSIVE —————————————————————— */
+@media (max-width: 1300px) {
+  .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: start;
+  }
+  .row > :nth-child(2) { grid-column: 1; }
+  .row > :nth-child(3) { grid-column: 2; grid-row: 1; }
+  .row > :nth-child(4),
+  .row > :nth-child(5) { grid-column: 1 / -1; }
+  .row-actions, .trace-head-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    justify-self: start;
+  }
+  .trace-card-head { grid-template-columns: minmax(0, 1fr) auto; align-items: start; }
+  .trace-card-head > .trace-head-actions { grid-column: 1 / -1; }
+}
+
 @media (max-width: 1180px) {
   /* Below the one-row width, let clusters wrap — each takes a full row. */
   .scoreboard { flex-wrap: wrap; }
@@ -1937,6 +1983,15 @@ button.metric.active .metric-dot {
   .panel-head { align-items: stretch; }
   .rail { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .merged-pr-list { grid-template-columns: 1fr; }
+  .row, .trace-card-head { grid-template-columns: 1fr; align-items: start; }
+  .row > :nth-child(n),
+  .trace-card-head > *,
+  .trace-card-head > .trace-head-actions { grid-column: 1; grid-row: auto; }
+  .row-actions, .trace-head-actions {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    justify-self: start;
+  }
 }
 
 @media (max-width: 720px) {
@@ -1961,10 +2016,17 @@ button.metric.active .metric-dot {
   .rail { grid-template-columns: 1fr; }
   .segmented { width: 100%; }
   .segment { min-width: 0; flex: 1; }
-  .row { grid-template-columns: 1fr; align-items: start; }
-  .row-actions { justify-self: start; }
+  .row-actions, .trace-head-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+  .row-actions > a,
+  .row-actions > button,
+  .trace-head-actions > a,
+  .trace-head-actions > button { min-width: 0; min-height: 44px; }
+  .rerun-button[data-multiple="true"] { grid-column: 1 / -1; }
   .review-summary { grid-template-columns: 1fr; }
-  .trace-card-head,
   .trace-stages { grid-template-columns: 1fr; }
   .cd-review { padding: 0 10px 12px 14px; }
   .meta-hint { display: none; }
