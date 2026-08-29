@@ -1692,11 +1692,28 @@ function currentTraceCount(counts) {
   return counts.flaggedJourneys;
 }
 
+// "Repos 15" reads the same whether the account has 15 repos or 89 with 74
+// trimmed as dormant. The count is the only place that difference can surface,
+// so say it there rather than leaving the scan quietly narrower than it looks.
+function renderRepoScope(scan) {
+  const chip = document.querySelector("#metricRepos")?.closest(".repo-chip");
+  if (!chip) return;
+  const skipped = Number(scan?.reposSkipped || 0);
+  if (skipped > 0) {
+    const hours = Number(scan?.pushedWithinHours || 0);
+    const window = hours >= 48 ? `${Math.round(hours / 24)} days` : `${hours} hours`;
+    chip.title = `Repositories in scope — ${skipped} skipped, no push in ${window} (SCAN_PUSHED_WITHIN_HOURS)`;
+  } else {
+    chip.title = "Repositories in scope";
+  }
+}
+
 function renderMetrics(data) {
   const counts = displayCounts(data);
   for (const [key, id] of Object.entries(metricIds)) {
     document.querySelector(`#${id}`).textContent = counts[key] ?? 0;
   }
+  renderRepoScope(data.scan);
   const skippedCd = Number(data.summary.skippedCd || 0);
   const finishedCdSub = document.querySelector("#metricFinishedCdSub");
   if (finishedCdSub) {
