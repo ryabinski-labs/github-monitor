@@ -9,10 +9,16 @@ import { fileURLToPath } from "node:url";
 
 const isMain = process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1];
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
-try {
-  process.loadEnvFile(join(__dirname, ".env"));
-} catch (error) {
-  if (error.code !== "ENOENT") throw error;
+// Skipped under the test runner so a developer's local .env cannot change what
+// the suite exercises. Without this, enabling GitHub App auth in .env silently
+// rerouted every test that stubs fetch, and the suite passed in CI (no .env)
+// while failing on the machine that had one.
+if (process.env.NODE_ENV !== "test") {
+  try {
+    process.loadEnvFile(join(__dirname, ".env"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
 }
 const publicDir = join(__dirname, "public");
 const port = Number(process.env.PORT || 4177);
@@ -20,7 +26,22 @@ const githubApiBase = "https://api.github.com";
 const githubGraphqlUrl = "https://api.github.com/graphql";
 const GITHUB_APP_ID = process.env.GITHUB_APP_ID || "";
 const GITHUB_APP_PRIVATE_KEY_PATH = process.env.GITHUB_APP_PRIVATE_KEY_PATH || "";
-const APP_AUTH_ENABLED = Boolean(GITHUB_APP_ID && GITHUB_APP_PRIVATE_KEY_PATH);
+// Both halves are required: an app id with no key (or the reverse) cannot mint a
+// JWT, so it is not a half-working app -- it is the PAT path with a misleading
+// config. Resolved through a pure function so the fallback is testable.
+function resolveAuthMode({ appId, privateKeyPath } = {}) {
+  const mode = appId && privateKeyPath ? "app" : "pat";
+  return {
+    mode,
+    appId: mode === "app" ? String(appId) : null,
+    // Config that looks like an attempt at app auth but cannot work. Silence here
+    // is how an app sat configured-but-unused for months.
+    misconfigured: Boolean((appId && !privateKeyPath) || (!appId && privateKeyPath))
+  };
+}
+
+const AUTH_MODE = resolveAuthMode({ appId: GITHUB_APP_ID, privateKeyPath: GITHUB_APP_PRIVATE_KEY_PATH });
+const APP_AUTH_ENABLED = AUTH_MODE.mode === "app";
 let githubTokenPromise;
 const scanMetrics = new AsyncLocalStorage();
 const SECURITY_HEADERS = {
@@ -697,6 +718,15 @@ async function cachedGithubValue(key, ttlMs, loader) {
 
 function buildDashboardWarnings(rateLimit, summary, options) {
   const warnings = [];
+  if (AUTH_MODE.misconfigured) {
+    warnings.push(
+      "GitHub App auth is half-configured: set both GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH, or neither. Running on a personal access token."
+    );
+  } else if (AUTH_MODE.mode === "pat") {
+    warnings.push(
+      "Running on a personal access token: 5,000 requests/hour, shared with every other tool using the same credential. GitHub App auth gives each installation its own quota."
+    );
+  }
   const quota = quotaState(rateLimit);
   const tightest = quota.tightest;
   if (!tightest || quota.status === "ok") return warnings;
@@ -3215,6 +3245,7 @@ async function buildDashboardData(requestUrl) {
   return {
     account: me,
     accounts,
+    auth: { mode: AUTH_MODE.mode, appId: AUTH_MODE.appId, misconfigured: AUTH_MODE.misconfigured },
     generatedAt: new Date().toISOString(),
     options: { mode, jobs, includeCd, includeTraces, includeRunners, includeRepoRunners, owners },
     summary,
@@ -3738,6 +3769,9 @@ if (isMain) {
 
 export {
   SECURITY_HEADERS,
+  resolveAuthMode,
+  AUTH_MODE,
+  buildDashboardWarnings,
   bestProductionUrlCandidate,
   buildChangeSummary,
   classifyPullRequest,
