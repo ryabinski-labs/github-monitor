@@ -2979,6 +2979,38 @@ async function fetchQueuedRunsForRepo(repo, limit) {
   return runs.map((run) => ({ repo, runId: run.id || null, status: run.status || "", url: run.html_url || "" }));
 }
 
+const SCAN_ERROR_CAUSE_LIMIT = 3;
+
+// A quota-blocked scan fails once per repo per endpoint, so one cause reaches this
+// point 500+ times on a large account. Reporting each verbatim turned the dashboard
+// warning strip into a screenful of the same sentence, so collapse the list to its
+// distinct causes and count the repeats.
+function summarizeScanErrors(errors, limit = SCAN_ERROR_CAUSE_LIMIT) {
+  const byCause = new Map();
+  for (const entry of Array.isArray(errors) ? errors : []) {
+    const text = String(entry ?? "").trim();
+    if (!text) continue;
+    // Producers format these as `${subject}: ${message}`, and the subject is the
+    // repo-specific half -- grouping on the message is what collapses the flood.
+    // A message with no subject at all groups under itself.
+    const separator = text.indexOf(": ");
+    const cause = separator === -1 ? text : text.slice(separator + 2);
+    const seen = byCause.get(cause);
+    if (seen) seen.count += 1;
+    else byCause.set(cause, { cause, count: 1, first: text });
+  }
+  if (!byCause.size) return "";
+  const causes = [...byCause.values()].sort((a, b) => b.count - a.count);
+  const shown = causes
+    .slice(0, limit)
+    // A lone failure keeps its subject so a single broken repo stays nameable;
+    // a repeated one drops it, because naming every repo is what caused this.
+    .map(({ cause, count, first }) => (count === 1 ? first : `${cause} (${count} checks)`));
+  const hidden = causes.length - shown.length;
+  if (hidden > 0) shown.push(`+${hidden} more ${hidden === 1 ? "cause" : "causes"}`);
+  return shown.join(" ");
+}
+
 async function runDependabotQueueScan({
   threshold = DEPENDABOT_QUEUE_THRESHOLD,
   owners = DEPENDABOT_QUEUE_OWNERS,
@@ -3033,7 +3065,7 @@ async function runDependabotQueueScan({
     const discoveryErrors = [...repositoryErrors, ...queuedGroups.flatMap((group) => group.errors)];
     dependabotCleanupState.queueDepth = dependabotQueueDepth(queuedRuns);
     dependabotCleanupState.lastScanAt = new Date(now).toISOString();
-    dependabotCleanupState.lastError = discoveryErrors.join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors(discoveryErrors);
     // Cancelling in-flight runs is the destructive half and stays gated on queue
     // depth. Closing Dependabot PRs whose CI already failed is safe at any depth,
     // so it runs on every pass — a lone failing PR should not wait for a backlog.
@@ -3052,7 +3084,7 @@ async function runDependabotQueueScan({
     const result = await cleanupDependabotWorkload({ repos, jobs, cancelRuns });
     dependabotCleanupState.lastResult = result;
     dependabotCleanupState.lastCompletedAt = new Date().toISOString();
-    dependabotCleanupState.lastError = [...discoveryErrors, ...result.errors].join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors([...discoveryErrors, ...result.errors]);
     return result;
   } catch (error) {
     dependabotCleanupState.lastError = error.message || "Dependabot cleanup failed";
@@ -3779,12 +3811,14 @@ export {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  summarizeScanErrors,
   markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
   attachBusyRunnerJobs,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
+  dependabotCleanupSnapshot,
   sameAutoMergeOwners,
   server
 };
