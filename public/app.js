@@ -721,6 +721,17 @@ function workflowPhaseKey(row, phase) {
   return `${phase}:${actionKey(row)}`;
 }
 
+// A busy-runner row carries none of the fields actionKey() reads -- no url, no
+// repo, no workflow, no run number -- so keying one through workflowPhaseKey
+// collapsed every runner in the fleet onto the single literal key
+// "runner_busy:". Because the phase never changes either, rememberPhase() then
+// held the first enteredAt it ever saw, persisted it to localStorage, and
+// reported the dashboard's own uptime as every runner's busy time. Key by the
+// runner's identity instead.
+function runnerPhaseKey(row, phase) {
+  return `${phase}:${[row?.level, row?.scope, row?.name].filter(Boolean).join(":")}`;
+}
+
 function currentPrPhase(row) {
   if (!row) return "";
   const key = mergeKey(row.repo, row.number);
@@ -850,7 +861,12 @@ function annotateDataWithPhaseAges(data) {
   const runners = {
     ...(data.runners || {}),
     busy: (data.runners?.busy || []).map((row) =>
-      decoratePhase(row, "runner_busy", workflowPhaseKey(row, "runner_busy"))
+      // startedAt is the assigned job's own start, so the pill measures how long
+      // the runner has actually been working. When no job could be correlated it
+      // is absent and rememberPhase falls back to first observation, which is an
+      // over-estimate for a runner already busy when the page opened -- but a
+      // per-runner one that resets, not a shared clock that never does.
+      decoratePhase(row, "runner_busy", runnerPhaseKey(row, "runner_busy"), row.startedAt)
     )
   };
   const staleTraces = stalePhaseTraces([
