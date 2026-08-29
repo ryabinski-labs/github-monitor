@@ -769,13 +769,22 @@ function rememberPhase(key, phase, fallbackEnteredAt = "") {
   if (!key || !phase) return null;
   const now = new Date().toISOString();
   const previous = state.phaseAges[key];
+  const sourceTime = new Date(fallbackEnteredAt || 0).getTime();
+  const sourceEnteredAt =
+    Number.isFinite(sourceTime) && sourceTime > 0 ? new Date(sourceTime).toISOString() : "";
   if (previous?.phase === phase) {
+    // A workflow row leaves this branch by changing key -- a new run number is a
+    // new entry -- but a runner keeps one key across every job it picks up and
+    // never leaves the "runner_busy" phase, so the entry stored for its first job
+    // would otherwise still be answering for its tenth. When the server reports
+    // when this phase actually began, that beats what we remembered. With no such
+    // report, first observation stands: re-pegging it to now on every refresh
+    // would hold an hours-old runner at 0s.
+    if (sourceEnteredAt) previous.enteredAt = sourceEnteredAt;
     previous.observedAt = now;
     return previous;
   }
-  const fallbackTime = new Date(fallbackEnteredAt || 0).getTime();
-  const enteredAt = Number.isFinite(fallbackTime) && fallbackTime > 0 ? new Date(fallbackTime).toISOString() : now;
-  const next = { phase, enteredAt, observedAt: now };
+  const next = { phase, enteredAt: sourceEnteredAt || now, observedAt: now };
   state.phaseAges[key] = next;
   return next;
 }
@@ -2628,16 +2637,21 @@ function renderDeploymentRow(row, view) {
 
 function renderRunnerRow(row) {
   const phaseBadge = renderPhaseBadge(row);
+  // The job correlated to this runner is what the busy time is measured against,
+  // so name it beside the level and let the row open it -- "busy 3h" is a very
+  // different report once you can see which job has been holding the runner. A
+  // runner with no correlated job has nothing to link to and stays inert.
+  const job = [row.jobName, row.jobRepo].filter(Boolean).join(" · ");
   return `
-    <article class="row${row.phaseStale ? " row-stale" : ""}" style="--accent: #87806f; --soft: var(--gray-soft);">
+    <article class="row${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: #87806f; --soft: var(--gray-soft);">
       <div class="row-main">
         <div class="repo">${escapeHtml(row.scope)}</div>
         <div class="title">${escapeHtml(row.name)}</div>
       </div>
-      <div class="meta">${escapeHtml(row.level)}</div>
+      <div class="meta">${escapeHtml(job ? `${row.level} · ${job}` : row.level)}</div>
       <div class="tag-group"><div class="tag">${escapeHtml(row.status || "busy")}</div>${phaseBadge}</div>
       <div class="meta">${escapeHtml((row.labels || []).join(", "))}</div>
-      <span></span>
+      ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Link</a>` : "<span></span>"}
     </article>
   `;
 }

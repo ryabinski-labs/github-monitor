@@ -3781,6 +3781,7 @@ export {
   shouldCleanDependabotQueue,
   markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
+  attachBusyRunnerJobs,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
