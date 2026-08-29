@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, chmod, symlink, copyFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -11,7 +12,27 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // start.sh is run out of a scratch copy rather than the repo: it sources the
 // repo's own .env, so testing it in place would let a developer's real
 // GITHUB_APP_ID decide whether these assertions pass.
-async function stage({ env = {}, withGh = true, ghStatusExit = 0, ghToken = "gho_stub", dotenv = null } = {}) {
+// PATH is built from scratch rather than inheriting the system one: GitHub's
+// runners ship gh in /usr/bin, so `withGh: false` only meant "no gh" on a
+// machine that happens to keep it somewhere else. Everything start.sh invokes
+// is either stubbed here or symlinked in by name.
+const HOST_TOOLS = ["dirname", "sleep"];
+
+// With PATH replaced, bash cannot be found by name -- not for the script itself
+// and not for the stubs' shebang lines.
+const BASH = ["/bin/bash", "/usr/bin/bash", "/opt/homebrew/bin/bash"].find((candidate) => existsSync(candidate));
+
+async function linkHostTool(bin, name) {
+  for (const dir of ["/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin"]) {
+    if (existsSync(`${dir}/${name}`)) {
+      await symlink(`${dir}/${name}`, path.join(bin, name));
+      return;
+    }
+  }
+  throw new Error(`start.sh needs ${name}, which is not on this machine`);
+}
+
+async function stage({ env = {}, withGh = true, ghStatusExit = 0, ghToken = "stub-token", dotenv = null } = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "start-sh-"));
   const bin = path.join(dir, "bin");
   await mkdir(bin);
@@ -23,7 +44,7 @@ async function stage({ env = {}, withGh = true, ghStatusExit = 0, ghToken = "gho
   if (dotenv !== null) await writeFile(path.join(dir, ".env"), dotenv);
 
   const stub = async (name, body) => {
-    await writeFile(path.join(bin, name), `#!/usr/bin/env bash\n${body}\n`);
+    await writeFile(path.join(bin, name), `#!${BASH}\n${body}\n`);
     await chmod(path.join(bin, name), 0o755);
   };
   // The real port check would fail whenever a dashboard is already running.
@@ -49,17 +70,18 @@ async function stage({ env = {}, withGh = true, ghStatusExit = 0, ghToken = "gho
   // server.js`) while gh must not be, and on this machine they share a
   // directory -- hence a symlink rather than keeping that directory on PATH.
   await symlink(process.execPath, path.join(bin, "node"));
+  for (const name of HOST_TOOLS) await linkHostTool(bin, name);
 
   return new Promise((resolve) => {
     execFile(
-      "bash",
+      BASH,
       [path.join(dir, "start.sh")],
       {
         cwd: dir,
         timeout: 30000,
         env: {
           HOME: process.env.HOME,
-          PATH: `${bin}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          PATH: bin,
           STUB_GH_STATUS_EXIT: String(ghStatusExit),
           STUB_GH_TOKEN: ghToken,
           PORT: "45177",
@@ -145,7 +167,7 @@ test("half-configured App auth warns and falls back to gh instead of starting on
 });
 
 test("a rate-limited gh auth status still starts when a token is stored", async () => {
-  const result = await stage({ ghStatusExit: 1, ghToken: "gho_stub" });
+  const result = await stage({ ghStatusExit: 1, ghToken: "stub-token" });
   assert.equal(result.code, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /rate-limiting the check/);
   assert.match(result.stdout, /STUB_SERVER_STARTED/);
@@ -159,7 +181,7 @@ test("gh with no stored token at all is still a hard stop", async () => {
 });
 
 test("GITHUB_TOKEN is accepted without gh, matching how server.js resolves a PAT", async () => {
-  const result = await stage({ withGh: false, env: { GITHUB_TOKEN: "ghp_stub" } });
+  const result = await stage({ withGh: false, env: { GITHUB_TOKEN: "stub-token" } });
   assert.equal(result.code, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /token from GITHUB_TOKEN\/GH_TOKEN/);
   assert.match(result.stdout, /STUB_SERVER_STARTED/);
