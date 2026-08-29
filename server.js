@@ -2770,6 +2770,58 @@ async function fetchBusyRunners({ includeRepoRunners, repos, pullRequests, mode,
   );
 }
 
+// GitHub's runners API reports `busy` but never says since when, so anything
+// built on it alone can only measure when the observer first looked -- which is
+// how a runner twelve minutes old came to be labelled busy for 17h30m. The jobs
+// of the runs already fetched for this refresh do carry the missing timestamp:
+// every job names the runner it landed on and its own started_at. Correlate the
+// two so a busy runner reports its actual job duration.
+//
+// This costs one jobs request per already-known running run, not a fresh scan:
+// the run list is the same one the dashboard just built, so the added quota
+// draw scales with work in flight rather than with repository count.
+async function attachBusyRunnerJobs(busyRunners, runs, jobs) {
+  if (!busyRunners.length) return busyRunners;
+  const candidates = uniqueBy(
+    (runs || []).filter((run) => run?.runId && run?.repo),
+    (run) => `${run.repo}#${run.runId}`
+  );
+  if (!candidates.length) return busyRunners;
+
+  const byRunner = new Map();
+  await mapLimit(candidates, jobs, async (run) => {
+    try {
+      const json = await githubRequest(`/repos/${run.repo}/actions/runs/${run.runId}/jobs`, {
+        query: { per_page: 100 }
+      });
+      for (const job of json?.jobs || []) {
+        if (job?.status !== "in_progress") continue;
+        if (!job.runner_name || !job.started_at) continue;
+        const previous = byRunner.get(job.runner_name);
+        // A runner executes one job at a time. If two runs both look current on
+        // the same runner, the earlier start is the one actually holding it --
+        // the other is a stale record the API has not caught up with.
+        if (previous && new Date(previous.startedAt) <= new Date(job.started_at)) continue;
+        byRunner.set(job.runner_name, {
+          startedAt: job.started_at,
+          jobName: job.name || "",
+          jobRepo: run.repo,
+          url: job.html_url || run.url || ""
+        });
+      }
+    } catch {
+      // One unreadable run must not cost every other runner its start time.
+    }
+  });
+
+  // A runner with no matching job keeps its row unchanged rather than gaining an
+  // invented timestamp: the client treats a missing startedAt as "first seen".
+  return busyRunners.map((runner) => {
+    const match = byRunner.get(runner.name);
+    return match ? { ...runner, ...match } : runner;
+  });
+}
+
 // The REST check-runs API reports lowercase `status`/`conclusion`; the GraphQL
 // checks used elsewhere report uppercase enums. Normalise before comparing.
 function hasFailedCiSignal(checkRuns, statuses) {
@@ -3115,6 +3167,7 @@ async function buildDashboardData(requestUrl) {
 
   if (includeRunners) {
     busyRunners = await fetchBusyRunners({ includeRepoRunners, repos, pullRequests, mode, me, jobs, owners });
+    busyRunners = await attachBusyRunnerJobs(busyRunners, [...runningActions, ...runningCd], jobs);
   }
 
   if (includeTraces && repos.length) {
@@ -3728,6 +3781,7 @@ export {
   shouldCleanDependabotQueue,
   markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
+  attachBusyRunnerJobs,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
