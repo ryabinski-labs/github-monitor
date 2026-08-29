@@ -37,7 +37,7 @@
   "scripts": {
     "start": "node server.js",
     "dev": "./start.sh",
-    "check": "node --check server.js && node --check public/app.js",
+    "check": "node --check server.js && node --check public/app.js && node --check public/theme.js",
     "test": "node --test && npm run check"
   },
   "engines": {

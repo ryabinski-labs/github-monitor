@@ -18,6 +18,7 @@ const skip = browserMissing
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const indexHtml = readFileSync(path.join(root, "public/index.html"), "utf8");
 const appJs = readFileSync(path.join(root, "public/app.js"), "utf8");
+const themeJs = readFileSync(path.join(root, "public/theme.js"), "utf8");
 const stylesCss = readFileSync(path.join(root, "public/styles.css"), "utf8");
 
 function status(overrides = {}) {
@@ -76,6 +77,7 @@ async function openDashboard(responseBody) {
       return route.fulfill({ contentType: "text/html", body: indexHtml });
     }
     if (pathname === "/app.js") return route.fulfill({ contentType: "text/javascript", body: appJs });
+    if (pathname === "/theme.js") return route.fulfill({ contentType: "text/javascript", body: themeJs });
     if (pathname === "/styles.css") return route.fulfill({ contentType: "text/css", body: stylesCss });
     if (pathname === "/api/status") {
       statusRequests.push(route.request().url());

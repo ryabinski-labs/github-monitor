@@ -35,6 +35,7 @@ const skip = browserMissing
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const indexHtml = readFileSync(path.join(root, "public/index.html"), "utf8");
 const appJs = readFileSync(path.join(root, "public/app.js"), "utf8");
+const themeJs = readFileSync(path.join(root, "public/theme.js"), "utf8");
 const stylesCss = readFileSync(path.join(root, "public/styles.css"), "utf8");
 
 function trace(status, repo, n) {
@@ -186,6 +187,7 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedP
     const p = url.pathname;
     if (p === "/" || p === "/index.html") return route.fulfill({ contentType: "text/html", body: indexHtml });
     if (p === "/app.js") return route.fulfill({ contentType: "text/javascript", body: appJs });
+    if (p === "/theme.js") return route.fulfill({ contentType: "text/javascript", body: themeJs });
     if (p === "/styles.css") return route.fulfill({ contentType: "text/css", body: stylesCss });
     if (p === "/api/status") return route.fulfill({ contentType: "application/json", body: JSON.stringify(statusBody) });
     if (p === "/favicon.svg") return route.fulfill({ contentType: "image/svg+xml", body: "<svg xmlns='http://www.w3.org/2000/svg'/>" });
