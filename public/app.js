@@ -3,6 +3,15 @@ const INBOX_KEY = "pr-deck:inbox:v1";
 const TRACE_CACHE_KEY = "pr-deck:traces:v1";
 const PHASE_AGE_KEY = "pr-deck:phase-ages:v1";
 const NOTIFIED_KEY = "pr-deck:notified:v1";
+const STATUS_CACHE_KEY = "pr-deck:status:v1";
+// A reload during an outage or a quota block has nothing to show, because the
+// dashboard only ever held its data in memory. Keep the last good payload so a
+// cold start can fall back to it instead of an empty deck.
+const STATUS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// localStorage is a few MB per origin and shared with the inbox, trace cache and
+// phase ages. A large account can serialize past that, so skip the write rather
+// than throw and lose the other caches to a quota error.
+const STATUS_CACHE_MAX_BYTES = 2 * 1024 * 1024;
 const INBOX_MAX = 60;
 const INBOX_TTL_MS = 24 * 60 * 60 * 1000;
 const TRACE_CACHE_MAX = 250;
@@ -60,6 +69,7 @@ const state = {
   accounts: [],
   ownerPickerOpen: false,
   activitySnapshot: null,
+  staleSince: null,
   refreshTimer: null,
   refreshRetryCount: 0,
   loading: false,
@@ -250,6 +260,31 @@ function loadPersisted() {
   } catch {
     return {};
   }
+}
+
+function loadStatusCache() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(STATUS_CACHE_KEY) || "null");
+    if (!raw || typeof raw !== "object") return null;
+    const savedAt = new Date(raw.savedAt || 0).getTime();
+    if (!Number.isFinite(savedAt) || Date.now() - savedAt > STATUS_CACHE_TTL_MS) return null;
+    // summary is what render() needs; anything without it cannot draw the deck.
+    if (!raw.data || typeof raw.data !== "object" || !raw.data.summary) return null;
+    return { savedAt: raw.savedAt, data: raw.data };
+  } catch {
+    return null;
+  }
+}
+
+function saveStatusCache(data) {
+  try {
+    const payload = JSON.stringify({ savedAt: new Date().toISOString(), data });
+    if (payload.length > STATUS_CACHE_MAX_BYTES) {
+      localStorage.removeItem(STATUS_CACHE_KEY);
+      return;
+    }
+    localStorage.setItem(STATUS_CACHE_KEY, payload);
+  } catch {}
 }
 
 function loadInbox() {
@@ -1378,6 +1413,13 @@ function renderRefreshPauseNotice(quotaBlock) {
     title = "Live updates paused";
     detail = `${quotaBlock.resource} API quota is too low${quota}. No new GitHub data will be pulled until ${formatTime(quotaBlock.retryAt)}. Pulling resumes automatically.`;
     reason = "quota";
+  } else if (state.staleSince) {
+    // Reached when the first pull of a session failed and the deck below is the
+    // stored payload. Naming its age matters more than naming the failure, which
+    // the error panel is already showing verbatim.
+    title = "Showing the last data pulled";
+    detail = `GitHub could not be reached, so these results are from ${formatRelative(state.staleSince)} and are not being updated. They refresh as soon as a pull succeeds.`;
+    reason = "stale";
   } else if (!els.autoRefresh.checked) {
     title = "Automatic pulling paused";
     detail = "New GitHub data will only be pulled when you use Refresh. Turn Auto back on to resume automatic updates.";
@@ -1557,6 +1599,20 @@ function buildParams() {
   return params;
 }
 
+// Draws the stored payload while keeping whatever fresh rate-limit figures the
+// failed response carried, so the quota readout still describes now rather than
+// whenever the cache was written.
+function hydrateFromStatusCache() {
+  const cached = loadStatusCache();
+  if (!cached) return false;
+  const liveRateLimit = state.data?.rateLimit;
+  state.data = liveRateLimit ? { ...cached.data, rateLimit: liveRateLimit } : cached.data;
+  state.staleSince = cached.savedAt;
+  state.activitySnapshot = buildActivitySnapshot(state.data);
+  render();
+  return true;
+}
+
 async function refresh({ source = "manual" } = {}) {
   if (source === "manual") clearRefreshTimer();
   const quotaBlock = quotaRefreshBlock();
@@ -1585,10 +1641,17 @@ async function refresh({ source = "manual" } = {}) {
     notifyCompletedActions(state.activitySnapshot, mergedData);
     state.activitySnapshot = buildActivitySnapshot(mergedData);
     state.data = mergedData;
+    state.staleSince = null;
     state.refreshRetryCount = 0;
+    saveStatusCache(mergedData);
     render();
     scheduleAutoRefresh(mergedData);
   } catch (error) {
+    // A failure mid-session leaves the rendered deck alone, because render() is
+    // not called and state.data still holds the last good payload. A failure on
+    // the first pull has nothing in memory, so fall back to the stored one --
+    // otherwise a reload during an outage shows an empty deck and "never".
+    if (!state.data?.summary) hydrateFromStatusCache();
     setError(error.message);
     scheduleRefreshRetry();
   } finally {
