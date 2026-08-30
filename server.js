@@ -251,6 +251,15 @@ const WORKFLOW_RUN_CACHE_TTL_MS =
   Math.max(0, Number(process.env.WORKFLOW_RUN_CACHE_TTL_SECONDS || 600)) * 1000;
 const RUNNING_ACTION_CACHE_TTL_MS = 60 * 1000;
 const RUNNING_DEPLOYMENT_CACHE_TTL_MS = 60 * 1000;
+// Both deployment readers -- running deployments and recent deployment targets --
+// inspect only the newest rows, but each asked githubRestAll to page the entire
+// history 20 at a time and then kept just the first page. On an 89-repo account
+// that was 170 list requests to use 31 of them, 82% fetched and discarded, one
+// repo spending 34 sequential round-trips to read a single page. Because both
+// readers walk the same URLs, the account paid that walk twice. It is what
+// pushed the deployments pass past SCAN_PASS_DEADLINE_MS and put "Partial scan:
+// deployments did not finish" on the dashboard beside a healthy quota.
+const DEPLOYMENT_SCAN_LIMIT = 20;
 const RERUN_DEDUP_TTL_MS = 60 * 1000;
 const OWNER_REPOS_CACHE_TTL_MS = 5 * 60 * 1000;
 // A repo nobody has pushed to in a week still costs a full slice of every scan
@@ -2199,12 +2208,13 @@ async function fetchRecentDeploymentTargets(repo) {
     const targets = new Map();
     let deployments = [];
     try {
-      deployments = await githubRestAll(`/repos/${repo}/deployments`, (json) => (Array.isArray(json) ? json : []), 20);
+      const json = await githubRestPage(`/repos/${repo}/deployments`, 1, DEPLOYMENT_SCAN_LIMIT);
+      deployments = Array.isArray(json) ? json : [];
     } catch {
       return targets;
     }
 
-    for (const deployment of deployments.slice(0, 20)) {
+    for (const deployment of deployments) {
       if (!deployment.statuses_url || targets.has(deployment.ref)) continue;
       try {
         const statuses = await githubRestPage(deployment.statuses_url, 1, 1);
@@ -3095,11 +3105,15 @@ async function fetchRunningDeploymentsForRepo(repo) {
     const running = [];
     let deployments = [];
     try {
-      deployments = await githubRestAll(`/repos/${repo}/deployments`, (json) => (Array.isArray(json) ? json : []), 20);
+      // One page, not githubRestAll: the loop below reads at most
+      // DEPLOYMENT_SCAN_LIMIT rows, so paging the rest of the history
+      // spends quota and latency on deployments that are dropped unread.
+      const json = await githubRestPage(`/repos/${repo}/deployments`, 1, DEPLOYMENT_SCAN_LIMIT);
+      deployments = Array.isArray(json) ? json : [];
     } catch {
       return running;
     }
-    for (const deployment of deployments.slice(0, 20)) {
+    for (const deployment of deployments) {
       if (!deployment.statuses_url) continue;
       try {
         const statuses = await githubRestPage(deployment.statuses_url, 1, 1);
@@ -4633,6 +4647,9 @@ export {
   queuePassDeadline,
   QUEUE_MAX_PAGES,
   QUEUE_PAGE_SIZE,
+  DEPLOYMENT_SCAN_LIMIT,
+  fetchRunningDeploymentsForRepo,
+  fetchRecentDeploymentTargets,
   scanScopeSnapshot,
   snapshotRateLimit,
   resetObservedRateBuckets,
