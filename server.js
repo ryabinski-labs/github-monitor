@@ -776,7 +776,12 @@ function createScanMetrics() {
     requestCount: 0,
     conditionalHits: 0,
     reposConsidered: 0,
-    reposScanned: 0
+    reposScanned: 0,
+    // How many times work was refused because the quota was spent. Carried on
+    // the scan rather than re-read at the end: by the time warnings are built
+    // the reset window may have landed and a live reading says "ok", which is
+    // how a quota block ends up on screen as "did not finish".
+    quotaBlockedRequests: 0
   };
 }
 
@@ -956,6 +961,14 @@ function quotaSnapshot(rateLimit) {
     status: quota.status,
     blocked: quota.blocked,
     resource: tightest?.resource || "",
+    // Which installation this reading is about. Without it the snapshot is
+    // ambiguous in a way that reads as a credential fault: `tightest` is picked
+    // by remaining-ratio across every installation's bucket, so consecutive
+    // polls can describe different accounts and `limit` appears to jump
+    // (7300 -> 5000 -> 5100) for no stated reason. App auth mints one token per
+    // owner and GitHub scales each separately, so those are all correct readings
+    // of different buckets -- but only if the consumer is told which one.
+    installationKey: tightest?.installationKey || "",
     remaining: tightest?.remaining ?? null,
     limit: tightest?.limit ?? null,
     resetAt: quota.resetAt || "",
@@ -967,7 +980,21 @@ function currentQuotaIsBlocked() {
   const quota = quotaState(snapshotRateLimit(scanMetrics.getStore() || createScanMetrics()));
   if (!quota.blocked) return false;
   const resetAt = new Date(quota.resetAt || 0).getTime();
-  return !Number.isFinite(resetAt) || resetAt > Date.now();
+  if (Number.isFinite(resetAt) && resetAt <= Date.now()) return false;
+  const metrics = scanMetrics.getStore();
+  if (metrics) metrics.quotaBlockedRequests += 1;
+  return true;
+}
+
+// "did not finish" names the symptom. On a quota block it points a reader at
+// latency when the cause was the budget -- which is what put "Partial scan: cd
+// did not finish" on the dashboard with no quota line beside it, because the
+// window had reset and the live reading had gone back to "ok". Extracted so the
+// distinction is pinnable by a test instead of buried inline in a scan builder.
+function partialScanCause(quotaBlockedRequests) {
+  return quotaBlockedRequests > 0
+    ? "did not finish because the GitHub quota ran out, not because it was slow"
+    : "did not finish";
 }
 
 function recommendRefresh(summary, options, rateLimit) {
@@ -3761,8 +3788,11 @@ async function buildQueueData(requestUrl, deadlineAt) {
   const active = runs.filter((run) => !run.autoDismissed);
   const warnings = [];
   if (degraded.size) {
+    // A live `quota.blocked` counts too: the queue reads it right above, so here
+    // the block is current rather than something that has to be remembered.
+    const refusals = (scanMetrics.getStore()?.quotaBlockedRequests || 0) + (quota.blocked ? 1 : 0);
     warnings.push(
-      `Partial queue scan: ${[...degraded].sort().join(", ")} did not finish. A short or empty queue here is not evidence of no demand.`
+      `Partial queue scan: ${[...degraded].sort().join(", ")} ${partialScanCause(refusals)}. A short or empty queue here is not evidence of no demand.`
     );
   }
   if (truncatedRepos.length) {
@@ -3934,7 +3964,8 @@ async function buildDashboardData(requestUrl) {
   // happened to coincide with it. The machine-readable `degraded` array below
   // was always correct; this is the human-visible half catching up.
   if (degraded.size) {
-    warnings.push(`Partial scan: ${[...degraded].sort().join(", ")} did not finish; those sections may be incomplete.`);
+    const cause = partialScanCause(scanMetrics.getStore()?.quotaBlockedRequests || 0);
+    warnings.push(`Partial scan: ${[...degraded].sort().join(", ")} ${cause}; those sections may be incomplete.`);
   }
 
   return {
@@ -4468,7 +4499,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
     if (requestUrl.pathname === "/api/health") {
-      await sendJson(res, 200, { ok: true });
+      // Reads the in-memory bucket cache only -- no GitHub request -- so asking
+      // how much quota is left does not itself spend quota. That circularity was
+      // a real trap: every other route runs a scan, so the only way to check
+      // headroom was to consume more of it, and repeated checks are exactly how
+      // this account got drained. Every bucket is listed, not just the tightest,
+      // because one bucket alone is what makes a multi-installation reading look
+      // like it is thrashing. Before the first scan the cache is empty and the
+      // status is "unknown" -- which is why `ok` stays independent of quota.
+      const rateLimit = snapshotRateLimit(scanMetrics.getStore() || createScanMetrics());
+      await sendJson(res, 200, {
+        ok: true,
+        authMode: APP_AUTH_ENABLED ? "app" : "pat",
+        quota: quotaSnapshot(rateLimit),
+        buckets: rateLimit.buckets
+      });
       return;
     }
     await sendStatic(req, res);
@@ -4534,6 +4579,8 @@ export {
   mergeBlockReason,
   openPullRequestSearchQuery,
   quotaState,
+  partialScanCause,
+  currentQuotaIsBlocked,
   recordRateLimit,
   selectActiveRepos,
   listQueueRepos,
