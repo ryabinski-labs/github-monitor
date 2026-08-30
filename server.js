@@ -2,7 +2,8 @@ import http from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createSign } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, mkdir, writeFile, rename } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -531,6 +532,103 @@ function githubUrl(path, query = {}) {
 const etagCache = new Map();
 const ETAG_CACHE_DISABLED = process.env.ETAG_CACHE_DISABLED === "1";
 const ETAG_CACHEABLE_METHODS = new Set(["GET", "HEAD"]);
+// A 304 costs no GitHub quota, so a warm cache makes a whole scan nearly free --
+// but the cache only ever lived in memory, so every restart paid full price for
+// all of it again. On an 89-repo account that is ~500 core requests per restart,
+// and ten restarts in an hour is the entire 5,000 budget. Keep it on disk.
+const ETAG_CACHE_PATH = process.env.ETAG_CACHE_PATH || join(__dirname, ".cache", "etag-cache.json");
+const ETAG_CACHE_MAX_ENTRIES = Number(process.env.ETAG_CACHE_MAX_ENTRIES || 5000);
+// Bodies are whole API responses, so the file is capped by size as well as count.
+const ETAG_CACHE_MAX_BYTES = Number(process.env.ETAG_CACHE_MAX_BYTES || 64 * 1024 * 1024);
+const ETAG_CACHE_SAVE_DEBOUNCE_MS = 30 * 1000;
+let etagCacheSaveTimer = null;
+let etagCacheDirty = false;
+
+// Least-recently-used first, so eviction drops what a scan is least likely to
+// ask for next. Entries without a timestamp sort oldest and go first.
+function pruneEtagCache(store, { maxEntries = ETAG_CACHE_MAX_ENTRIES, maxBytes = ETAG_CACHE_MAX_BYTES } = {}) {
+  const entries = [...store.entries()].sort((a, b) => (b[1]?.usedAt || 0) - (a[1]?.usedAt || 0));
+  const kept = [];
+  let bytes = 0;
+  for (const [url, entry] of entries) {
+    if (kept.length >= maxEntries) break;
+    // Approximate: JSON length of this pair, which is what the file will hold.
+    const size = url.length + JSON.stringify(entry?.body ?? null).length + (entry?.etag?.length || 0);
+    if (bytes + size > maxBytes) continue;
+    bytes += size;
+    kept.push([url, entry]);
+  }
+  return { entries: kept, bytes };
+}
+
+function serializeEtagCache(store, limits) {
+  const { entries } = pruneEtagCache(store, limits);
+  return JSON.stringify({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    entries: entries.map(([url, entry]) => ({ url, etag: entry.etag, body: entry.body, usedAt: entry.usedAt || 0 }))
+  });
+}
+
+function deserializeEtagCache(raw) {
+  const store = new Map();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return store;
+  }
+  if (parsed?.version !== 1 || !Array.isArray(parsed.entries)) return store;
+  for (const entry of parsed.entries) {
+    // An entry without an etag can never produce a 304, so it is dead weight.
+    if (!entry || typeof entry.url !== "string" || typeof entry.etag !== "string" || !entry.etag) continue;
+    store.set(entry.url, { etag: entry.etag, body: entry.body, usedAt: Number(entry.usedAt) || 0 });
+  }
+  return store;
+}
+
+function loadEtagCacheFromDisk(path = ETAG_CACHE_PATH) {
+  if (!isEtagCacheEnabled()) return 0;
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    // No cache yet, or unreadable. Starting cold is correct, never fatal.
+    return 0;
+  }
+  const restored = deserializeEtagCache(raw);
+  for (const [url, entry] of restored) etagCache.set(url, entry);
+  return restored.size;
+}
+
+async function saveEtagCacheToDisk(path = ETAG_CACHE_PATH, store = etagCache) {
+  if (!isEtagCacheEnabled()) return false;
+  try {
+    await mkdir(join(path, ".."), { recursive: true });
+    const payload = serializeEtagCache(store);
+    // Write-then-rename so a crash mid-write cannot leave a truncated cache that
+    // would poison every conditional request on the next boot.
+    const temporary = `${path}.${process.pid}.tmp`;
+    await writeFile(temporary, payload, "utf8");
+    await rename(temporary, path);
+    etagCacheDirty = false;
+    return true;
+  } catch {
+    // A cache that cannot be written is a slow start, not an outage.
+    return false;
+  }
+}
+
+function scheduleEtagCacheSave() {
+  if (!isEtagCacheEnabled()) return;
+  etagCacheDirty = true;
+  if (etagCacheSaveTimer) return;
+  etagCacheSaveTimer = setTimeout(() => {
+    etagCacheSaveTimer = null;
+    if (etagCacheDirty) saveEtagCacheToDisk();
+  }, ETAG_CACHE_SAVE_DEBOUNCE_MS);
+  etagCacheSaveTimer.unref?.();
+}
 
 function isEtagCacheEnabled() {
   return !ETAG_CACHE_DISABLED;
@@ -548,6 +646,8 @@ function takeCachedConditionalResponse(store, url, method, status) {
   if (!ETAG_CACHEABLE_METHODS.has(method)) return null;
   const cached = store.get(url);
   if (!cached) return null;
+  // A 304 is a hit, so keep it away from the eviction end of the cache.
+  cached.usedAt = Date.now();
   return cached.body;
 }
 
@@ -558,7 +658,8 @@ function storeConditionalResponse(store, url, method, response, body) {
     store.delete(url);
     return false;
   }
-  store.set(url, { etag, body });
+  store.set(url, { etag, body, usedAt: Date.now() });
+  scheduleEtagCacheSave();
   return true;
 }
 
@@ -3846,12 +3947,29 @@ if (isMain) {
     console.log(`GitHub Monitor dashboard: http://127.0.0.1:${port}`);
     console.log(`Auth mode: ${APP_AUTH_ENABLED ? `GitHub App (id ${GITHUB_APP_ID})` : "Personal access token"}`);
     console.log(`Dependabot queue cleanup: ${DEPENDABOT_QUEUE_THRESHOLD > 0 ? `enabled at ${DEPENDABOT_QUEUE_THRESHOLD} queued runs` : "disabled"}`);
+    const restored = loadEtagCacheFromDisk();
+    console.log(`Conditional-request cache: ${restored > 0 ? `${restored} entries restored` : "cold, first scan pays full quota"}`);
     scheduleDependabotQueueScan(0);
   });
+
+  // Flush on the way out so a normal Ctrl-C keeps what the session learned; the
+  // debounce alone would lose up to 30s of it. Only when run directly -- an
+  // importing test must keep its own signal handling.
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      saveEtagCacheToDisk().finally(() => process.exit(0));
+    });
+  }
 }
 
 export {
   SECURITY_HEADERS,
+  loadEtagCacheFromDisk,
+  saveEtagCacheToDisk,
+  serializeEtagCache,
+  deserializeEtagCache,
+  pruneEtagCache,
+  etagCache,
   bestProductionUrlCandidate,
   buildChangeSummary,
   classifyPullRequest,

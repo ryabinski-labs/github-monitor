@@ -1865,8 +1865,13 @@ test("storeConditionalResponse caches GET bodies with their ETag and evicts entr
   const responseWithEtag = { headers: { get: (h) => (h.toLowerCase() === "etag" ? 'W/"v1"' : null) } };
   const responseWithoutEtag = { headers: { get: () => null } };
 
+  const before = Date.now();
   assert.equal(storeConditionalResponse(store, "https://api/x", "GET", responseWithEtag, { value: 1 }), true);
-  assert.deepEqual(store.get("https://api/x"), { etag: 'W/"v1"', body: { value: 1 } });
+  const stored = store.get("https://api/x");
+  assert.equal(stored.etag, 'W/"v1"');
+  assert.deepEqual(stored.body, { value: 1 });
+  // usedAt drives least-recently-used eviction when the cache is persisted.
+  assert.ok(stored.usedAt >= before && stored.usedAt <= Date.now(), `usedAt was stamped, got ${stored.usedAt}`);
 
   // A later response that carries no ETag should evict the stale cached entry rather than serve it forever.
   assert.equal(storeConditionalResponse(store, "https://api/x", "GET", responseWithoutEtag, { value: 2 }), false);
