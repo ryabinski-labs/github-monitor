@@ -183,3 +183,15 @@ test("the workflow-run TTL stays inside a sane staleness ceiling", async () => {
     "half an hour of stale CD state is past useful"
   );
 });
+
+test("a cold scan pass is given room to finish rather than guillotined", async () => {
+  // Measured on an 85-repo account: allowed to run, the cold cd/deployments
+  // passes take ~72s and return 122 CD rows. At the old 60s ceiling they were
+  // cut off at 102 rows and marked degraded on every cold boot -- a complete
+  // answer sacrificed for about twelve seconds. The ceiling still exists to stop
+  // a pathological pass, so this is a floor on the headroom, not a removal.
+  assert.ok(
+    SCAN_PASS_DEADLINE_MS >= 120_000,
+    `${SCAN_PASS_DEADLINE_MS}ms leaves a cold pass no margin over the ~72s it measures`
+  );
+});

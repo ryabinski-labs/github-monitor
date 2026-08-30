@@ -284,7 +284,20 @@ const DEPENDABOT_CLEANUP_JOBS = 4;
 const GITHUB_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.GITHUB_REQUEST_TIMEOUT_MS || 30000));
 // Ceiling on any one scan pass. Past this the pass returns what it has and the
 // section is reported degraded, rather than the whole response waiting on it.
-const SCAN_PASS_DEADLINE_MS = Math.max(0, Number(process.env.SCAN_PASS_DEADLINE_MS || 60000));
+//
+// Tuned from measurement, not taste. At the previous 60s, an 85-repo account
+// degraded 'cd' and 'deployments' on every cold scan and the CD panel came back
+// with 102 of 122 rows. Lifting the ceiling and letting the same pass run to
+// completion took 83.8s end to end, of which 11.9s is the non-CD baseline -- so
+// the passes wanted roughly 72s and were being guillotined about twelve seconds
+// short. Warm, they finish in ~34s and never come near this.
+//
+// 180s is that ~72s with room for a slower day, and it is still a real bound: no
+// single request can exceed GITHUB_REQUEST_TIMEOUT_MS, so a pass can only reach
+// this ceiling by doing a lot of slow work, never by hanging on one call. It
+// also has to stay under WORKFLOW_RUN_CACHE_TTL_MS, or the cache goes back to
+// expiring inside the pass that fills it -- there is a test for that.
+const SCAN_PASS_DEADLINE_MS = Math.max(0, Number(process.env.SCAN_PASS_DEADLINE_MS || 180000));
 // Fan-out *inside* one repo's CD scan. Multiplies with the outer repo lanes, so
 // these stay deliberately small: the ceiling that bites first is GitHub's
 // secondary limit on request rate, not core quota (a 304 is quota-free but is
