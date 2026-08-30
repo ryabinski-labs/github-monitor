@@ -516,9 +516,47 @@ async function getAppJwt() {
   return token;
 }
 
+// undici throws `TypeError: fetch failed` for every network-layer failure and
+// keeps the actual reason on `cause` -- ECONNRESET, ENOTFOUND, a TLS error, a
+// connect timeout. Nothing here read `cause`, so a DNS outage, a reset socket
+// and an expired certificate all reached the dashboard as the identical string
+// "fetch failed", which says nothing about whether to retry, re-authenticate or
+// go look at the network. That is how `GipsyChef repositories: fetch failed`
+// sat on the deck: unactionable, and unreproducible afterwards because the one
+// part that identified it was discarded at the throw site.
+//
+// Walks the chain rather than reading one level: undici nests these, and a
+// multi-address connect keeps its real failures on AggregateError.errors rather
+// than on `cause`. Guarded against a cycle so a self-referential chain cannot
+// spin here.
+function describeRequestError(error) {
+  const parts = [];
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const code = current.code ? ` (${current.code})` : "";
+    const text = `${current.message || current.name || "unknown error"}${code}`;
+    if (!parts.includes(text)) parts.push(text);
+    current = current.cause || (Array.isArray(current.errors) ? current.errors[0] : null);
+  }
+  return parts.join(": ") || "unknown error";
+}
+
+// Every GitHub call goes through one of the two fetch sites below, so unwrapping
+// here fixes the message for every caller at once instead of at each of the ~40
+// places an error message is finally rendered.
+async function fetchWithCause(url, init) {
+  try {
+    return await fetch(url, init);
+  } catch (error) {
+    throw new Error(describeRequestError(error), { cause: error });
+  }
+}
+
 async function appAuthorizedRequest(url, init = {}) {
   const jwt = await getAppJwt();
-  const response = await fetch(url, {
+  const response = await fetchWithCause(url, {
     ...init,
     signal: init.signal || AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     headers: {
@@ -744,7 +782,7 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
   const headers = isEtagCacheEnabled()
     ? applyConditionalHeaders(baseHeaders, etagCache, cacheKey, method)
     : baseHeaders;
-  const response = await fetch(url, {
+  const response = await fetchWithCause(url, {
     method,
     headers,
     signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
@@ -4580,6 +4618,7 @@ export {
   openPullRequestSearchQuery,
   quotaState,
   partialScanCause,
+  describeRequestError,
   currentQuotaIsBlocked,
   recordRateLimit,
   selectActiveRepos,
