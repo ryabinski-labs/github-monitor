@@ -62,7 +62,7 @@ Handy variants:
 ```bash
 GITHUB_TOKEN=<your-token> npm start   # use an explicit token
 PORT=4180 npm start                   # use a different port
-npm run dev                           # guided launch: checks Node, gh auth, port, then opens the browser
+npm run dev                           # guided launch: checks Node, credentials, port, then opens the browser
 ```
 
 Prefer a config file? Copy [`.env.example`](.env.example) to `.env` and fill in what you need.
@@ -74,6 +74,8 @@ Pick one path. The server never persists your credential.
 1. **Personal access token** — set `GITHUB_TOKEN` or `GH_TOKEN`.
 2. **GitHub CLI fallback** — if neither variable is set, the server runs `gh auth token` once to reuse your existing local login. Verify with `gh auth status`.
 3. **GitHub App you own** — set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY_PATH` for higher, per-installation quota. See **[docs/github-app-setup.md](docs/github-app-setup.md)** for setup and quota trade-offs.
+
+These are checked in reverse order: App auth wins when both variables are set, then `GITHUB_TOKEN`/`GH_TOKEN`, then `gh`. `npm run dev` checks only the path that will actually be used, so App auth does not require `gh` to be installed or logged in.
 
 Token scopes you need depend on what you want to see:
 
@@ -150,9 +152,19 @@ All optional except your chosen auth path. Set via environment or `.env`.
 | `GITHUB_APP_PRIVATE_KEY_PATH` | Path to the App's private key (`0600`, kept outside the repo) |
 | `PORT` | Dashboard port (default `4177`) |
 | `OPEN_PRS_JOBS` | Parallelism for the open-PR scan |
+| `SCAN_PUSHED_WITHIN_HOURS` | Skip repos with no push in this window (default `168`; `0` scans everything) |
+| `SCAN_REPO_FLOOR` | Always scan this many most-recently-pushed repos, whatever the window says (default `10`) |
 | `DEPENDABOT_QUEUE_THRESHOLD` | Enables Dependabot cleanup (disabled by default); its value (`1`–`5000`) is the queued workflow-run depth that additionally triggers run cancellation |
 | `DEPENDABOT_QUEUE_OWNERS` | Optional comma-separated owner allowlist for automatic cleanup |
 | `ETAG_CACHE_DISABLED` | Set to `1` to disable conditional-request caching (debugging) |
+
+### Scan scope
+
+Most of a scan's cost is per repo — workflows, runs, deployments, runners — and on an account with many repositories most of that is spent on repos nobody has touched in weeks. `SCAN_PUSHED_WITHIN_HOURS` (default one week) skips them.
+
+Three things keep a repo in scope regardless of when it was last pushed: an open pull request, a missing or unreadable `pushed_at`, and being among the `SCAN_REPO_FLOOR` most recently pushed. The floor matters most — without it a quiet fortnight would empty the dashboard while looking like a successful scan.
+
+When repos are skipped, the **Repos** count says how many and why on hover. Set `SCAN_PUSHED_WITHIN_HOURS=0` to scan everything.
 
 ### Dashboard controls
 
@@ -191,7 +203,7 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md) — do not open a p
 
 ```bash
 npm test     # node --test plus a syntax check (npm run check)
-npm run dev  # startup helper: verifies Node, gh auth, port, then opens the dashboard
+npm run dev  # startup helper: verifies Node, credentials, port, then opens the dashboard
 ```
 
 GitHub Monitor is distributed as source — there are no runtime npm dependencies, so `npm ci` simply verifies the lockfile.
