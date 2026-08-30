@@ -2,7 +2,8 @@ import http from "node:http";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { createSign } from "node:crypto";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, stat, mkdir, writeFile, rename } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { extname, join, normalize } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -234,6 +235,16 @@ const RUNNING_ACTION_CACHE_TTL_MS = 60 * 1000;
 const RUNNING_DEPLOYMENT_CACHE_TTL_MS = 60 * 1000;
 const RERUN_DEDUP_TTL_MS = 60 * 1000;
 const OWNER_REPOS_CACHE_TTL_MS = 5 * 60 * 1000;
+// A repo nobody has pushed to in a week still costs a full slice of every scan
+// -- workflows, runs, deployments, runners -- to return the same empty answer it
+// returned last time. On an 89-repo account most of the fan-out is spent this
+// way. Set SCAN_PUSHED_WITHIN_HOURS=0 to scan everything.
+const SCAN_PUSHED_WITHIN_MS = Math.max(0, Number(process.env.SCAN_PUSHED_WITHIN_HOURS || 168)) * 60 * 60 * 1000;
+// Recency is a proxy for relevance, not the same thing, so the floor keeps the N
+// most recently pushed repos unconditionally. Without it a quiet fortnight (or a
+// clock skew, or an org that only merges via the web UI) collapses the scan to
+// nothing and the dashboard goes blank while looking like it worked.
+const SCAN_REPO_FLOOR = Math.max(0, Number(process.env.SCAN_REPO_FLOOR || 10));
 const DEPLOYMENT_TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
 // A repo's deploy target almost never changes; cache it (and the "none found"
 // result) for a day so the expensive code/tree probe runs ~4x less often.
@@ -542,6 +553,103 @@ function githubUrl(path, query = {}) {
 const etagCache = new Map();
 const ETAG_CACHE_DISABLED = process.env.ETAG_CACHE_DISABLED === "1";
 const ETAG_CACHEABLE_METHODS = new Set(["GET", "HEAD"]);
+// A 304 costs no GitHub quota, so a warm cache makes a whole scan nearly free --
+// but the cache only ever lived in memory, so every restart paid full price for
+// all of it again. On an 89-repo account that is ~500 core requests per restart,
+// and ten restarts in an hour is the entire 5,000 budget. Keep it on disk.
+const ETAG_CACHE_PATH = process.env.ETAG_CACHE_PATH || join(__dirname, ".cache", "etag-cache.json");
+const ETAG_CACHE_MAX_ENTRIES = Number(process.env.ETAG_CACHE_MAX_ENTRIES || 5000);
+// Bodies are whole API responses, so the file is capped by size as well as count.
+const ETAG_CACHE_MAX_BYTES = Number(process.env.ETAG_CACHE_MAX_BYTES || 64 * 1024 * 1024);
+const ETAG_CACHE_SAVE_DEBOUNCE_MS = 30 * 1000;
+let etagCacheSaveTimer = null;
+let etagCacheDirty = false;
+
+// Least-recently-used first, so eviction drops what a scan is least likely to
+// ask for next. Entries without a timestamp sort oldest and go first.
+function pruneEtagCache(store, { maxEntries = ETAG_CACHE_MAX_ENTRIES, maxBytes = ETAG_CACHE_MAX_BYTES } = {}) {
+  const entries = [...store.entries()].sort((a, b) => (b[1]?.usedAt || 0) - (a[1]?.usedAt || 0));
+  const kept = [];
+  let bytes = 0;
+  for (const [url, entry] of entries) {
+    if (kept.length >= maxEntries) break;
+    // Approximate: JSON length of this pair, which is what the file will hold.
+    const size = url.length + JSON.stringify(entry?.body ?? null).length + (entry?.etag?.length || 0);
+    if (bytes + size > maxBytes) continue;
+    bytes += size;
+    kept.push([url, entry]);
+  }
+  return { entries: kept, bytes };
+}
+
+function serializeEtagCache(store, limits) {
+  const { entries } = pruneEtagCache(store, limits);
+  return JSON.stringify({
+    version: 1,
+    savedAt: new Date().toISOString(),
+    entries: entries.map(([url, entry]) => ({ url, etag: entry.etag, body: entry.body, usedAt: entry.usedAt || 0 }))
+  });
+}
+
+function deserializeEtagCache(raw) {
+  const store = new Map();
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return store;
+  }
+  if (parsed?.version !== 1 || !Array.isArray(parsed.entries)) return store;
+  for (const entry of parsed.entries) {
+    // An entry without an etag can never produce a 304, so it is dead weight.
+    if (!entry || typeof entry.url !== "string" || typeof entry.etag !== "string" || !entry.etag) continue;
+    store.set(entry.url, { etag: entry.etag, body: entry.body, usedAt: Number(entry.usedAt) || 0 });
+  }
+  return store;
+}
+
+function loadEtagCacheFromDisk(path = ETAG_CACHE_PATH) {
+  if (!isEtagCacheEnabled()) return 0;
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    // No cache yet, or unreadable. Starting cold is correct, never fatal.
+    return 0;
+  }
+  const restored = deserializeEtagCache(raw);
+  for (const [url, entry] of restored) etagCache.set(url, entry);
+  return restored.size;
+}
+
+async function saveEtagCacheToDisk(path = ETAG_CACHE_PATH, store = etagCache) {
+  if (!isEtagCacheEnabled()) return false;
+  try {
+    await mkdir(join(path, ".."), { recursive: true });
+    const payload = serializeEtagCache(store);
+    // Write-then-rename so a crash mid-write cannot leave a truncated cache that
+    // would poison every conditional request on the next boot.
+    const temporary = `${path}.${process.pid}.tmp`;
+    await writeFile(temporary, payload, "utf8");
+    await rename(temporary, path);
+    etagCacheDirty = false;
+    return true;
+  } catch {
+    // A cache that cannot be written is a slow start, not an outage.
+    return false;
+  }
+}
+
+function scheduleEtagCacheSave() {
+  if (!isEtagCacheEnabled()) return;
+  etagCacheDirty = true;
+  if (etagCacheSaveTimer) return;
+  etagCacheSaveTimer = setTimeout(() => {
+    etagCacheSaveTimer = null;
+    if (etagCacheDirty) saveEtagCacheToDisk();
+  }, ETAG_CACHE_SAVE_DEBOUNCE_MS);
+  etagCacheSaveTimer.unref?.();
+}
 
 function isEtagCacheEnabled() {
   return !ETAG_CACHE_DISABLED;
@@ -559,6 +667,8 @@ function takeCachedConditionalResponse(store, url, method, status) {
   if (!ETAG_CACHEABLE_METHODS.has(method)) return null;
   const cached = store.get(url);
   if (!cached) return null;
+  // A 304 is a hit, so keep it away from the eviction end of the cache.
+  cached.usedAt = Date.now();
   return cached.body;
 }
 
@@ -569,7 +679,8 @@ function storeConditionalResponse(store, url, method, response, body) {
     store.delete(url);
     return false;
   }
-  store.set(url, { etag, body });
+  store.set(url, { etag, body, usedAt: Date.now() });
+  scheduleEtagCacheSave();
   return true;
 }
 
@@ -617,7 +728,9 @@ function createScanMetrics() {
   return {
     startedAt: new Date().toISOString(),
     requestCount: 0,
-    conditionalHits: 0
+    conditionalHits: 0,
+    reposConsidered: 0,
+    reposScanned: 0
   };
 }
 
@@ -662,6 +775,21 @@ function recordRateLimit(response, { conditional = false, installationKey = "pat
     bucket.remaining = previous.remaining;
   }
   observedRateBuckets.set(key, bucket);
+}
+
+// How much of the account the scan actually looked at. Trimming the repo list is
+// invisible from the deck alone -- "Repos 15" looks identical whether the other
+// 74 were quiet or silently dropped -- so the numbers ship with the payload.
+function scanScopeSnapshot(metrics) {
+  const considered = Number(metrics?.reposConsidered || 0);
+  const scanned = Number(metrics?.reposScanned || 0);
+  return {
+    reposConsidered: considered,
+    reposScanned: scanned,
+    reposSkipped: Math.max(0, considered - scanned),
+    pushedWithinHours: SCAN_PUSHED_WITHIN_MS / (60 * 60 * 1000),
+    repoFloor: SCAN_REPO_FLOOR
+  };
 }
 
 function snapshotRateLimit(metrics) {
@@ -1792,31 +1920,83 @@ async function fetchOwnerRepos(owner, me) {
       );
       return repos
         .filter((repo) => !repo.archived && repo.owner?.login?.toLowerCase() === owner.toLowerCase())
-        .map((repo) => repo.full_name);
+        .map(toScanCandidate);
     }
     if (owner === me) {
       const repos = await githubRestAll("/user/repos", (json) => (Array.isArray(json) ? json : []), 100, {
         affiliation: "owner"
       });
-      return repos.filter((repo) => !repo.archived && repo.owner?.login === me).map((repo) => repo.full_name);
+      return repos.filter((repo) => !repo.archived && repo.owner?.login === me).map(toScanCandidate);
     }
     const repos = await githubRestAll(`/orgs/${owner}/repos`, (json) => (Array.isArray(json) ? json : []));
-    return repos.filter((repo) => !repo.archived).map((repo) => repo.full_name);
+    return repos.filter((repo) => !repo.archived).map(toScanCandidate);
   });
+}
+
+// The repo listing already carries pushed_at, so keeping it costs nothing and is
+// the only signal available before the per-repo fan-out has been paid for.
+function toScanCandidate(repo) {
+  return { fullName: repo.full_name, pushedAt: repo.pushed_at || repo.updated_at || null };
+}
+
+// Narrows the repo list the scan fans out over. Three ways to survive it, in
+// order of how much they are trusted:
+//
+//   1. `keep` -- an open pull request, which is direct evidence the repo matters
+//      right now regardless of when it was last pushed. Costs nothing: the PR
+//      search has already run by the time this is called.
+//   2. Pushed within the window.
+//   3. Among the `floor` most recently pushed, whatever the window says.
+//
+// A repo with no pushed_at at all is kept: an unknown date is not evidence of
+// dormancy, and silently dropping repos is the failure mode this function has to
+// avoid much more than it has to save requests.
+function selectActiveRepos(candidates, { withinMs = SCAN_PUSHED_WITHIN_MS, floor = SCAN_REPO_FLOOR, keep = [], now = Date.now() } = {}) {
+  const byName = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const entry = typeof candidate === "string" ? { fullName: candidate, pushedAt: null } : candidate;
+    const fullName = entry?.fullName;
+    if (!fullName || byName.has(fullName)) continue;
+    const parsed = entry.pushedAt ? Date.parse(entry.pushedAt) : Number.NaN;
+    byName.set(fullName, { fullName, pushedAt: Number.isNaN(parsed) ? null : parsed });
+  }
+  const all = [...byName.values()];
+  if (!(withinMs > 0)) return all.map((entry) => entry.fullName).sort();
+
+  const kept = new Set(keep);
+  // Only dated repos compete for the floor: an undated one is already kept
+  // below, so letting it take a slot would spend the floor on the repos it
+  // exists to protect against. A future pushed_at (clock skew) ranks as most
+  // recent, which is the harmless direction to be wrong in.
+  const dated = all.filter((entry) => entry.pushedAt !== null).sort((a, b) => b.pushedAt - a.pushedAt);
+  for (const entry of dated.slice(0, floor)) kept.add(entry.fullName);
+
+  const cutoff = now - withinMs;
+  const selected = all
+    .filter((entry) => kept.has(entry.fullName) || entry.pushedAt === null || entry.pushedAt >= cutoff)
+    .map((entry) => entry.fullName);
+  return selected.sort();
 }
 
 async function listRepos({ mode, me, pullRequests, jobs, owners: ownerFilter }) {
   if (mode === "mine") return [...new Set(pullRequests.map((pr) => pr.repo))].sort();
-  if (mode === "owned") return fetchOwnerRepos(me, me);
-  const owners = await selectedOwners(me, ownerFilter);
-  const groups = await mapLimit(owners, jobs, async (owner) => {
-    try {
-      return await fetchOwnerRepos(owner, me);
-    } catch {
-      return [];
-    }
-  });
-  return [...new Set(groups.flat())].sort();
+  const keep = (pullRequests || []).map((pr) => pr.repo).filter(Boolean);
+  const candidates = mode === "owned"
+    ? await fetchOwnerRepos(me, me)
+    : (await mapLimit(await selectedOwners(me, ownerFilter), jobs, async (owner) => {
+        try {
+          return await fetchOwnerRepos(owner, me);
+        } catch {
+          return [];
+        }
+      })).flat();
+  const selected = selectActiveRepos(candidates, { keep });
+  const metrics = scanMetrics.getStore();
+  if (metrics) {
+    metrics.reposConsidered = new Set(candidates.map((entry) => entry?.fullName).filter(Boolean)).size;
+    metrics.reposScanned = selected.length;
+  }
+  return selected;
 }
 
 function isCdWorkflow(workflow) {
@@ -3009,6 +3189,38 @@ async function fetchQueuedRunsForRepo(repo, limit) {
   return runs.map((run) => ({ repo, runId: run.id || null, status: run.status || "", url: run.html_url || "" }));
 }
 
+const SCAN_ERROR_CAUSE_LIMIT = 3;
+
+// A quota-blocked scan fails once per repo per endpoint, so one cause reaches this
+// point 500+ times on a large account. Reporting each verbatim turned the dashboard
+// warning strip into a screenful of the same sentence, so collapse the list to its
+// distinct causes and count the repeats.
+function summarizeScanErrors(errors, limit = SCAN_ERROR_CAUSE_LIMIT) {
+  const byCause = new Map();
+  for (const entry of Array.isArray(errors) ? errors : []) {
+    const text = String(entry ?? "").trim();
+    if (!text) continue;
+    // Producers format these as `${subject}: ${message}`, and the subject is the
+    // repo-specific half -- grouping on the message is what collapses the flood.
+    // A message with no subject at all groups under itself.
+    const separator = text.indexOf(": ");
+    const cause = separator === -1 ? text : text.slice(separator + 2);
+    const seen = byCause.get(cause);
+    if (seen) seen.count += 1;
+    else byCause.set(cause, { cause, count: 1, first: text });
+  }
+  if (!byCause.size) return "";
+  const causes = [...byCause.values()].sort((a, b) => b.count - a.count);
+  const shown = causes
+    .slice(0, limit)
+    // A lone failure keeps its subject so a single broken repo stays nameable;
+    // a repeated one drops it, because naming every repo is what caused this.
+    .map(({ cause, count, first }) => (count === 1 ? first : `${cause} (${count} checks)`));
+  const hidden = causes.length - shown.length;
+  if (hidden > 0) shown.push(`+${hidden} more ${hidden === 1 ? "cause" : "causes"}`);
+  return shown.join(" ");
+}
+
 async function runDependabotQueueScan({
   threshold = DEPENDABOT_QUEUE_THRESHOLD,
   owners = DEPENDABOT_QUEUE_OWNERS,
@@ -3049,7 +3261,9 @@ async function runDependabotQueueScan({
           return { repos: [], errors: [`${owner} repositories: ${error.message}`] };
         }
       });
-      repos = [...new Set(repoGroups.flatMap((group) => group.repos))].sort();
+      // Same trim as the dashboard scan: a Dependabot PR pushes a branch, so a
+      // repo with a queue worth cleaning has a recent pushed_at by definition.
+      repos = selectActiveRepos(repoGroups.flatMap((group) => group.repos));
       repositoryErrors = repoGroups.flatMap((group) => group.errors);
       queuedGroups = await mapLimit(repos, jobs, async (repo) => {
         try {
@@ -3063,7 +3277,7 @@ async function runDependabotQueueScan({
     const discoveryErrors = [...repositoryErrors, ...queuedGroups.flatMap((group) => group.errors)];
     dependabotCleanupState.queueDepth = dependabotQueueDepth(queuedRuns);
     dependabotCleanupState.lastScanAt = new Date(now).toISOString();
-    dependabotCleanupState.lastError = discoveryErrors.join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors(discoveryErrors);
     // Cancelling in-flight runs is the destructive half and stays gated on queue
     // depth. Closing Dependabot PRs whose CI already failed is safe at any depth,
     // so it runs on every pass — a lone failing PR should not wait for a backlog.
@@ -3082,7 +3296,7 @@ async function runDependabotQueueScan({
     const result = await cleanupDependabotWorkload({ repos, jobs, cancelRuns });
     dependabotCleanupState.lastResult = result;
     dependabotCleanupState.lastCompletedAt = new Date().toISOString();
-    dependabotCleanupState.lastError = [...discoveryErrors, ...result.errors].join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors([...discoveryErrors, ...result.errors]);
     return result;
   } catch (error) {
     dependabotCleanupState.lastError = error.message || "Dependabot cleanup failed";
@@ -3248,6 +3462,7 @@ async function buildDashboardData(requestUrl) {
     auth: { mode: AUTH_MODE.mode, appId: AUTH_MODE.appId, misconfigured: AUTH_MODE.misconfigured },
     generatedAt: new Date().toISOString(),
     options: { mode, jobs, includeCd, includeTraces, includeRunners, includeRepoRunners, owners },
+    scan: scanScopeSnapshot(scanMetrics.getStore()),
     summary,
     rateLimit,
     warnings,
@@ -3763,8 +3978,19 @@ if (isMain) {
     console.log(`GitHub Monitor dashboard: http://127.0.0.1:${port}`);
     console.log(`Auth mode: ${APP_AUTH_ENABLED ? `GitHub App (id ${GITHUB_APP_ID})` : "Personal access token"}`);
     console.log(`Dependabot queue cleanup: ${DEPENDABOT_QUEUE_THRESHOLD > 0 ? `enabled at ${DEPENDABOT_QUEUE_THRESHOLD} queued runs` : "disabled"}`);
+    const restored = loadEtagCacheFromDisk();
+    console.log(`Conditional-request cache: ${restored > 0 ? `${restored} entries restored` : "cold, first scan pays full quota"}`);
     scheduleDependabotQueueScan(0);
   });
+
+  // Flush on the way out so a normal Ctrl-C keeps what the session learned; the
+  // debounce alone would lose up to 30s of it. Only when run directly -- an
+  // importing test must keep its own signal handling.
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      saveEtagCacheToDisk().finally(() => process.exit(0));
+    });
+  }
 }
 
 export {
@@ -3772,6 +3998,12 @@ export {
   resolveAuthMode,
   AUTH_MODE,
   buildDashboardWarnings,
+  loadEtagCacheFromDisk,
+  saveEtagCacheToDisk,
+  serializeEtagCache,
+  deserializeEtagCache,
+  pruneEtagCache,
+  etagCache,
   bestProductionUrlCandidate,
   buildChangeSummary,
   classifyPullRequest,
@@ -3787,6 +4019,8 @@ export {
   openPullRequestSearchQuery,
   quotaState,
   recordRateLimit,
+  selectActiveRepos,
+  scanScopeSnapshot,
   snapshotRateLimit,
   resetObservedRateBuckets,
   createScanMetrics,
@@ -3813,12 +4047,14 @@ export {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  summarizeScanErrors,
   markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
   attachBusyRunnerJobs,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
+  dependabotCleanupSnapshot,
   sameAutoMergeOwners,
   server
 };

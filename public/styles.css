@@ -767,11 +767,19 @@ button.metric.active .metric-dot {
   animation: spin 0.9s linear infinite;
 }
 
+/* A quota-blocked scan can hand this panel a warning built from hundreds of repo
+   failures at once. Cap it so the overflow scrolls inside its own box instead of
+   pushing the dashboard off-screen. Centring is dropped because a flex container
+   that centres taller-than-max content clips the top out of scroll reach. */
 .error-panel {
   border-color: rgba(168, 54, 43, 0.32);
   background: var(--red-soft);
   color: var(--red);
   font-weight: 600;
+  align-items: flex-start;
+  max-height: 7.5em;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .error-panel.warning {
