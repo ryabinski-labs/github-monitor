@@ -266,7 +266,13 @@ const DEPENDABOT_CLEANUP_JOBS = 4;
 const GITHUB_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.GITHUB_REQUEST_TIMEOUT_MS || 30000));
 // Ceiling on any one scan pass. Past this the pass returns what it has and the
 // section is reported degraded, rather than the whole response waiting on it.
-const SCAN_PASS_DEADLINE_MS = Math.max(0, Number(process.env.SCAN_PASS_DEADLINE_MS || 60000));
+//
+// Sized from measurement, not taste: a complete scan of this account runs 110s
+// at jobs=16 and 343s at jobs=4. An earlier 60s value cut CD off on every
+// single request, so `degraded` was always set and therefore said nothing. This
+// is a pathology bound -- a healthy scan must finish well inside it, and a trip
+// should mean something is actually wrong.
+const SCAN_PASS_DEADLINE_MS = Math.max(0, Number(process.env.SCAN_PASS_DEADLINE_MS || 420000));
 // Fan-out *inside* one repo's CD scan. Multiplies with the outer repo lanes, so
 // these stay deliberately small: the ceiling that bites first is GitHub's
 // secondary limit on request rate, not core quota (a 304 is quota-free but is
