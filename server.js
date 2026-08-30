@@ -260,6 +260,19 @@ const DEPENDABOT_QUEUE_OWNERS = parseOwners(process.env.DEPENDABOT_QUEUE_OWNERS)
 const DEPENDABOT_CLEANUP_COOLDOWN_MS = 5 * 60 * 1000;
 const DEPENDABOT_QUEUE_SCAN_MS = 60 * 1000;
 const DEPENDABOT_CLEANUP_JOBS = 4;
+// Node's fetch has no default request timeout, so a stalled socket held a
+// mapLimit lane open forever with nothing to break the deadlock: no error, no
+// log line, just a response that never came. Every GitHub call is bounded now.
+const GITHUB_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.GITHUB_REQUEST_TIMEOUT_MS || 30000));
+// Ceiling on any one scan pass. Past this the pass returns what it has and the
+// section is reported degraded, rather than the whole response waiting on it.
+const SCAN_PASS_DEADLINE_MS = Math.max(0, Number(process.env.SCAN_PASS_DEADLINE_MS || 60000));
+// Fan-out *inside* one repo's CD scan. Multiplies with the outer repo lanes, so
+// these stay deliberately small: the ceiling that bites first is GitHub's
+// secondary limit on request rate, not core quota (a 304 is quota-free but is
+// still a request).
+const CD_WORKFLOW_JOBS = Math.max(1, Number(process.env.CD_WORKFLOW_JOBS || 6));
+const CD_RUN_JOBS = Math.max(1, Number(process.env.CD_RUN_JOBS || 4));
 const FAILED_RUN_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
 const SKIPPED_RUN_CONCLUSIONS = new Set(["skipped"]);
 const FAILED_JOB_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
@@ -476,6 +489,7 @@ async function appAuthorizedRequest(url, init = {}) {
   const jwt = await getAppJwt();
   const response = await fetch(url, {
     ...init,
+    signal: init.signal || AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     headers: {
       accept: "application/vnd.github+json",
       authorization: `Bearer ${jwt}`,
@@ -702,6 +716,7 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
   const response = await fetch(url, {
     method,
     headers,
+    signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     body: body ? JSON.stringify(body) : undefined
   });
 
@@ -1015,6 +1030,49 @@ async function mapLimit(items, limit, mapper) {
   return output;
 }
 
+// A scan pass that degrades instead of failing whole. Two independent guards:
+// a repo whose fetch throws yields its empty shape rather than rejecting the
+// pass, and the pass as a whole abandons what it has not finished once
+// `deadlineMs` elapses. Either way the caller gets usable rows plus a `failed`
+// flag it can surface, so one wedged section can no longer hold the entire
+// /api/status payload hostage -- consumers that only want queue depth were
+// waiting on CD work they never read.
+async function settledScanPass(items, limit, mapper, emptyValue, deadlineMs = SCAN_PASS_DEADLINE_MS) {
+  let failed = false;
+  const blank = () => (typeof emptyValue === "function" ? emptyValue() : emptyValue);
+  const results = new Array(items.length);
+  for (let i = 0; i < items.length; i += 1) results[i] = blank();
+
+  let expired = false;
+  let timer = null;
+  const expiry = deadlineMs > 0
+    ? new Promise((resolve) => {
+        timer = setTimeout(() => {
+          expired = true;
+          failed = true;
+          resolve();
+        }, deadlineMs);
+      })
+    : null;
+
+  const work = mapLimit(items, limit, async (item, index) => {
+    if (expired) return;
+    try {
+      results[index] = await mapper(item, index);
+    } catch {
+      failed = true;
+    }
+  });
+
+  try {
+    if (expiry) await Promise.race([work, expiry]);
+    else await work;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return { results, failed };
+}
+
 function uniqueBy(items, keyFn) {
   const seen = new Set();
   return items.filter((item) => {
@@ -1035,10 +1093,17 @@ function parseBool(value, fallback = false) {
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
 }
 
+// Default was 4, which left the scan almost entirely latency-bound: 89 repos
+// through 4 lanes, three times over. 8 halves the round trips without doubling
+// the pressure on GitHub's secondary request-rate limit, which is the ceiling
+// that bites before core quota does.
+const DEFAULT_SCAN_JOBS = 8;
+const MAX_SCAN_JOBS = 16;
+
 function parseJobs(value) {
-  const jobs = Number(value || process.env.OPEN_PRS_JOBS || 4);
-  if (!Number.isInteger(jobs) || jobs < 1) return 4;
-  return Math.min(jobs, 16);
+  const jobs = Number(value || process.env.OPEN_PRS_JOBS || DEFAULT_SCAN_JOBS);
+  if (!Number.isInteger(jobs) || jobs < 1) return DEFAULT_SCAN_JOBS;
+  return Math.min(jobs, MAX_SCAN_JOBS);
 }
 
 function parseDependabotQueueThreshold(value, fallback = 0) {
@@ -2674,33 +2739,46 @@ async function fetchRecentCommits(repo, branch = "") {
 }
 
 async function fetchCdForRepo(repo) {
-  const failed = [];
-  const finished = [];
-  const running = [];
-  const failureReasons = new Map();
-  const changeSummaries = new Map();
+  // Every await below used to sit in a plain `for...of`, three levels deep:
+  // per workflow, then per failed run, then per completed run. On an 89-repo
+  // account under mapLimit(repos, 4) that serial chain was ~470 of the 473
+  // seconds a full /api/status took. The work is per-run independent, so it
+  // fans out; what is NOT independent is the de-duplication, which is why the
+  // memos below cache the *promise* rather than the resolved value. Storing the
+  // promise makes check-then-set atomic -- there is no await between the `has`
+  // and the `set`, so two concurrent runs asking for the same key share one
+  // request instead of both missing the cache and firing their own.
+  const failureReasonPromises = new Map();
+  const failureReasonFor = (run) => {
+    if (!failureReasonPromises.has(run.id)) {
+      failureReasonPromises.set(run.id, fetchWorkflowRunFailureReason(repo, run));
+    }
+    return failureReasonPromises.get(run.id);
+  };
+  const changeSummaryPromises = new Map();
   let deploymentTargetsPromise = null;
   let repoProductionTargetPromise = null;
   let mergedPullRequestsPromise = null;
   let recentCommitsPromise = null;
+
   let workflows = [];
   try {
     workflows = await fetchCdWorkflows(repo);
   } catch {
-  return {
-    failed: markIgnoredRuns(failed),
-    finished,
-    running: markIgnoredRuns(running)
-  };
+    return { failed: markIgnoredRuns([]), finished: [], running: markIgnoredRuns([]) };
   }
-  for (const workflow of workflows) {
+
+  const perWorkflow = await mapLimit(workflows, CD_WORKFLOW_JOBS, async (workflow) => {
+    const failed = [];
+    const finished = [];
+    const running = [];
     try {
       const recentWorkflowRuns = await fetchWorkflowRuns(repo, workflow.id, { per_page: 20 });
       const completedRuns = recentWorkflowRuns.filter((run) => run.status === "completed");
-      for (const failedRun of selectFailedCdRuns(completedRuns)) {
+
+      const failedRows = await mapLimit(selectFailedCdRuns(completedRuns), CD_RUN_JOBS, async (failedRun) => {
         const failedAt = failedRun.updated_at || failedRun.created_at;
-        const failureReason = await fetchWorkflowRunFailureReason(repo, failedRun);
-        failureReasons.set(failedRun.id, failureReason);
+        const failureReason = await failureReasonFor(failedRun);
         const supersedingRun = findSupersedingSuccessfulRun(completedRuns, failedRun);
         const resolvedBy = supersedingRun
           ? {
@@ -2710,7 +2788,7 @@ async function fetchCdForRepo(repo) {
               createdAt: supersedingRun.updated_at || supersedingRun.created_at || ""
             }
           : null;
-        failed.push({
+        return {
           runId: failedRun.id || null,
           createdAt: failedAt,
           updatedAt: failedRun.updated_at || "",
@@ -2725,60 +2803,60 @@ async function fetchCdForRepo(repo) {
           title: failedRun.display_title || "",
           url: failedRun.html_url || "",
           resolvedBy
-        });
-      }
-      for (const [runIndex, run] of completedRuns.entries()) {
-        const finishedAt = run.updated_at || run.created_at;
-        if (!isWithinFinishedCdWindow(finishedAt)) continue;
-        const outcome = runOutcome(run);
-        const failureReason = FAILED_RUN_CONCLUSIONS.has(run.conclusion)
-          ? failureReasons.get(run.id) || await fetchWorkflowRunFailureReason(repo, run)
-          : "";
-        if (failureReason) failureReasons.set(run.id, failureReason);
-        const skipReason = outcome === "skipped"
-          ? await fetchWorkflowRunSkipReason(repo, run)
-          : "";
-        deploymentTargetsPromise ||= fetchRecentDeploymentTargets(repo);
-        const deploymentTargets = await deploymentTargetsPromise;
-        let deployTarget = deploymentTargets.get(run.head_branch || "") || deploymentTargets.get("") || {};
-        if (!deployTarget.url) {
-          repoProductionTargetPromise ||= fetchRepoProductionTarget(repo);
-          deployTarget = await repoProductionTargetPromise || {};
-        }
-        const changeKey = run.head_sha || run.head_commit?.id || run.id;
-        if (!changeSummaries.has(changeKey)) {
-          mergedPullRequestsPromise ||= fetchRecentMergedPullRequests(repo);
-          const mergedPullRequests = await mergedPullRequestsPromise;
-          let recentCommits = [];
-          if (!mergedPullRequests.length) {
-            recentCommitsPromise ||= fetchRecentCommits(repo, run.head_branch || "");
-            recentCommits = await recentCommitsPromise;
+        };
+      });
+      failed.push(...failedRows);
+
+      const finishedRows = await mapLimit(
+        [...completedRuns.entries()].filter(([, run]) => isWithinFinishedCdWindow(run.updated_at || run.created_at)),
+        CD_RUN_JOBS,
+        async ([runIndex, run]) => {
+          const finishedAt = run.updated_at || run.created_at;
+          const outcome = runOutcome(run);
+          const failureReason = FAILED_RUN_CONCLUSIONS.has(run.conclusion) ? await failureReasonFor(run) : "";
+          const skipReason = outcome === "skipped" ? await fetchWorkflowRunSkipReason(repo, run) : "";
+          deploymentTargetsPromise ||= fetchRecentDeploymentTargets(repo);
+          const deploymentTargets = await deploymentTargetsPromise;
+          let deployTarget = deploymentTargets.get(run.head_branch || "") || deploymentTargets.get("") || {};
+          if (!deployTarget.url) {
+            repoProductionTargetPromise ||= fetchRepoProductionTarget(repo);
+            deployTarget = await repoProductionTargetPromise || {};
           }
-          const previousRun = completedRuns.slice(runIndex + 1).find((item) => item.head_sha || item.head_commit?.id);
-          changeSummaries.set(
-            changeKey,
-            await fetchWorkflowRunChangeSummary(repo, run, deployTarget, previousRun, mergedPullRequests, recentCommits)
-          );
+          const changeKey = run.head_sha || run.head_commit?.id || run.id;
+          if (!changeSummaryPromises.has(changeKey)) {
+            const previousRun = completedRuns.slice(runIndex + 1).find((item) => item.head_sha || item.head_commit?.id);
+            changeSummaryPromises.set(changeKey, (async () => {
+              mergedPullRequestsPromise ||= fetchRecentMergedPullRequests(repo);
+              const mergedPullRequests = await mergedPullRequestsPromise;
+              let recentCommits = [];
+              if (!mergedPullRequests.length) {
+                recentCommitsPromise ||= fetchRecentCommits(repo, run.head_branch || "");
+                recentCommits = await recentCommitsPromise;
+              }
+              return fetchWorkflowRunChangeSummary(repo, run, deployTarget, previousRun, mergedPullRequests, recentCommits);
+            })());
+          }
+          return {
+            runId: run.id || null,
+            createdAt: finishedAt,
+            updatedAt: run.updated_at || "",
+            repo,
+            workflow: workflow.name,
+            runNumber: `#${run.run_number}`,
+            status: run.status || "",
+            conclusion: run.conclusion || "",
+            outcome,
+            failureReason,
+            skipReason,
+            branch: run.head_branch || "",
+            headSha: run.head_sha || run.head_commit?.id || "",
+            title: run.display_title || "",
+            url: run.html_url || "",
+            changeSummary: await changeSummaryPromises.get(changeKey)
+          };
         }
-        finished.push({
-          runId: run.id || null,
-          createdAt: finishedAt,
-          updatedAt: run.updated_at || "",
-          repo,
-          workflow: workflow.name,
-          runNumber: `#${run.run_number}`,
-          status: run.status || "",
-          conclusion: run.conclusion || "",
-          outcome,
-          failureReason,
-          skipReason,
-          branch: run.head_branch || "",
-          headSha: run.head_sha || run.head_commit?.id || "",
-          title: run.display_title || "",
-          url: run.html_url || "",
-          changeSummary: changeSummaries.get(changeKey)
-        });
-      }
+      );
+      finished.push(...finishedRows);
 
       for (const run of recentWorkflowRuns.filter((item) => RUNNING_RUN_STATUSES.has(item.status))) {
         running.push({
@@ -2796,10 +2874,18 @@ async function fetchCdForRepo(repo) {
         });
       }
     } catch {
-      continue;
+      // Original kept whatever this workflow had already collected before the
+      // throw rather than discarding it; preserve that.
+      return { failed, finished, running };
     }
-  }
-  return { failed, finished, running };
+    return { failed, finished, running };
+  });
+
+  return {
+    failed: perWorkflow.flatMap((group) => group.failed),
+    finished: perWorkflow.flatMap((group) => group.finished),
+    running: perWorkflow.flatMap((group) => group.running)
+  };
 }
 
 async function fetchActionsForRepo(repo) {
@@ -3382,31 +3468,53 @@ async function buildDashboardData(requestUrl) {
   let busyRunners = [];
   let traces = groupTraces([]);
   let cdRowsByRepo = new Map();
+  // Sections that returned incomplete. Surfaced on the payload so a consumer
+  // polling for one thing (queue depth) can tell a partial answer from a whole
+  // one instead of trusting a silently short list.
+  const degraded = new Set();
   let mergedPullRequestsByRepo;
 
   repos = await listRepos({ mode, me, pullRequests, jobs, owners });
 
+  // These three passes each fan out over the same repo list and none of them
+  // reads another's result -- busyRunners below is the only consumer, and it
+  // runs after all of them. Awaiting them one after another was costing three
+  // serial passes over 89 repos for no reason. Same request count, a third of
+  // the wall clock.
   if (repos.length) {
-    const actionGroups = await mapLimit(repos, jobs, fetchActionsForRepo);
+    const wantCd = Boolean(includeCd);
+    const [actionGroups, cdOutcome, deploymentOutcome] = await Promise.all([
+      mapLimit(repos, jobs, fetchActionsForRepo),
+      wantCd ? settledScanPass(repos, jobs, fetchCdForRepo, () => ({ failed: [], finished: [], running: [] })) : null,
+      wantCd ? settledScanPass(repos, jobs, fetchRunningDeploymentsForRepo, () => []) : null
+    ]);
+
     failedActions = markAutoDismissedDependabotRuns(
       uniqueBy(actionGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
     );
     runningActions = uniqueBy(actionGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
     pullRequests = applyActionRunEvidenceToPullRequests(pullRequests, { runningActions, failedActions });
-  }
 
-  if (includeCd && repos.length) {
-    const cdGroups = await mapLimit(repos, jobs, fetchCdForRepo);
-    cdRowsByRepo = new Map(cdGroups.map((group, index) => [
-      repos[index],
-      [...group.failed, ...group.finished, ...group.running]
-    ]));
-    failedCd = uniqueBy(cdGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
-      .filter((run) => !run.resolvedBy);
-    finishedCd = uniqueBy(cdGroups.flatMap((group) => group.finished), (run) => run.url || JSON.stringify(run));
-    runningCd = uniqueBy(cdGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
-    const deploymentGroups = await mapLimit(repos, jobs, fetchRunningDeploymentsForRepo);
-    runningDeployments = uniqueBy(deploymentGroups.flat(), (deployment) => deployment.url || JSON.stringify(deployment));
+    if (cdOutcome) {
+      if (cdOutcome.failed) degraded.add("cd");
+      const cdGroups = cdOutcome.results;
+      cdRowsByRepo = new Map(cdGroups.map((group, index) => [
+        repos[index],
+        [...group.failed, ...group.finished, ...group.running]
+      ]));
+      failedCd = uniqueBy(cdGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
+        .filter((run) => !run.resolvedBy);
+      finishedCd = uniqueBy(cdGroups.flatMap((group) => group.finished), (run) => run.url || JSON.stringify(run));
+      runningCd = uniqueBy(cdGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
+    }
+
+    if (deploymentOutcome) {
+      if (deploymentOutcome.failed) degraded.add("deployments");
+      runningDeployments = uniqueBy(
+        deploymentOutcome.results.flat(),
+        (deployment) => deployment.url || JSON.stringify(deployment)
+      );
+    }
   }
 
   if (includeRunners) {
@@ -3454,6 +3562,9 @@ async function buildDashboardData(requestUrl) {
   const cleanupSnapshot = dependabotCleanupSnapshot();
   if (cleanupSnapshot.lastError) {
     warnings.push(`Dependabot cleanup: ${cleanupSnapshot.lastError}`);
+  if (degraded.size) {
+    warnings.push(`Partial scan: ${[...degraded].sort().join(", ")} did not finish; those sections may be incomplete.`);
+  }
   }
 
   return {
@@ -3461,6 +3572,7 @@ async function buildDashboardData(requestUrl) {
     accounts,
     auth: { mode: AUTH_MODE.mode, appId: AUTH_MODE.appId, misconfigured: AUTH_MODE.misconfigured },
     generatedAt: new Date().toISOString(),
+    degraded: [...degraded].sort(),
     options: { mode, jobs, includeCd, includeTraces, includeRunners, includeRepoRunners, owners },
     scan: scanScopeSnapshot(scanMetrics.getStore()),
     summary,
@@ -3995,6 +4107,12 @@ if (isMain) {
 
 export {
   SECURITY_HEADERS,
+  settledScanPass,
+  parseJobs,
+  DEFAULT_SCAN_JOBS,
+  MAX_SCAN_JOBS,
+  GITHUB_REQUEST_TIMEOUT_MS,
+  SCAN_PASS_DEADLINE_MS,
   resolveAuthMode,
   AUTH_MODE,
   buildDashboardWarnings,
