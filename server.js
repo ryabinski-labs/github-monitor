@@ -230,12 +230,15 @@ const QUOTA_WARN_RATIO = 0.3;
 // smaller than this floor, judge purely by ratio + reset proximity.
 const QUOTA_ABSOLUTE_LIMIT_FLOOR = 1000;
 const CD_WORKFLOW_CACHE_TTL_MS = 15 * 60 * 1000;
-// A 60s TTL cannot survive the scan that fills it. A cold CD pass measures ~320s
-// and is allowed up to SCAN_PASS_DEADLINE_MS, so entries fetched early in a pass
-// had already expired before the pass ended: every pass re-fetched everything and
-// the cache never paid for itself across passes. To be reused at all the TTL has
-// to outlive one whole pass plus the gap to the next, hence a value well above
-// the pass deadline rather than a nudge up from 60s.
+// A 60s TTL cannot survive the scan that fills it. SCAN_PASS_DEADLINE_MS is 60s,
+// so a CD pass is allowed to run exactly as long as its own cache entries live:
+// anything fetched in the first moments of a pass had expired by the time the
+// pass ended. Every pass re-fetched everything and the cache never paid for
+// itself. (A cold CD pass wants ~320s of work and gets cut off at the deadline,
+// which is a separate problem -- see the degraded 'cd' section -- but it is why
+// a pass reliably runs the full 60s rather than finishing early.) To be reused
+// at all the TTL has to outlive one whole pass plus the gap to the next, hence a
+// value well above the pass deadline rather than a nudge up from 60s.
 //
 // Blast radius is the CD panel only -- fetchWorkflowRuns has a single caller, in
 // fetchCdForRepo. CI status on pull requests comes from a different cache and is
