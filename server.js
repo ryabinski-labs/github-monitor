@@ -3552,8 +3552,13 @@ async function withQueueDeadline(promise, remainingMs, fallback) {
   const outcome = await Promise.race([
     settled,
     new Promise((resolve) => {
+      // Deliberately NOT unref'd. An unref'd timer cannot hold the event loop, so
+      // if this deadline were ever the only pending work the process would exit
+      // before it fired and the phase would never be bounded at all. In the server
+      // the in-flight socket keeps the loop alive anyway -- but correctness here
+      // must not depend on something else happening to be pending. It is cleared
+      // on every path below, so it holds the loop only while the phase is running.
       timer = setTimeout(() => resolve({ value: fallback, timedOut: true }), remainingMs);
-      timer.unref?.();
     })
   ]);
   clearTimeout(timer);
