@@ -213,6 +213,16 @@ const RUNNING_ACTION_CACHE_TTL_MS = 60 * 1000;
 const RUNNING_DEPLOYMENT_CACHE_TTL_MS = 60 * 1000;
 const RERUN_DEDUP_TTL_MS = 60 * 1000;
 const OWNER_REPOS_CACHE_TTL_MS = 5 * 60 * 1000;
+// A repo nobody has pushed to in a week still costs a full slice of every scan
+// -- workflows, runs, deployments, runners -- to return the same empty answer it
+// returned last time. On an 89-repo account most of the fan-out is spent this
+// way. Set SCAN_PUSHED_WITHIN_HOURS=0 to scan everything.
+const SCAN_PUSHED_WITHIN_MS = Math.max(0, Number(process.env.SCAN_PUSHED_WITHIN_HOURS || 168)) * 60 * 60 * 1000;
+// Recency is a proxy for relevance, not the same thing, so the floor keeps the N
+// most recently pushed repos unconditionally. Without it a quiet fortnight (or a
+// clock skew, or an org that only merges via the web UI) collapses the scan to
+// nothing and the dashboard goes blank while looking like it worked.
+const SCAN_REPO_FLOOR = Math.max(0, Number(process.env.SCAN_REPO_FLOOR || 10));
 const DEPLOYMENT_TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
 // A repo's deploy target almost never changes; cache it (and the "none found"
 // result) for a day so the expensive code/tree probe runs ~4x less often.
@@ -596,7 +606,9 @@ function createScanMetrics() {
   return {
     startedAt: new Date().toISOString(),
     requestCount: 0,
-    conditionalHits: 0
+    conditionalHits: 0,
+    reposConsidered: 0,
+    reposScanned: 0
   };
 }
 
@@ -641,6 +653,21 @@ function recordRateLimit(response, { conditional = false, installationKey = "pat
     bucket.remaining = previous.remaining;
   }
   observedRateBuckets.set(key, bucket);
+}
+
+// How much of the account the scan actually looked at. Trimming the repo list is
+// invisible from the deck alone -- "Repos 15" looks identical whether the other
+// 74 were quiet or silently dropped -- so the numbers ship with the payload.
+function scanScopeSnapshot(metrics) {
+  const considered = Number(metrics?.reposConsidered || 0);
+  const scanned = Number(metrics?.reposScanned || 0);
+  return {
+    reposConsidered: considered,
+    reposScanned: scanned,
+    reposSkipped: Math.max(0, considered - scanned),
+    pushedWithinHours: SCAN_PUSHED_WITHIN_MS / (60 * 60 * 1000),
+    repoFloor: SCAN_REPO_FLOOR
+  };
 }
 
 function snapshotRateLimit(metrics) {
@@ -1762,31 +1789,83 @@ async function fetchOwnerRepos(owner, me) {
       );
       return repos
         .filter((repo) => !repo.archived && repo.owner?.login?.toLowerCase() === owner.toLowerCase())
-        .map((repo) => repo.full_name);
+        .map(toScanCandidate);
     }
     if (owner === me) {
       const repos = await githubRestAll("/user/repos", (json) => (Array.isArray(json) ? json : []), 100, {
         affiliation: "owner"
       });
-      return repos.filter((repo) => !repo.archived && repo.owner?.login === me).map((repo) => repo.full_name);
+      return repos.filter((repo) => !repo.archived && repo.owner?.login === me).map(toScanCandidate);
     }
     const repos = await githubRestAll(`/orgs/${owner}/repos`, (json) => (Array.isArray(json) ? json : []));
-    return repos.filter((repo) => !repo.archived).map((repo) => repo.full_name);
+    return repos.filter((repo) => !repo.archived).map(toScanCandidate);
   });
+}
+
+// The repo listing already carries pushed_at, so keeping it costs nothing and is
+// the only signal available before the per-repo fan-out has been paid for.
+function toScanCandidate(repo) {
+  return { fullName: repo.full_name, pushedAt: repo.pushed_at || repo.updated_at || null };
+}
+
+// Narrows the repo list the scan fans out over. Three ways to survive it, in
+// order of how much they are trusted:
+//
+//   1. `keep` -- an open pull request, which is direct evidence the repo matters
+//      right now regardless of when it was last pushed. Costs nothing: the PR
+//      search has already run by the time this is called.
+//   2. Pushed within the window.
+//   3. Among the `floor` most recently pushed, whatever the window says.
+//
+// A repo with no pushed_at at all is kept: an unknown date is not evidence of
+// dormancy, and silently dropping repos is the failure mode this function has to
+// avoid much more than it has to save requests.
+function selectActiveRepos(candidates, { withinMs = SCAN_PUSHED_WITHIN_MS, floor = SCAN_REPO_FLOOR, keep = [], now = Date.now() } = {}) {
+  const byName = new Map();
+  for (const candidate of Array.isArray(candidates) ? candidates : []) {
+    const entry = typeof candidate === "string" ? { fullName: candidate, pushedAt: null } : candidate;
+    const fullName = entry?.fullName;
+    if (!fullName || byName.has(fullName)) continue;
+    const parsed = entry.pushedAt ? Date.parse(entry.pushedAt) : Number.NaN;
+    byName.set(fullName, { fullName, pushedAt: Number.isNaN(parsed) ? null : parsed });
+  }
+  const all = [...byName.values()];
+  if (!(withinMs > 0)) return all.map((entry) => entry.fullName).sort();
+
+  const kept = new Set(keep);
+  // Only dated repos compete for the floor: an undated one is already kept
+  // below, so letting it take a slot would spend the floor on the repos it
+  // exists to protect against. A future pushed_at (clock skew) ranks as most
+  // recent, which is the harmless direction to be wrong in.
+  const dated = all.filter((entry) => entry.pushedAt !== null).sort((a, b) => b.pushedAt - a.pushedAt);
+  for (const entry of dated.slice(0, floor)) kept.add(entry.fullName);
+
+  const cutoff = now - withinMs;
+  const selected = all
+    .filter((entry) => kept.has(entry.fullName) || entry.pushedAt === null || entry.pushedAt >= cutoff)
+    .map((entry) => entry.fullName);
+  return selected.sort();
 }
 
 async function listRepos({ mode, me, pullRequests, jobs, owners: ownerFilter }) {
   if (mode === "mine") return [...new Set(pullRequests.map((pr) => pr.repo))].sort();
-  if (mode === "owned") return fetchOwnerRepos(me, me);
-  const owners = await selectedOwners(me, ownerFilter);
-  const groups = await mapLimit(owners, jobs, async (owner) => {
-    try {
-      return await fetchOwnerRepos(owner, me);
-    } catch {
-      return [];
-    }
-  });
-  return [...new Set(groups.flat())].sort();
+  const keep = (pullRequests || []).map((pr) => pr.repo).filter(Boolean);
+  const candidates = mode === "owned"
+    ? await fetchOwnerRepos(me, me)
+    : (await mapLimit(await selectedOwners(me, ownerFilter), jobs, async (owner) => {
+        try {
+          return await fetchOwnerRepos(owner, me);
+        } catch {
+          return [];
+        }
+      })).flat();
+  const selected = selectActiveRepos(candidates, { keep });
+  const metrics = scanMetrics.getStore();
+  if (metrics) {
+    metrics.reposConsidered = new Set(candidates.map((entry) => entry?.fullName).filter(Boolean)).size;
+    metrics.reposScanned = selected.length;
+  }
+  return selected;
 }
 
 function isCdWorkflow(workflow) {
@@ -2979,6 +3058,38 @@ async function fetchQueuedRunsForRepo(repo, limit) {
   return runs.map((run) => ({ repo, runId: run.id || null, status: run.status || "", url: run.html_url || "" }));
 }
 
+const SCAN_ERROR_CAUSE_LIMIT = 3;
+
+// A quota-blocked scan fails once per repo per endpoint, so one cause reaches this
+// point 500+ times on a large account. Reporting each verbatim turned the dashboard
+// warning strip into a screenful of the same sentence, so collapse the list to its
+// distinct causes and count the repeats.
+function summarizeScanErrors(errors, limit = SCAN_ERROR_CAUSE_LIMIT) {
+  const byCause = new Map();
+  for (const entry of Array.isArray(errors) ? errors : []) {
+    const text = String(entry ?? "").trim();
+    if (!text) continue;
+    // Producers format these as `${subject}: ${message}`, and the subject is the
+    // repo-specific half -- grouping on the message is what collapses the flood.
+    // A message with no subject at all groups under itself.
+    const separator = text.indexOf(": ");
+    const cause = separator === -1 ? text : text.slice(separator + 2);
+    const seen = byCause.get(cause);
+    if (seen) seen.count += 1;
+    else byCause.set(cause, { cause, count: 1, first: text });
+  }
+  if (!byCause.size) return "";
+  const causes = [...byCause.values()].sort((a, b) => b.count - a.count);
+  const shown = causes
+    .slice(0, limit)
+    // A lone failure keeps its subject so a single broken repo stays nameable;
+    // a repeated one drops it, because naming every repo is what caused this.
+    .map(({ cause, count, first }) => (count === 1 ? first : `${cause} (${count} checks)`));
+  const hidden = causes.length - shown.length;
+  if (hidden > 0) shown.push(`+${hidden} more ${hidden === 1 ? "cause" : "causes"}`);
+  return shown.join(" ");
+}
+
 async function runDependabotQueueScan({
   threshold = DEPENDABOT_QUEUE_THRESHOLD,
   owners = DEPENDABOT_QUEUE_OWNERS,
@@ -3019,7 +3130,9 @@ async function runDependabotQueueScan({
           return { repos: [], errors: [`${owner} repositories: ${error.message}`] };
         }
       });
-      repos = [...new Set(repoGroups.flatMap((group) => group.repos))].sort();
+      // Same trim as the dashboard scan: a Dependabot PR pushes a branch, so a
+      // repo with a queue worth cleaning has a recent pushed_at by definition.
+      repos = selectActiveRepos(repoGroups.flatMap((group) => group.repos));
       repositoryErrors = repoGroups.flatMap((group) => group.errors);
       queuedGroups = await mapLimit(repos, jobs, async (repo) => {
         try {
@@ -3033,7 +3146,7 @@ async function runDependabotQueueScan({
     const discoveryErrors = [...repositoryErrors, ...queuedGroups.flatMap((group) => group.errors)];
     dependabotCleanupState.queueDepth = dependabotQueueDepth(queuedRuns);
     dependabotCleanupState.lastScanAt = new Date(now).toISOString();
-    dependabotCleanupState.lastError = discoveryErrors.join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors(discoveryErrors);
     // Cancelling in-flight runs is the destructive half and stays gated on queue
     // depth. Closing Dependabot PRs whose CI already failed is safe at any depth,
     // so it runs on every pass — a lone failing PR should not wait for a backlog.
@@ -3052,7 +3165,7 @@ async function runDependabotQueueScan({
     const result = await cleanupDependabotWorkload({ repos, jobs, cancelRuns });
     dependabotCleanupState.lastResult = result;
     dependabotCleanupState.lastCompletedAt = new Date().toISOString();
-    dependabotCleanupState.lastError = [...discoveryErrors, ...result.errors].join("; ");
+    dependabotCleanupState.lastError = summarizeScanErrors([...discoveryErrors, ...result.errors]);
     return result;
   } catch (error) {
     dependabotCleanupState.lastError = error.message || "Dependabot cleanup failed";
@@ -3217,6 +3330,7 @@ async function buildDashboardData(requestUrl) {
     accounts,
     generatedAt: new Date().toISOString(),
     options: { mode, jobs, includeCd, includeTraces, includeRunners, includeRepoRunners, owners },
+    scan: scanScopeSnapshot(scanMetrics.getStore()),
     summary,
     rateLimit,
     warnings,
@@ -3753,6 +3867,8 @@ export {
   openPullRequestSearchQuery,
   quotaState,
   recordRateLimit,
+  selectActiveRepos,
+  scanScopeSnapshot,
   snapshotRateLimit,
   resetObservedRateBuckets,
   createScanMetrics,
@@ -3779,12 +3895,14 @@ export {
   isDependabotWorkflowRun,
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
+  summarizeScanErrors,
   markAutoDismissedDependabotRuns,
   hasFailedCiSignal,
   attachBusyRunnerJobs,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
   resetDependabotCleanupState,
+  dependabotCleanupSnapshot,
   sameAutoMergeOwners,
   server
 };
