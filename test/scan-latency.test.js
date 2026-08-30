@@ -6,7 +6,8 @@ import {
   DEFAULT_SCAN_JOBS,
   MAX_SCAN_JOBS,
   GITHUB_REQUEST_TIMEOUT_MS,
-  SCAN_PASS_DEADLINE_MS
+  SCAN_PASS_DEADLINE_MS,
+  WORKFLOW_RUN_CACHE_TTL_MS
 } from "../server.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -158,5 +159,27 @@ test("a scan pass ceiling exists and sits above a single request's timeout", asy
   assert.ok(
     SCAN_PASS_DEADLINE_MS >= GITHUB_REQUEST_TIMEOUT_MS,
     "a pass must outlive one request, or it would cut off work that was about to succeed"
+  );
+});
+
+// --- CD workflow-run cache TTL ------------------------------------------------
+
+test("the workflow-run cache outlives a whole scan pass, or it never gets reused", async () => {
+  // The bug this guards: at 60s, entries fetched at the start of a ~320s CD pass
+  // had expired before the pass finished, so consecutive passes shared nothing
+  // and the cache did no work at all. Surviving one pass is the minimum bar.
+  assert.ok(
+    WORKFLOW_RUN_CACHE_TTL_MS > SCAN_PASS_DEADLINE_MS,
+    `TTL ${WORKFLOW_RUN_CACHE_TTL_MS}ms must exceed the pass deadline ${SCAN_PASS_DEADLINE_MS}ms`
+  );
+});
+
+test("the workflow-run TTL stays inside a sane staleness ceiling", async () => {
+  // It defers CD runs started outside the dashboard, so it buys reuse without
+  // letting the CD panel drift arbitrarily far from GitHub.
+  assert.ok(Number.isFinite(WORKFLOW_RUN_CACHE_TTL_MS));
+  assert.ok(
+    WORKFLOW_RUN_CACHE_TTL_MS <= 30 * 60 * 1000,
+    "half an hour of stale CD state is past useful"
   );
 });
