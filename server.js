@@ -230,12 +230,15 @@ const QUOTA_WARN_RATIO = 0.3;
 // smaller than this floor, judge purely by ratio + reset proximity.
 const QUOTA_ABSOLUTE_LIMIT_FLOOR = 1000;
 const CD_WORKFLOW_CACHE_TTL_MS = 15 * 60 * 1000;
-// A 60s TTL cannot survive the scan that fills it. A cold CD pass measures ~320s
-// and is allowed up to SCAN_PASS_DEADLINE_MS, so entries fetched early in a pass
-// had already expired before the pass ended: every pass re-fetched everything and
-// the cache never paid for itself across passes. To be reused at all the TTL has
-// to outlive one whole pass plus the gap to the next, hence a value well above
-// the pass deadline rather than a nudge up from 60s.
+// A 60s TTL cannot survive the scan that fills it. SCAN_PASS_DEADLINE_MS is 60s,
+// so a CD pass is allowed to run exactly as long as its own cache entries live:
+// anything fetched in the first moments of a pass had expired by the time the
+// pass ended. Every pass re-fetched everything and the cache never paid for
+// itself. (A cold CD pass wants ~320s of work and gets cut off at the deadline,
+// which is a separate problem -- see the degraded 'cd' section -- but it is why
+// a pass reliably runs the full 60s rather than finishing early.) To be reused
+// at all the TTL has to outlive one whole pass plus the gap to the next, hence a
+// value well above the pass deadline rather than a nudge up from 60s.
 //
 // Blast radius is the CD panel only -- fetchWorkflowRuns has a single caller, in
 // fetchCdForRepo. CI status on pull requests comes from a different cache and is
@@ -929,6 +932,24 @@ function quotaState(rateLimit) {
   return { status: "ok", blocked: false, tightest, resetAt, retryAfterSeconds: 0 };
 }
 
+// The shape /api/status has always published at refresh.quota, factored out so
+// /api/queue can publish an identical one. A consumer that already backs off on
+// refresh.quota.blocked should not have to learn a second field layout to poll a
+// second endpoint.
+function quotaSnapshot(rateLimit) {
+  const quota = quotaState(rateLimit);
+  const tightest = quota.tightest;
+  return {
+    status: quota.status,
+    blocked: quota.blocked,
+    resource: tightest?.resource || "",
+    remaining: tightest?.remaining ?? null,
+    limit: tightest?.limit ?? null,
+    resetAt: quota.resetAt || "",
+    retryAfterSeconds: quota.retryAfterSeconds || 0
+  };
+}
+
 function currentQuotaIsBlocked() {
   const quota = quotaState(snapshotRateLimit(scanMetrics.getStore() || createScanMetrics()));
   if (!quota.blocked) return false;
@@ -960,15 +981,7 @@ function recommendRefresh(summary, options, rateLimit) {
     intervalSeconds,
     nextRefreshAt: new Date(Date.now() + intervalSeconds * 1000).toISOString(),
     reason: refreshReason(activeCount, problemCount, quota),
-    quota: {
-      status: quota.status,
-      blocked: quota.blocked,
-      resource: tightest?.resource || "",
-      remaining: tightest?.remaining ?? null,
-      limit: tightest?.limit ?? null,
-      resetAt: quota.resetAt || "",
-      retryAfterSeconds: quota.retryAfterSeconds || 0
-    }
+    quota: quotaSnapshot(rateLimit)
   };
 }
 
@@ -3462,6 +3475,228 @@ async function buildBusyRunnerData(requestUrl) {
   };
 }
 
+// --- /api/queue ---------------------------------------------------------------
+//
+// Runner demand is the one question this server answers where the scan's
+// freshness trim is actively wrong. selectActiveRepos drops repos with no push
+// inside SCAN_PUSHED_WITHIN_HOURS, but a scheduled run, a workflow_dispatch, or a
+// re-run queues work on a repo nobody has pushed to. An autoscaler reading queue
+// depth from the trimmed set sees "no demand" while jobs sit waiting, and scales
+// to zero -- so everything below bypasses that filter and fans out over every
+// non-archived repo. That is the entire reason this endpoint exists separately
+// from /api/status rather than being another section of it.
+
+// Only `queued` counts. The other members of RUNNING_RUN_STATUSES -- `waiting`,
+// `requested`, `pending` -- mean a run is held by a deployment gate, a required
+// approval, or a concurrency group. Adding a runner releases none of them, so
+// counting them as demand over-provisions; it is the same reason a queued
+// deployment is not runner demand. Echoed on the response as options.statuses so
+// a consumer never has to guess which set it is holding.
+const QUEUE_RUN_STATUSES = ["queued"];
+const QUEUE_PAGE_SIZE = 100;
+// Per repo. A repo sitting on more queued runs than this is a Dependabot storm,
+// not a capacity signal, and unbounded pagination does not belong inside a
+// request with a ten-second latency budget. Past the cap the repo is named in
+// queue.truncatedRepos and the answer is marked degraded rather than quietly
+// short.
+const QUEUE_MAX_PAGES = Math.max(1, Number(process.env.QUEUE_MAX_PAGES || 3));
+// Deliberately tighter than SCAN_PASS_DEADLINE_MS. The consumer's hard ceiling is
+// 30s, so a pass allowed to run to the dashboard's deadline would blow it and the
+// answer would arrive after the client had already given up. A degraded answer
+// inside the budget beats a complete one that is never read.
+const QUEUE_PASS_DEADLINE_MS = Math.max(1000, Number(process.env.QUEUE_PASS_DEADLINE_MS || 20000));
+
+// Repo discovery as the dashboard does it, minus selectActiveRepos, and with
+// owner-listing failures reported rather than swallowed. An owner whose listing
+// failed contributes zero queued runs, which is indistinguishable from an idle
+// owner unless the caller is told -- and "indistinguishable from idle" is the
+// exact bug this endpoint exists to fix.
+// The half of repo discovery that must NOT trim, kept as its own function so a
+// test can hand it the same candidate list selectActiveRepos would trim and watch
+// the stale repo survive. A trim reintroduced here is the exact regression that
+// puts an autoscaler back to reading "no demand" while jobs sit queued.
+function queueRepoNames(candidates) {
+  const names = (candidates || [])
+    .map((entry) => (typeof entry === "string" ? entry : entry?.fullName))
+    .filter(Boolean);
+  return [...new Set(names)].sort();
+}
+
+async function listQueueRepos({ mode, me, pullRequests, jobs, owners: ownerFilter }) {
+  if (mode === "mine") {
+    return { repos: queueRepoNames((pullRequests || []).map((pr) => pr.repo)), errors: [] };
+  }
+  const errors = [];
+  let candidates = [];
+  if (mode === "owned") {
+    try {
+      candidates = await fetchOwnerRepos(me, me);
+    } catch (error) {
+      errors.push(`${me} repositories: ${error.message}`);
+    }
+  } else {
+    const owners = await selectedOwners(me, ownerFilter);
+    const groups = await mapLimit(owners, jobs, async (owner) => {
+      try {
+        return await fetchOwnerRepos(owner, me);
+      } catch (error) {
+        errors.push(`${owner} repositories: ${error.message}`);
+        return [];
+      }
+    });
+    candidates = groups.flat();
+  }
+  return { repos: queueRepoNames(candidates), errors };
+}
+
+// Field names match status.actions.running[] exactly, so a consumer already
+// mapping that array needs no second mapping layer for this one.
+function toQueuedRun(run, repo) {
+  return {
+    kind: "workflowRun",
+    ...(run.id ? { runId: run.id } : {}),
+    createdAt: run.created_at || "",
+    repo,
+    workflow: run.name || "Workflow",
+    runNumber: `#${run.run_number}`,
+    status: run.status || "",
+    branch: run.head_branch || "",
+    // Not on the dashboard's shape, and free here: `event` is the direct evidence
+    // of what the freshness trim was hiding, since schedule and workflow_dispatch
+    // are precisely the triggers that queue work without a push.
+    event: run.event || "",
+    ...(run.head_sha || run.head_commit?.id ? { headSha: run.head_sha || run.head_commit?.id } : {}),
+    ...(isDependabotWorkflowRun(run) ? { dependabot: true } : {}),
+    title: run.display_title || run.name || "",
+    url: run.html_url || ""
+  };
+}
+
+async function fetchQueuedRunsForQueue(repo) {
+  const raw = [];
+  let truncated = false;
+  for (let page = 1; page <= QUEUE_MAX_PAGES; page += 1) {
+    const json = await githubRestPage(
+      `/repos/${repo}/actions/runs`,
+      page,
+      QUEUE_PAGE_SIZE,
+      { status: QUEUE_RUN_STATUSES[0] }
+    );
+    const items = json?.workflow_runs || [];
+    raw.push(...items);
+    if (items.length < QUEUE_PAGE_SIZE) break;
+    if (page === QUEUE_MAX_PAGES) truncated = true;
+  }
+  // Same dismissal rules as the dashboard: a run cleanup is about to cancel, or
+  // one pinned in IGNORED_RUN_URLS, is not demand worth starting a runner for.
+  // Marked rather than dropped, so a consumer can disagree.
+  const runs = markIgnoredRuns(markAutoDismissedDependabotRuns(raw.map((run) => toQueuedRun(run, repo))));
+  return { runs, truncated };
+}
+
+async function buildQueueData(requestUrl) {
+  const params = requestUrl.searchParams;
+  const mode = normalizeMode(params.get("mode"));
+  const jobs = parseJobs(params.get("jobs"));
+  const owners = parseOwners(params.get("owners"));
+  const me = await getAccount();
+  // The pull request search exists only to resolve mode=mine into a repo list.
+  // The other modes list repos directly, and paying for a PR search on the hot
+  // polling path would buy nothing.
+  const pullRequests = mode === "mine" ? await fetchPullRequests({ mode, me, jobs, owners }) : [];
+
+  const degraded = new Set();
+  const errors = [];
+  const { repos, errors: repoErrors } = await listQueueRepos({ mode, me, pullRequests, jobs, owners });
+  if (repoErrors.length) {
+    errors.push(...repoErrors);
+    degraded.add("repos");
+    // A repo that never made the list cannot report a queue, so an incomplete
+    // repo list is an incomplete queue -- not merely an incomplete repo list.
+    degraded.add("queue");
+  }
+
+  let runs = [];
+  const truncatedRepos = [];
+  if (repos.length) {
+    const outcome = await settledScanPass(
+      repos,
+      jobs,
+      fetchQueuedRunsForQueue,
+      () => ({ runs: [], truncated: false }),
+      QUEUE_PASS_DEADLINE_MS
+    );
+    if (outcome.failed) {
+      degraded.add("queue");
+      errors.push("Queue scan did not finish for every repository within its deadline.");
+    }
+    outcome.results.forEach((group, index) => {
+      if (group?.truncated) truncatedRepos.push(repos[index]);
+    });
+    if (truncatedRepos.length) degraded.add("queue");
+    runs = uniqueBy(
+      outcome.results.flatMap((group) => group?.runs || []),
+      (run) => run.runId || run.url || `${run.repo}:${run.workflow}:${run.runNumber}`
+    ).sort(sortByCreatedDesc);
+  }
+
+  const rateLimit = snapshotRateLimit(scanMetrics.getStore() || createScanMetrics());
+  const quota = quotaSnapshot(rateLimit);
+  // A quota block truncates the queue silently: requests start failing, repos
+  // come back empty, and the list looks short rather than broken.
+  if (quota.blocked) degraded.add("queue");
+
+  const active = runs.filter((run) => !run.autoDismissed);
+  const warnings = [];
+  if (degraded.size) {
+    warnings.push(
+      `Partial queue scan: ${[...degraded].sort().join(", ")} did not finish. A short or empty queue here is not evidence of no demand.`
+    );
+  }
+  if (truncatedRepos.length) {
+    warnings.push(`Queue truncated at ${QUEUE_MAX_PAGES * QUEUE_PAGE_SIZE} runs for: ${truncatedRepos.join(", ")}.`);
+  }
+
+  return {
+    account: me,
+    generatedAt: new Date().toISOString(),
+    options: { mode, jobs, owners, statuses: [...QUEUE_RUN_STATUSES] },
+    degraded: [...degraded].sort(),
+    queue: {
+      // Deliberately redundant with `degraded`. The failure mode this guards is a
+      // consumer reading queue.runs, finding it empty during an outage, and
+      // scaling to zero with work queued -- so "is this answer whole" sits as a
+      // boolean directly beside the data instead of only in a sibling array.
+      complete: !degraded.has("queue"),
+      truncatedRepos,
+      runs
+    },
+    summary: {
+      repos: repos.length,
+      reposWithQueue: new Set(active.map((run) => run.repo)).size,
+      queuedRuns: active.length,
+      autoDismissedRuns: runs.length - active.length
+    },
+    scan: {
+      reposConsidered: repos.length,
+      reposScanned: repos.length,
+      // Stated rather than implied: the dashboard scan trims to recently-pushed
+      // repos and this one must not, or scheduled and dispatch-triggered work
+      // would be invisible exactly when it matters.
+      freshnessFilterApplied: false
+    },
+    refresh: {
+      // What this endpoint can sustain, not what the caller must use. Under a
+      // quota block the only honest recommendation is to wait for the reset.
+      intervalSeconds: quota.blocked ? Math.max(60, quota.retryAfterSeconds) : 60,
+      quota
+    },
+    rateLimit,
+    warnings,
+    errors: errors.slice(0, 10)
+  };
+}
+
 async function buildDashboardData(requestUrl) {
   const params = requestUrl.searchParams;
   const mode = normalizeMode(params.get("mode"));
@@ -3577,9 +3812,13 @@ async function buildDashboardData(requestUrl) {
   const cleanupSnapshot = dependabotCleanupSnapshot();
   if (cleanupSnapshot.lastError) {
     warnings.push(`Dependabot cleanup: ${cleanupSnapshot.lastError}`);
+  }
+  // This block was nested inside the branch above, so the one warning that says
+  // the scan came back short only ever appeared when a Dependabot cleanup error
+  // happened to coincide with it. The machine-readable `degraded` array below
+  // was always correct; this is the human-visible half catching up.
   if (degraded.size) {
     warnings.push(`Partial scan: ${[...degraded].sort().join(", ")} did not finish; those sections may be incomplete.`);
-  }
   }
 
   return {
@@ -4069,6 +4308,30 @@ const server = http.createServer(async (req, res) => {
       }
       return;
     }
+    if (requestUrl.pathname === "/api/queue") {
+      if (req.method !== "GET") {
+        throw new HttpError(405, "Method not allowed");
+      }
+      const metrics = createScanMetrics();
+      try {
+        await scanMetrics.run(metrics, async () => {
+          const data = await buildQueueData(requestUrl);
+          await sendJson(res, 200, data);
+        });
+      } catch (error) {
+        const status = error.status || 500;
+        // The error body carries the same degraded markers as a successful one.
+        // A consumer that reads queue.runs without checking the status code must
+        // still not be able to read this as an empty queue.
+        await sendJson(res, status, {
+          error: error.message || "Unexpected error",
+          degraded: ["queue"],
+          queue: { complete: false, truncatedRepos: [], runs: [] },
+          rateLimit: snapshotRateLimit(metrics)
+        });
+      }
+      return;
+    }
     if (requestUrl.pathname === "/api/pull-request/merge") {
       await mergePullRequest(req, res);
       return;
@@ -4154,6 +4417,14 @@ export {
   quotaState,
   recordRateLimit,
   selectActiveRepos,
+  listQueueRepos,
+  queueRepoNames,
+  toQueuedRun,
+  quotaSnapshot,
+  QUEUE_RUN_STATUSES,
+  QUEUE_PASS_DEADLINE_MS,
+  QUEUE_MAX_PAGES,
+  QUEUE_PAGE_SIZE,
   scanScopeSnapshot,
   snapshotRateLimit,
   resetObservedRateBuckets,
