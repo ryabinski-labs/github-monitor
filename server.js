@@ -3518,6 +3518,54 @@ const QUEUE_MAX_PAGES = Math.max(1, Number(process.env.QUEUE_MAX_PAGES || 3));
 // answer would arrive after the client had already given up. A degraded answer
 // inside the budget beats a complete one that is never read.
 const QUEUE_PASS_DEADLINE_MS = Math.max(1000, Number(process.env.QUEUE_PASS_DEADLINE_MS || 20000));
+// The ceiling on the WHOLE request, which QUEUE_PASS_DEADLINE_MS is not: that one
+// bounds the repo fan-out and nothing else, so the phases ahead of it -- account
+// lookup, the mode=mine PR search, owner listing -- were unbounded. A cold request
+// measured 23.3s against a consumer whose hard ceiling is 30s, which is not a
+// margin so much as a coincidence. This is the number a caller can set a client
+// timeout against: past it the handler returns what it has, marked incomplete,
+// instead of a complete answer that arrives after everyone stopped listening.
+//
+// Kept strictly above the pass deadline, or the fan-out would be strangled by the
+// budget before its own ceiling ever applied, and two deadlines would be fighting
+// over the same work.
+const QUEUE_REQUEST_BUDGET_MS = Math.max(
+  QUEUE_PASS_DEADLINE_MS + 1000,
+  Number(process.env.QUEUE_REQUEST_BUDGET_MS || 25000)
+);
+
+// Race one phase against what is left of the budget. The loser is NOT cancelled --
+// these are in-flight GitHub requests with no abort signal plumbed through -- so it
+// is left to settle and its result dropped. That is bounded waste rather than a
+// leak: every request underneath is already capped by GITHUB_REQUEST_TIMEOUT_MS.
+//
+// It never rejects. A rejection is carried out as a value so that a phase which
+// loses the race and then fails cannot resurface as an unhandled rejection long
+// after its response was sent.
+async function withQueueDeadline(promise, remainingMs, fallback) {
+  const settled = Promise.resolve(promise).then(
+    (value) => ({ value }),
+    (error) => ({ error })
+  );
+  if (!(remainingMs > 0)) return { value: fallback, timedOut: true };
+  let timer;
+  const outcome = await Promise.race([
+    settled,
+    new Promise((resolve) => {
+      // Deliberately NOT unref'd. An unref'd timer cannot hold the event loop, so
+      // if this deadline were ever the only pending work the process would exit
+      // before it fired and the phase would never be bounded at all. In the server
+      // the in-flight socket keeps the loop alive anyway -- but correctness here
+      // must not depend on something else happening to be pending. It is cleared
+      // on every path below, so it holds the loop only while the phase is running.
+      timer = setTimeout(() => resolve({ value: fallback, timedOut: true }), remainingMs);
+    })
+  ]);
+  clearTimeout(timer);
+  if (outcome.timedOut) return outcome;
+  if (outcome.error) throw outcome.error;
+  return { value: outcome.value, timedOut: false };
+}
 
 // Repo discovery as the dashboard does it, minus selectActiveRepos, and with
 // owner-listing failures reported rather than swallowed. An owner whose listing
@@ -3607,50 +3655,101 @@ async function fetchQueuedRunsForQueue(repo) {
   return { runs, truncated };
 }
 
-async function buildQueueData(requestUrl) {
+// The smaller of the two ceilings -- or null when the budget is already gone.
+// null rather than 0 is the whole point: settledScanPass reads a deadline of 0 as
+// "no ceiling at all", so passing an exhausted budget straight through would lift
+// the bound at exactly the moment the bound is what matters. Its own function so a
+// test can pin that inversion instead of trusting a Math.min to stay correct.
+function queuePassDeadline(remainingMs, passDeadlineMs = QUEUE_PASS_DEADLINE_MS) {
+  const ms = Math.min(passDeadlineMs, remainingMs);
+  return ms > 0 ? ms : null;
+}
+
+async function buildQueueData(requestUrl, deadlineAt) {
+  const startedAt = Date.now();
+  // Set by the route at request entry so the budget covers the whole handler and
+  // not merely the part of it that lives inside this function.
+  const budgetEndsAt = Number.isFinite(deadlineAt) ? deadlineAt : startedAt + QUEUE_REQUEST_BUDGET_MS;
+  const remaining = () => budgetEndsAt - Date.now();
+
   const params = requestUrl.searchParams;
   const mode = normalizeMode(params.get("mode"));
   const jobs = parseJobs(params.get("jobs"));
   const owners = parseOwners(params.get("owners"));
-  const me = await getAccount();
-  // The pull request search exists only to resolve mode=mine into a repo list.
-  // The other modes list repos directly, and paying for a PR search on the hot
-  // polling path would buy nothing.
-  const pullRequests = mode === "mine" ? await fetchPullRequests({ mode, me, jobs, owners }) : [];
 
   const degraded = new Set();
   const errors = [];
-  const { repos, errors: repoErrors } = await listQueueRepos({ mode, me, pullRequests, jobs, owners });
-  if (repoErrors.length) {
-    errors.push(...repoErrors);
-    degraded.add("repos");
-    // A repo that never made the list cannot report a queue, so an incomplete
-    // repo list is an incomplete queue -- not merely an incomplete repo list.
+  // Running out of budget is not an error to throw. Every phase past this point
+  // is skipped, and the response is assembled as usual from whatever was gathered
+  // -- explicitly incomplete, which is the one thing a consumer must never have to
+  // infer from a short list.
+  let expired = false;
+  const expire = (phase) => {
+    expired = true;
     degraded.add("queue");
+    errors.push(`${phase} did not finish within the ${QUEUE_REQUEST_BUDGET_MS}ms request budget.`);
+  };
+
+  const account = await withQueueDeadline(getAccount(), remaining(), "");
+  const me = account.value;
+  if (account.timedOut) expire("Account lookup");
+
+  // The pull request search exists only to resolve mode=mine into a repo list.
+  // The other modes list repos directly, and paying for a PR search on the hot
+  // polling path would buy nothing.
+  let pullRequests = [];
+  if (!expired && mode === "mine") {
+    const search = await withQueueDeadline(fetchPullRequests({ mode, me, jobs, owners }), remaining(), []);
+    pullRequests = search.value;
+    if (search.timedOut) expire("Pull request search");
+  }
+
+  let repos = [];
+  if (!expired) {
+    const listing = await withQueueDeadline(
+      listQueueRepos({ mode, me, pullRequests, jobs, owners }),
+      remaining(),
+      { repos: [], errors: [] }
+    );
+    if (listing.timedOut) expire("Repository listing");
+    repos = listing.value.repos;
+    const repoErrors = listing.value.errors;
+    if (repoErrors.length) {
+      errors.push(...repoErrors);
+      degraded.add("repos");
+      // A repo that never made the list cannot report a queue, so an incomplete
+      // repo list is an incomplete queue -- not merely an incomplete repo list.
+      degraded.add("queue");
+    }
   }
 
   let runs = [];
   const truncatedRepos = [];
-  if (repos.length) {
-    const outcome = await settledScanPass(
-      repos,
-      jobs,
-      fetchQueuedRunsForQueue,
-      () => ({ runs: [], truncated: false }),
-      QUEUE_PASS_DEADLINE_MS
-    );
-    if (outcome.failed) {
-      degraded.add("queue");
-      errors.push("Queue scan did not finish for every repository within its deadline.");
+  if (!expired && repos.length) {
+    const passDeadline = queuePassDeadline(remaining());
+    if (passDeadline === null) {
+      expire("Repository queue scan");
+    } else {
+      const outcome = await settledScanPass(
+        repos,
+        jobs,
+        fetchQueuedRunsForQueue,
+        () => ({ runs: [], truncated: false }),
+        passDeadline
+      );
+      if (outcome.failed) {
+        degraded.add("queue");
+        errors.push("Queue scan did not finish for every repository within its deadline.");
+      }
+      outcome.results.forEach((group, index) => {
+        if (group?.truncated) truncatedRepos.push(repos[index]);
+      });
+      if (truncatedRepos.length) degraded.add("queue");
+      runs = uniqueBy(
+        outcome.results.flatMap((group) => group?.runs || []),
+        (run) => run.runId || run.url || `${run.repo}:${run.workflow}:${run.runNumber}`
+      ).sort(sortByCreatedDesc);
     }
-    outcome.results.forEach((group, index) => {
-      if (group?.truncated) truncatedRepos.push(repos[index]);
-    });
-    if (truncatedRepos.length) degraded.add("queue");
-    runs = uniqueBy(
-      outcome.results.flatMap((group) => group?.runs || []),
-      (run) => run.runId || run.url || `${run.repo}:${run.workflow}:${run.runNumber}`
-    ).sort(sortByCreatedDesc);
   }
 
   const rateLimit = snapshotRateLimit(scanMetrics.getStore() || createScanMetrics());
@@ -3696,7 +3795,11 @@ async function buildQueueData(requestUrl) {
       // Stated rather than implied: the dashboard scan trims to recently-pushed
       // repos and this one must not, or scheduled and dispatch-triggered work
       // would be invisible exactly when it matters.
-      freshnessFilterApplied: false
+      freshnessFilterApplied: false,
+      // So a caller can see how much of its ceiling this answer actually spent,
+      // and notice the margin shrinking before a timeout is what tells them.
+      budgetMs: QUEUE_REQUEST_BUDGET_MS,
+      elapsedMs: Date.now() - startedAt
     },
     refresh: {
       // What this endpoint can sustain, not what the caller must use. Under a
@@ -4325,10 +4428,13 @@ const server = http.createServer(async (req, res) => {
       if (req.method !== "GET") {
         throw new HttpError(405, "Method not allowed");
       }
+      // The clock starts here, not inside the builder, so the budget covers the
+      // whole handler -- which is the entire point of having it.
+      const queueDeadlineAt = Date.now() + QUEUE_REQUEST_BUDGET_MS;
       const metrics = createScanMetrics();
       try {
         await scanMetrics.run(metrics, async () => {
-          const data = await buildQueueData(requestUrl);
+          const data = await buildQueueData(requestUrl, queueDeadlineAt);
           await sendJson(res, 200, data);
         });
       } catch (error) {
@@ -4436,6 +4542,9 @@ export {
   quotaSnapshot,
   QUEUE_RUN_STATUSES,
   QUEUE_PASS_DEADLINE_MS,
+  QUEUE_REQUEST_BUDGET_MS,
+  withQueueDeadline,
+  queuePassDeadline,
   QUEUE_MAX_PAGES,
   QUEUE_PAGE_SIZE,
   scanScopeSnapshot,

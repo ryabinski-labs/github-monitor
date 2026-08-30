@@ -7,6 +7,10 @@ import {
   selectActiveRepos,
   QUEUE_RUN_STATUSES,
   QUEUE_PASS_DEADLINE_MS,
+  QUEUE_REQUEST_BUDGET_MS,
+  withQueueDeadline,
+  queuePassDeadline,
+  settledScanPass,
   QUEUE_MAX_PAGES,
   QUEUE_PAGE_SIZE
 } from "../server.js";
@@ -151,4 +155,108 @@ test("quotaSnapshot with no observed rate limit is not reported as blocked", asy
   assert.equal(snapshot.blocked, false);
   assert.equal(snapshot.status, "unknown");
   assert.equal(snapshot.retryAfterSeconds, 0);
+});
+
+// --- the whole-request budget ------------------------------------------------
+//
+// QUEUE_PASS_DEADLINE_MS bounds the repo fan-out and nothing else. Account
+// lookup, the mode=mine PR search and owner listing all run ahead of it, so
+// before this budget existed the endpoint's real worst case was unbounded -- and
+// a cold request had already been measured at 23.3s against a consumer whose
+// hard ceiling is 30s.
+
+test("the request budget sits under the consumer's hard ceiling", async () => {
+  assert.ok(
+    QUEUE_REQUEST_BUDGET_MS <= 30_000,
+    `${QUEUE_REQUEST_BUDGET_MS}ms would return after the consumer's 30s ceiling, so nobody would read it`
+  );
+  assert.ok(QUEUE_REQUEST_BUDGET_MS >= 5_000, "a budget this tight would degrade healthy requests");
+});
+
+test("the request budget strictly outlives the fan-out deadline", async () => {
+  // Otherwise the budget strangles the pass before the pass's own ceiling can
+  // ever apply, and two deadlines end up fighting over the same work.
+  assert.ok(
+    QUEUE_REQUEST_BUDGET_MS > QUEUE_PASS_DEADLINE_MS,
+    `budget ${QUEUE_REQUEST_BUDGET_MS}ms must exceed pass deadline ${QUEUE_PASS_DEADLINE_MS}ms`
+  );
+});
+
+test("an exhausted budget yields null, never a deadline of 0", async () => {
+  // The inversion this guards, proven in two halves. First: settledScanPass reads
+  // 0 as "no ceiling at all" -- a wedged item runs unbounded.
+  const started = Date.now();
+  const wedged = await settledScanPass(
+    ["a"],
+    1,
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      return "done";
+    },
+    () => null,
+    0
+  );
+  assert.equal(wedged.failed, false, "a 0 deadline imposes no ceiling, it does not expire instantly");
+  assert.ok(Date.now() - started >= 35, "the work ran to completion rather than being cut off");
+
+  // Second: so an exhausted budget must never reach it as a number. Math.min
+  // alone would hand through 0 and negatives and lift the bound at exactly the
+  // moment the bound is the point.
+  assert.equal(queuePassDeadline(0), null);
+  assert.equal(queuePassDeadline(-1_000), null);
+});
+
+test("the pass gets whichever ceiling arrives first", async () => {
+  assert.equal(queuePassDeadline(5_000, 20_000), 5_000, "a short remaining budget wins");
+  assert.equal(queuePassDeadline(60_000, 20_000), 20_000, "otherwise the pass deadline stands");
+  assert.equal(queuePassDeadline(1, 20_000), 1, "a millisecond is still a budget, not an absence of one");
+});
+
+test("a phase that beats the clock returns its value untouched", async () => {
+  const outcome = await withQueueDeadline(Promise.resolve(["acme/one"]), 5_000, []);
+  assert.deepEqual(outcome, { value: ["acme/one"], timedOut: false });
+});
+
+test("a phase that blows the clock returns the fallback promptly, flagged", async () => {
+  const started = Date.now();
+  const slow = new Promise((resolve) => setTimeout(resolve, 30_000).unref());
+  const outcome = await withQueueDeadline(slow, 60, "fallback");
+  const elapsed = Date.now() - started;
+
+  assert.equal(outcome.timedOut, true, "the caller must be able to tell the answer is short");
+  assert.equal(outcome.value, "fallback");
+  assert.ok(elapsed < 3_000, `returned in ${elapsed}ms rather than waiting on the slow phase`);
+});
+
+test("no remaining budget short-circuits without starting a timer", async () => {
+  for (const remaining of [0, -5_000]) {
+    const outcome = await withQueueDeadline(Promise.resolve("late"), remaining, "fallback");
+    assert.deepEqual(outcome, { value: "fallback", timedOut: true }, `remaining=${remaining}`);
+  }
+});
+
+test("a phase that fails before the clock still throws", async () => {
+  await assert.rejects(
+    () => withQueueDeadline(Promise.reject(new Error("403 from GitHub")), 5_000, []),
+    /403 from GitHub/,
+    "a real failure must not be laundered into a silent fallback"
+  );
+});
+
+test("a phase that fails after losing the race cannot crash the process", async () => {
+  // The response has already been sent by then. An orphaned rejection surfacing
+  // as an unhandled rejection would take the server down for a request that
+  // succeeded, so the rejection is carried as a value and dropped.
+  let unhandled = null;
+  const capture = (error) => { unhandled = error; };
+  process.on("unhandledRejection", capture);
+  try {
+    const doomed = new Promise((_, reject) => setTimeout(() => reject(new Error("late 500")), 40).unref());
+    const outcome = await withQueueDeadline(doomed, 10, "fallback");
+    assert.equal(outcome.timedOut, true);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(unhandled, null, `the orphaned rejection escaped: ${unhandled?.message}`);
+  } finally {
+    process.off("unhandledRejection", capture);
+  }
 });
