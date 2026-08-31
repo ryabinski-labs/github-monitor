@@ -215,3 +215,177 @@ test("a pipeline whose evidence is days old is never announced", { skip }, async
     await browser.close();
   }
 });
+
+test("a failed CD run announces CD failed with danger tone, not CD finished", { skip }, async () => {
+  const cdRunning = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "in_progress",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+  const cdFailed = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "completed",
+    conclusion: "failure",
+    outcome: "failure",
+    failureReason: "Process completed with exit code 1.",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+
+  const runningStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 1 },
+    cd: { running: [cdRunning], finished: [], failed: [] }
+  };
+  const failedStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 0, failedCd: 1, finishedCd: 1 },
+    cd: { running: [], finished: [cdFailed], failed: [cdFailed] }
+  };
+
+  const { browser, page, box } = await openDashboard(runningStatus);
+  try {
+    const inbox = () => page.evaluate(() => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]"));
+
+    assert.equal((await inbox()).length, 0, "no notification while running");
+
+    box.status = failedStatus;
+    await page.click("#refresh");
+    await page.waitForFunction(() => (JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]")).length === 1);
+
+    const items = await inbox();
+    assert.equal(items.length, 1);
+    assert.equal(items[0].title, "CD failed (failure)");
+    assert.equal(items[0].tone, "danger");
+    assert.match(items[0].body, /ryabinski-labs\/emcognito-new-ui CD #1064: CD/);
+    assert.match(items[0].body, /Process completed with exit code 1/);
+    assert.notEqual(items[0].title, "CD finished");
+    assert.notEqual(items[0].tone, "success");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("a failed CD run in finishedCd without failedCd entry still announces failure with danger tone", { skip }, async () => {
+  const cdRunning = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "in_progress",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+  const cdFinishedFailure = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "completed",
+    conclusion: "failure",
+    outcome: "failure",
+    failureReason: "Deploy step timed out",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+
+  const runningStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 1 },
+    cd: { running: [cdRunning], finished: [], failed: [] }
+  };
+  const finishedFailureStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 0, failedCd: 0, finishedCd: 1 },
+    cd: { running: [], finished: [cdFinishedFailure], failed: [] }
+  };
+
+  const { browser, page, box } = await openDashboard(runningStatus);
+  try {
+    const inbox = () => page.evaluate(() => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]"));
+
+    assert.equal((await inbox()).length, 0, "no notification while running");
+
+    box.status = finishedFailureStatus;
+    await page.click("#refresh");
+    await page.waitForFunction(() => (JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]")).length === 1);
+
+    const items = await inbox();
+    assert.equal(items.length, 1);
+    assert.equal(items[0].title, "CD failed (failure)");
+    assert.equal(items[0].tone, "danger");
+    assert.match(items[0].body, /Deploy step timed out/);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("a skipped CD run announces CD skipped with warning tone", { skip }, async () => {
+  const cdRunning = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "in_progress",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+  const cdSkipped = {
+    runId: 33335471856,
+    repo: "ryabinski-labs/emcognito-new-ui",
+    workflow: "CD",
+    runNumber: "#1064",
+    status: "completed",
+    conclusion: "skipped",
+    outcome: "skipped",
+    branch: "main",
+    title: "CD",
+    url: "https://github.com/ryabinski-labs/emcognito-new-ui/actions/runs/33335471856"
+  };
+
+  const runningStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 1 },
+    cd: { running: [cdRunning], finished: [], failed: [] }
+  };
+  const skippedStatus = {
+    ...baseStatus({}),
+    options: { includeCd: true },
+    summary: { ...baseStatus({}).summary, runningCd: 0, skippedCd: 1, finishedCd: 1 },
+    cd: { running: [], finished: [cdSkipped], failed: [] }
+  };
+
+  const { browser, page, box } = await openDashboard(runningStatus);
+  try {
+    const inbox = () => page.evaluate(() => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]"));
+
+    box.status = skippedStatus;
+    await page.click("#refresh");
+    await page.waitForFunction(() => (JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]")).length === 1);
+
+    const items = await inbox();
+    assert.equal(items.length, 1);
+    assert.equal(items[0].title, "CD skipped");
+    assert.equal(items[0].tone, "warning");
+    assert.match(items[0].body, /Production was not deployed/);
+  } finally {
+    await browser.close();
+  }
+});

@@ -744,6 +744,25 @@ function actionKey(row) {
   return row?.url || [row?.repo, row?.workflow, row?.runNumber, row?.number].filter(Boolean).join(":");
 }
 
+function findCdActionMatch(target, rows = []) {
+  if (!target || !Array.isArray(rows)) return null;
+  const targetUrl = target.url || "";
+  const targetId = target.runId ? String(target.runId) : "";
+  const targetRepo = target.repo || "";
+  const targetWorkflow = target.workflow || "";
+  const targetRunNumber = target.runNumber || "";
+
+  return rows.find((row) => {
+    if (!row) return false;
+    if (targetId && row.runId && String(row.runId) === targetId) return true;
+    if (targetUrl && row.url && targetUrl === row.url) return true;
+    if (targetRepo && row.repo && targetWorkflow && row.workflow && targetRunNumber && row.runNumber) {
+      return targetRepo === row.repo && targetWorkflow === row.workflow && targetRunNumber === row.runNumber;
+    }
+    return false;
+  }) || null;
+}
+
 function prKey(row) {
   return row?.url || `${row?.repo || ""}#${row?.number || ""}`;
 }
@@ -1264,35 +1283,53 @@ function notifyCompletedActions(previousSnapshot, data) {
   }
 
   if (!previousSnapshot.includeCd || !nextSnapshot.includeCd) return;
+  const FAILED_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required", "startup_failure"]);
   const failedCdByKey = new Map((data?.cd?.failed || []).map((row) => [actionKey(row), row]));
   const finishedCdByKey = new Map((data?.cd?.finished || []).map((row) => [actionKey(row), row]));
   for (const [key, previous] of previousSnapshot.cd) {
     if (nextSnapshot.cd.has(key)) continue;
-    const failed = failedCdByKey.get(key);
-    const finished = finishedCdByKey.get(key);
-    const skipped = !failed && finished?.outcome === "skipped";
+    const failed = failedCdByKey.get(key) || findCdActionMatch(previous, data?.cd?.failed);
+    const finished = finishedCdByKey.get(key) || findCdActionMatch(previous, data?.cd?.finished);
+    if (!failed && !finished) continue;
+
+    const isFailure = Boolean(
+      failed ||
+      finished?.outcome === "failure" ||
+      FAILED_CONCLUSIONS.has(String(finished?.conclusion || "").toLowerCase()) ||
+      finished?.failureReason
+    );
+    const isSkipped = !isFailure && (finished?.outcome === "skipped" || String(finished?.conclusion || "").toLowerCase() === "skipped");
+
     let statusLabel;
     let reason;
     let tone;
-    if (failed) {
-      statusLabel = `failed (${failed.conclusion})`;
-      reason = `. Reason: ${failureDetail(failed, "CD failed")}`;
+    let targetUrl;
+
+    if (isFailure) {
+      const info = failed || finished;
+      const conclusion = info?.conclusion || (info?.outcome === "failure" ? "failure" : "failure");
+      statusLabel = `failed (${conclusion})`;
+      reason = `. Reason: ${failureDetail(info, "CD failed")}`;
       tone = "danger";
-    } else if (skipped) {
+      targetUrl = info?.url || previous.url;
+    } else if (isSkipped) {
       statusLabel = "skipped";
       reason = ". Production was not deployed.";
       tone = "warning";
+      targetUrl = finished?.url || previous.url;
     } else {
       statusLabel = "finished";
       reason = "";
       tone = "success";
+      targetUrl = finished?.url || previous.url;
     }
+
     sendPopup(
       `CD ${statusLabel}`,
       `${previous.repo} ${previous.workflow} ${previous.runNumber}: ${previous.title || previous.branch}${reason}`,
       `cd:${key}:${statusLabel}`,
       {
-        url: failed?.url || finished?.url || previous.url,
+        url: targetUrl,
         kind: "cd",
         tone
       }
