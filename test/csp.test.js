@@ -89,6 +89,16 @@ async function openAgainstServer({ storedSettings = null, blockAppJs = false } =
   await page.route("**/api/status*", (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(emptyStatus()) })
   );
+  // Auto merge is on by default, so simply loading the page posts enabled:true
+  // and the real server would start a live auto-merge scan against GitHub --
+  // which reaches the network and never lets the listener close. Stub it so
+  // this test stays about the content security policy and nothing else.
+  await page.route("**/api/auto-merge", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ enabled: false, running: false, candidates: [] })
+    })
+  );
   // Holding app.js back leaves only the pre-paint script's work on the page, so
   // the theme found there is the one a user sees before the dashboard boots --
   // not the one applyTheme() would have set a moment later either way.
