@@ -83,7 +83,7 @@ const state = {
   notified: loadNotified(),
   dismissed: loadDismissed(),
   showDismissed: false,
-  autoMerge: persisted.autoMerge === true,
+  autoMerge: persisted.autoMerge !== false,
   merging: new Set(),
   merged: new Set(),
   closing: new Set(),
@@ -197,8 +197,14 @@ const els = {
   viewKicker: document.querySelector("#viewKicker"),
   viewTitle: document.querySelector("#viewTitle"),
   filter: document.querySelector("#filter"),
+  filterBox: document.querySelector("#filterBox"),
   filterClear: document.querySelector("#filterClear"),
   filterCount: document.querySelector("#filterCount"),
+  filterNotice: document.querySelector("#filterNotice"),
+  filterNoticeDetail: document.querySelector("#filterNoticeDetail"),
+  filterNoticeClear: document.querySelector("#filterNoticeClear"),
+  scoreboard: document.querySelector("#scoreboard"),
+  rail: document.querySelector("#rail"),
   theme: document.querySelector("#theme"),
   toastRegion: document.querySelector("#toastRegion"),
   inboxToggle: document.querySelector("#inboxToggle"),
@@ -1808,10 +1814,48 @@ function renderRepoScope(scan) {
   }
 }
 
+// True if the search box is narrowing what the page reports. Every count on the
+// page -- tiles, rail, trace pills -- is recomputed against the filter, so this
+// one predicate drives the whole "this is not the real total" treatment.
+function filterIsActive() {
+  return Boolean(state.filter.trim());
+}
+
+// Writes a count that may be filtered. The <strong> always holds the number
+// actually being shown; the unfiltered total goes in a sibling badge so the real
+// figure never disappears from the screen -- reading "1" when 14 are running is
+// the trap this whole treatment exists to close.
+// Returns the badge text it wrote, or "" -- callers that need every badge in a
+// group to share a width can measure from that.
+function writeCount(el, shown, total, filtering, badgeClass) {
+  if (!el) return "";
+  el.textContent = shown ?? 0;
+  const host = el.parentElement;
+  let badge = host?.querySelector(`.${badgeClass}`);
+  const show = filtering && Number(total ?? 0) !== Number(shown ?? 0);
+  if (!show) {
+    badge?.remove();
+    return "";
+  }
+  if (!badge) {
+    badge = document.createElement("span");
+    badge.className = badgeClass;
+    el.insertAdjacentElement("afterend", badge);
+  }
+  const text = `of ${total ?? 0}`;
+  badge.textContent = text;
+  badge.title = `${total ?? 0} without the "${state.filter.trim()}" filter`;
+  return text;
+}
+
 function renderMetrics(data) {
   const counts = displayCounts(data);
+  // adjustedSummary is the same data displayCounts starts from, minus the
+  // filter -- i.e. the honest org-wide number for each tile.
+  const totals = adjustedSummary(data);
+  const filtering = filterIsActive();
   for (const [key, id] of Object.entries(metricIds)) {
-    document.querySelector(`#${id}`).textContent = counts[key] ?? 0;
+    writeCount(document.querySelector(`#${id}`), counts[key] ?? 0, totals[key] ?? 0, filtering, "metric-total");
   }
   renderRepoScope(data.scan);
   const skippedCd = Number(data.summary.skippedCd || 0);
@@ -1851,9 +1895,28 @@ function renderMetrics(data) {
     failedCd: counts.failedCd,
     pipelineTraces: currentTraceCount(counts)
   };
+  const navTotals = {
+    pass: totals.passingPrs,
+    noCi: totals.noCiPrs,
+    fail: totals.failingPrs,
+    conflicts: totals.conflictPrs,
+    running: totals.runningPrs,
+    runningCd: totals.runningCd,
+    finishedCd: totals.finishedCd,
+    deployments: totals.runningDeployments,
+    runners: totals.busyRunners,
+    failedCd: totals.failedCd,
+    pipelineTraces: currentTraceCount(totals)
+  };
+  // Each rail item is its own grid, so a wide "of 1420" would push its count
+  // left while a narrow "of 4" would not, leaving the column of numbers ragged.
+  // Size every badge to the widest one so the counts line up down the rail.
+  let widestBadge = 0;
   for (const [key, id] of Object.entries(navIds)) {
-    document.querySelector(`#${id}`).textContent = navCounts[key] ?? 0;
+    const text = writeCount(document.querySelector(`#${id}`), navCounts[key] ?? 0, navTotals[key] ?? 0, filtering, "rail-total");
+    widestBadge = Math.max(widestBadge, text.length);
   }
+  els.rail?.style.setProperty("--rail-total-ch", `${widestBadge}ch`);
 }
 
 function syncActiveAffordances() {
@@ -1876,17 +1939,60 @@ function syncActiveAffordances() {
   });
 }
 
+// A search filter silently re-scopes every number on the page, which reads
+// exactly like a quiet org -- "CI Running 1, Runners 0" is indistinguishable
+// from the real thing unless the mode announces itself. So it announces itself
+// in four places at once: a banner above the scoreboard, an amber outline on the
+// tiles, "of N" true totals beside every changed count, and the input's own
+// active state. Colour is never the only carrier -- the word "Filtered", the
+// funnel glyph and the "of N" text each stand alone.
 function syncFilterUI(matched, total) {
+  const query = state.filter.trim();
+  const active = Boolean(query);
+
   els.filterClear.classList.toggle("hidden", !state.filter);
-  if (!state.filter) {
-    els.filterCount.textContent = "";
-  } else {
-    els.filterCount.textContent = `${matched}/${total}`;
+  els.filterBox?.classList.toggle("is-active", active);
+  els.scoreboard?.classList.toggle("is-filtered", active);
+  els.rail?.classList.toggle("is-filtered", active);
+  // Screen readers land on these regions without ever passing the banner, so
+  // the region names carry the mode too.
+  els.scoreboard?.setAttribute("aria-label", active ? `Summary, filtered by \u201C${query}\u201D` : "Summary");
+  els.rail?.setAttribute("aria-label", active ? `Views, counts filtered by \u201C${query}\u201D` : "Views");
+
+  const known = Number.isFinite(matched) && Number.isFinite(total);
+  els.filterCount.textContent = active && known ? `${matched} of ${total}` : "";
+
+  if (!els.filterNotice) return;
+  els.filterNotice.hidden = !active;
+  if (!active) {
+    els.filterNoticeDetail.textContent = "";
+    return;
   }
+  // A pasted URL or hash has no break opportunities, and echoing it whole would
+  // stretch the banner past the viewport. The tail is what distinguishes long
+  // queries, so keep the head and say it was cut.
+  const shown = query.length > 72 ? `${query.slice(0, 72)}\u2026` : query;
+  const scope = known
+    ? `Showing ${matched} of ${total} ${total === 1 ? "row" : "rows"} matching \u201C${shown}\u201D.`
+    : `Showing only rows matching \u201C${shown}\u201D.`;
+  els.filterNoticeDetail.textContent =
+    `${scope} Every tile and sidebar count below is narrowed to this search \u2014 they are not totals.`;
+}
+
+// One exit shared by the clear button, the banner button and Escape, so the
+// filter can never be cleared through a path that skips the redraw.
+function clearFilter({ focus = false, blur = false } = {}) {
+  state.filter = "";
+  els.filter.value = "";
+  persist();
+  render();
+  if (focus) els.filter.focus();
+  if (blur) els.filter.blur();
 }
 
 function renderEmptyState(view, allCount) {
-  const query = state.filter.trim();
+  const raw = state.filter.trim();
+  const query = raw.length > 72 ? `${raw.slice(0, 72)}\u2026` : raw;
   if (query && allCount > 0) {
     return `<div class="empty">No rows match "${escapeHtml(query)}". Clear the filter to show ${escapeHtml(allCount)} ${allCount === 1 ? "item" : "items"}.</div>`;
   }
@@ -3200,6 +3306,7 @@ document.addEventListener("click", (event) => {
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && state.ownerPickerOpen) {
     setOwnerPickerOpen(false);
+    event.preventDefault();
   }
 });
 renderOwnerPicker();
@@ -3362,13 +3469,9 @@ els.filter.addEventListener("input", (event) => {
   render();
 });
 
-els.filterClear.addEventListener("click", () => {
-  state.filter = "";
-  els.filter.value = "";
-  persist();
-  render();
-  els.filter.focus();
-});
+els.filterClear.addEventListener("click", () => clearFilter({ focus: true }));
+
+els.filterNoticeClear?.addEventListener("click", () => clearFilter({ focus: true }));
 
 /* row click — open URL anywhere on the card (ignore clicks on the explicit link/buttons) */
 els.content.addEventListener("click", (event) => {
@@ -3391,11 +3494,18 @@ document.addEventListener("keydown", (event) => {
   );
 
   if (event.key === "Escape" && target === els.filter) {
-    state.filter = "";
-    els.filter.value = "";
-    persist();
-    render();
-    els.filter.blur();
+    clearFilter({ blur: true });
+    return;
+  }
+
+  // Escape anywhere else on the page drops the filter too -- the banner
+  // advertises the shortcut, and a filter you cannot see is the one you most
+  // need to be able to kill without hunting for the input. It is the last thing
+  // Escape does, so anything already dismissed by this keypress (the owner
+  // picker, which runs first and marks the event) keeps the filter intact.
+  if (event.key === "Escape" && !inField && !state.inboxOpen && !event.defaultPrevented && filterIsActive()) {
+    event.preventDefault();
+    clearFilter();
     return;
   }
 
@@ -3442,6 +3552,9 @@ document.addEventListener("keydown", (event) => {
 
 /* —— restore persisted state into the form —— */
 els.filter.value = state.filter;
+// A filter survives a reload in localStorage. Announce it before the first
+// fetch lands, so the page is never briefly filtered-but-unmarked.
+syncFilterUI();
 syncNotificationControl();
 renderInbox();
 ensureCountdownTimer();

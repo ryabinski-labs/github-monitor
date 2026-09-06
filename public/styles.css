@@ -18,6 +18,14 @@
   --red-soft: #482629;
   --amber: #efb75d;
   --amber-soft: #49391d;
+
+  /* Filtered-mode accent. Red, because the filter is a mode that makes every
+     number on the page untrue as an org figure -- the same "do not read this at
+     face value" weight an error carries. Kept as its own token so the tiles'
+     pass/fail dot colours stay independent of it. */
+  --flag: var(--red);
+  --flag-soft: var(--red-soft);
+  --flag-on-soft: var(--red);
   --blue: #70bef1;
   --blue-soft: #193d55;
   --violet: #c39af5;
@@ -59,6 +67,10 @@
   --red-soft: #f0d8d3;
   --amber: #9a6312;
   --amber-soft: #efddb8;
+
+  --flag: var(--red);
+  --flag-soft: var(--red-soft);
+  --flag-on-soft: var(--red);
   --blue: #1f5c8c;
   --blue-soft: #d3e1ec;
   --violet: #65458f;
@@ -527,6 +539,149 @@ kbd {
   letter-spacing: 0.02em;
 }
 
+/* —————————————————————— FILTERED MODE ——————————————————————
+   A search filter re-scopes every count on the page. That is a mode, and an
+   unannounced mode reads as fact: "CI Running 1 / Runners 0" looks identical to
+   a quiet org. The treatment below makes the mode impossible to miss at a
+   glance and impossible to miss in a screenshot -- banner, tile outline, and
+   the true total kept on screen beside every narrowed number. */
+.filter-notice[hidden] { display: none; }
+
+.filter-notice {
+  display: flex;
+  gap: 11px;
+  align-items: center;
+  margin: 16px 0 0;
+  padding: 10px 12px 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--flag) 45%, transparent);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--flag-soft);
+  color: var(--flag-on-soft);
+  font-family: var(--sans);
+  font-size: 12.5px;
+  line-height: 1.45;
+  animation: filter-notice-in 220ms cubic-bezier(0.2, 0.7, 0.2, 1) both;
+}
+
+@keyframes filter-notice-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: none; }
+}
+
+.filter-notice-icon {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  fill: currentColor;
+}
+
+.filter-notice-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  /* The query is user text with no guaranteed break opportunities. */
+  overflow-wrap: anywhere;
+}
+
+.filter-notice-text strong {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+.filter-notice-text strong::after {
+  content: "·";
+  margin: 0 7px 0 8px;
+  opacity: 0.55;
+  font-weight: 400;
+  letter-spacing: 0;
+}
+
+.filter-notice-text span { color: var(--muted-strong); }
+
+.filter-notice-clear {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 28px;
+  padding: 0 11px;
+  border: 1px solid color-mix(in srgb, var(--flag-on-soft) 55%, transparent);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--flag-on-soft);
+  font-family: var(--sans);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  transition: background 160ms ease, border-color 160ms ease;
+}
+.filter-notice-clear:hover {
+  border-color: var(--flag-on-soft);
+  background: color-mix(in srgb, var(--flag-on-soft) 16%, transparent);
+}
+.filter-notice-clear:focus-visible { outline: 2px solid var(--flag-on-soft); outline-offset: 2px; }
+.filter-notice-clear kbd {
+  border-color: color-mix(in srgb, var(--flag-on-soft) 55%, transparent);
+  background: transparent;
+  color: inherit;
+  font-size: 9.5px;
+}
+
+/* The true, unfiltered count -- kept beside every number the filter changed so
+   the honest figure is never off-screen. */
+.metric-total,
+.rail-total {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-feature-settings: "tnum";
+  letter-spacing: 0.02em;
+  color: var(--flag);
+  white-space: nowrap;
+}
+
+.scoreboard.is-filtered .metric {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--flag) 52%, transparent);
+}
+.scoreboard.is-filtered .metric-label { color: var(--flag); }
+/* The "9 skipped" sub-count is a raw server figure the filter never touches --
+   parking it next to a filtered number would put two different scopes on one
+   tile. Hide it until the filter is cleared. */
+.scoreboard.is-filtered .metric-sub { display: none; }
+
+/* Every group in a filtered scoreboard is labelled, so a cropped screenshot of
+   any single cluster still carries the warning. */
+.scoreboard.is-filtered .metric-group-label::after {
+  content: "— filtered";
+  margin-left: 7px;
+  color: var(--flag);
+  letter-spacing: 0.12em;
+}
+
+/* One frame around the whole board -- drawn with outline, so switching the mode
+   on never reflows the tiles underneath it. */
+.scoreboard.is-filtered {
+  outline: 1px solid color-mix(in srgb, var(--flag) 46%, transparent);
+  outline-offset: 9px;
+  border-radius: var(--radius);
+}
+
+.rail.is-filtered .rail-item { grid-template-columns: 12px 1fr auto auto; }
+.rail.is-filtered .rail-item strong { text-align: right; }
+/* --rail-total-ch is set from the widest badge in renderMetrics. */
+/* letter-spacing would make the rendered badge wider than its ch measurement,
+   so the shared width has to be measured without it. */
+.rail-total { display: inline-block; min-width: var(--rail-total-ch, 0); letter-spacing: 0; }
+/* The rail is nothing but counts, so it gets the same frame as the board. Border
+   rather than outline -- it sits flush against the panel. */
+.rail.is-filtered { border-color: color-mix(in srgb, var(--flag) 72%, transparent); }
+.rail-item.active .rail-total { color: var(--paper-warm); }
+
 /* —————————————————————— SCOREBOARD —————————————————————— */
 .scoreboard {
   display: flex;
@@ -975,6 +1130,24 @@ button.metric.active .metric-dot {
   border-color: var(--ink);
   background: var(--surface-hover);
 }
+
+/* The input is the cause of the mode, so it wears the same amber as the banner
+   and the tiles -- not the neutral chrome of an idle control. */
+.filter-box.is-active {
+  border-color: var(--flag);
+  background: var(--flag-soft);
+  color: var(--flag-on-soft);
+}
+.filter-box.is-active input { color: var(--ink); }
+.filter-box.is-active .filter-count {
+  color: var(--flag-on-soft);
+  font-weight: 700;
+}
+.filter-box.is-active .filter-clear {
+  background: color-mix(in srgb, var(--flag-on-soft) 26%, transparent);
+  color: var(--flag-on-soft);
+}
+.filter-box.is-active .filter-clear:hover { background: color-mix(in srgb, var(--flag-on-soft) 40%, transparent); }
 
 .filter-box input {
   min-width: 0;
@@ -1928,6 +2101,7 @@ button.metric.active .metric-dot {
 .empty {
   display: grid;
   place-items: center;
+  overflow-wrap: anywhere;
   min-height: 160px;
   padding: 22px;
   border: 1px dashed var(--line-strong);
@@ -2004,6 +2178,9 @@ button.metric.active .metric-dot {
 
 @media (max-width: 720px) {
   .shell { width: min(100vw - 20px, 1480px); }
+  .filter-notice { flex-wrap: wrap; }
+  .filter-notice-text { flex-basis: calc(100% - 26px); }
+  .filter-notice-clear { margin-left: 26px; }
   .topbar { position: static; grid-template-columns: 1fr; gap: 10px; }
   .controls { justify-content: flex-start; }
   .refresh-pause-notice {
