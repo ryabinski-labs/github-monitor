@@ -322,7 +322,13 @@ const SUCCESSFUL_DEPLOYMENT_STATES = new Set(["success"]);
 const AUTO_MERGE_DELAY_MS = 15 * 1000;
 const AUTO_MERGE_SCAN_MS = 60 * 1000;
 const TRACE_CI_SLA_MS = 4 * 60 * 60 * 1000;
-const TRACE_CD_START_SLA_MS = 15 * 60 * 1000;
+// A merged PR does not flag for a missing CD run until this much time has
+// elapsed. CD is queued behind post-merge CI on the base branch, and a slow
+// pipeline can leave that queued for a long while, so the old 15-minute window
+// flagged journeys that were still working through CI. Four hours matches the
+// CI and production-completion windows; while post-merge CI is actually still
+// queued or running the trace stays active regardless (see runBlocksCdStart).
+const TRACE_CD_START_SLA_MS = 4 * 60 * 60 * 1000;
 const TRACE_PROD_COMPLETE_SLA_MS = 4 * 60 * 60 * 1000;
 const FAILURE_REASON_LABELS = {
   FAILURE: "failed",
@@ -2530,6 +2536,23 @@ function cdRunMatchesPr(run, pr) {
   return Boolean(branch && base && branch === base && runHappenedAfter(run, pr.mergedAt));
 }
 
+// True while a workflow run still occupies the merge's path to production: a
+// run on the PR's base branch (the post-merge CI lane) or one for the merge
+// commit itself. A missing CD run is the expected order of events while one of
+// these is queued or running -- on a slow pipeline the base branch can still be
+// draining earlier work -- so the merged-PR trace must stay active rather than
+// flag. Unlike cdRunMatchesPr there is deliberately no time window here: an
+// older run on the base branch still blocks the CD run queued behind it.
+function runBlocksCdStart(run, pr) {
+  if (!run || !pr) return false;
+  const runSha = compactSha(run.headSha);
+  const candidateShas = [pr.headSha, pr.mergeCommitSha].map(compactSha).filter(Boolean);
+  if (runSha && candidateShas.includes(runSha)) return true;
+  const branch = String(run.branch || "").toLowerCase();
+  const base = String(pr.baseRefName || "").toLowerCase();
+  return Boolean(branch && base && branch === base);
+}
+
 function traceStatusRank(status) {
   return { flagged: 0, active: 1, unknown: 2, completed: 3 }[status] ?? 4;
 }
@@ -2640,7 +2663,7 @@ function mergedPrIsDeployNeutral(files = []) {
   return files.every((file) => isDeployNeutralFile(file?.filename || file?.path || ""));
 }
 
-function buildMergedPullRequestTrace(pr, cdRows, { now = Date.now(), includeCd = true } = {}) {
+function buildMergedPullRequestTrace(pr, cdRows, { now = Date.now(), includeCd = true, runningRuns = [] } = {}) {
   const startedAt = pr.mergedAt || pr.closedAt || new Date(now).toISOString();
   const matching = cdRows.filter((run) => cdRunMatchesPr(run, pr)).sort(sortByCreatedDesc);
   const failures = matching.filter((run) => run.outcome === "failure" || FAILED_RUN_CONCLUSIONS.has(run.conclusion));
@@ -2648,9 +2671,13 @@ function buildMergedPullRequestTrace(pr, cdRows, { now = Date.now(), includeCd =
   const successes = matching.filter((run) => run.outcome === "success");
   const running = matching.filter((run) => RUNNING_RUN_STATUSES.has(run.status));
   const latest = matching[0] || null;
+  // Post-merge CI that is still queued/running keeps the journey active: CD
+  // cannot have produced a run yet because it is queued behind this one.
+  const blockingRuns = (Array.isArray(runningRuns) ? runningRuns : []).filter((run) => runBlocksCdStart(run, pr));
   const evidence = [
     traceEvidence("pull_request", `${pr.numberLabel} merged`, pr.url, startedAt),
-    ...matching.slice(0, 4).map((run) => traceEvidence("workflow_run", `${run.workflow} ${run.runNumber}`, run.url, run.createdAt))
+    ...matching.slice(0, 4).map((run) => traceEvidence("workflow_run", `${run.workflow} ${run.runNumber}`, run.url, run.createdAt)),
+    ...blockingRuns.slice(0, 3).map((run) => traceEvidence("workflow_run", `${run.workflow || "CI"} ${run.runNumber || ""} ${run.status || "running"}`.trim(), run.url || "", run.createdAt || ""))
   ];
   const stages = [
     traceStage("pr_opened", "PR opened", "complete", "", pr.url),
@@ -2793,12 +2820,33 @@ function buildMergedPullRequestTrace(pr, cdRows, { now = Date.now(), includeCd =
   }
 
   const overdue = traceAgeMs(startedAt, now) > TRACE_CD_START_SLA_MS;
+  // While post-merge CI is still queued or running, a missing CD run is the
+  // expected order of events -- CD is queued behind it. Keep the trace active
+  // instead of flagging; the extended CD-start window above is the backstop for
+  // a pipeline that never drains.
+  if (blockingRuns.length && !overdue) {
+    const run = blockingRuns[0];
+    return {
+      ...base,
+      stage: "cd_started",
+      status: "active",
+      severity: "low",
+      reason: `Post-merge CI is still queued or running on ${pr.baseRefName || "the base branch"}; production CD cannot start until it finishes.`,
+      nextAction: { label: "Open running run", url: run.url || pr.url },
+      lastEvidenceAt: run.updatedAt || run.createdAt || base.lastEvidenceAt,
+      stages: stages.map((stage) => stage.key === "cd_started" ? { ...stage, status: "active", at: run.createdAt || "", url: run.url || "" } : stage)
+    };
+  }
   return {
     ...base,
     stage: "cd_started",
     status: overdue ? "flagged" : "active",
     severity: overdue ? "high" : "low",
-    reason: overdue ? "Merged PR has no matching production CD run yet." : "Waiting for a matching production CD run to start.",
+    reason: overdue
+      ? (blockingRuns.length
+          ? "Post-merge CI is still queued or running and production CD has not started."
+          : "Merged PR has no matching production CD run yet.")
+      : "Waiting for a matching production CD run to start.",
     nextAction: { label: "Open PR", url: pr.url },
     stages: stages.map((stage) => stage.key === "cd_started" ? { ...stage, status: overdue ? "blocked" : "active" } : stage)
   };
@@ -2814,7 +2862,7 @@ function groupTraces(traces) {
   };
 }
 
-function buildPipelineTraces({ pullRequests = [], mergedPullRequestsByRepo = new Map(), cdRowsByRepo = new Map(), includeCd = true, now = Date.now() } = {}) {
+function buildPipelineTraces({ pullRequests = [], mergedPullRequestsByRepo = new Map(), cdRowsByRepo = new Map(), runningActionsByRepo = new Map(), includeCd = true, now = Date.now() } = {}) {
   const traces = [];
   const seen = new Set();
   for (const pr of pullRequests) {
@@ -2827,7 +2875,8 @@ function buildPipelineTraces({ pullRequests = [], mergedPullRequestsByRepo = new
       const pr = normalizeMergedPullRequest(repo, item);
       if (!pr.number || seen.has(`${repo}#${pr.number}`)) continue;
       const cdRows = cdRowsByRepo.get(repo) || [];
-      traces.push(buildMergedPullRequestTrace(pr, cdRows, { now, includeCd }));
+      const runningRuns = runningActionsByRepo.get(repo) || [];
+      traces.push(buildMergedPullRequestTrace(pr, cdRows, { now, includeCd, runningRuns }));
       seen.add(`${repo}#${pr.number}`);
     }
   }
@@ -3916,6 +3965,7 @@ async function buildDashboardData(requestUrl) {
   let busyRunners = [];
   let traces = groupTraces([]);
   let cdRowsByRepo = new Map();
+  let runningActionsByRepo = new Map();
   // Sections that returned incomplete. Surfaced on the payload so a consumer
   // polling for one thing (queue depth) can tell a partial answer from a whole
   // one instead of trusting a silently short list.
@@ -3941,6 +3991,9 @@ async function buildDashboardData(requestUrl) {
       uniqueBy(actionGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
     );
     runningActions = uniqueBy(actionGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
+    // Per-repo view for the pipeline traces: a merged PR waiting on its
+    // post-merge CI needs to know which of these runs belong to its repo.
+    runningActionsByRepo = new Map(repos.map((repo, index) => [repo, actionGroups[index]?.running || []]));
     pullRequests = applyActionRunEvidenceToPullRequests(pullRequests, { runningActions, failedActions });
 
     if (cdOutcome) {
@@ -3979,7 +4032,7 @@ async function buildDashboardData(requestUrl) {
       }
     });
     mergedPullRequestsByRepo = new Map(mergedGroups.map((group, index) => [repos[index], group]));
-    traces = buildPipelineTraces({ pullRequests, mergedPullRequestsByRepo, cdRowsByRepo, includeCd });
+    traces = buildPipelineTraces({ pullRequests, mergedPullRequestsByRepo, cdRowsByRepo, runningActionsByRepo, includeCd });
   } else if (includeTraces) {
     traces = buildPipelineTraces({ pullRequests, includeCd });
   }
@@ -4658,6 +4711,7 @@ export {
   recommendRefresh,
   runOutcome,
   cdRunMatchesPr,
+  runBlocksCdStart,
   isDeployNeutralFile,
   mergedPrIsDeployNeutral,
   buildPipelineTraces,

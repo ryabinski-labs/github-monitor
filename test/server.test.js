@@ -27,6 +27,7 @@ import {
   isBackendUrl,
   runOutcome,
   buildPipelineTraces,
+  runBlocksCdStart,
   isDeployNeutralFile,
   mergedPrIsDeployNeutral,
   selectFailedActionRuns,
@@ -1716,7 +1717,7 @@ test("pipeline traces still flag a merged PR that mixes code with changelog", ()
             number: 448,
             title: "Ship feature and update changelog",
             html_url: "https://github.com/ryabinski-labs/nightlamp/pull/448",
-            merged_at: "2026-06-01T11:00:00Z",
+            merged_at: "2026-06-01T07:00:00Z",
             head: { sha: "abc999" },
             merge_commit_sha: "def999",
             base: { ref: "main" },
@@ -1748,6 +1749,149 @@ test("pipeline traces still flag a merged PR that mixes code with changelog", ()
   assert.equal(traces.flagged.length, 1);
   assert.equal(traces.flagged[0].id, "ryabinski-labs/nightlamp#448");
   assert.match(traces.flagged[0].reason, /no matching production CD run/i);
+});
+
+test("runBlocksCdStart matches base-branch and merge-commit runs only", () => {
+  const pr = { headSha: "abc123", mergeCommitSha: "def456", baseRefName: "main" };
+  assert.equal(runBlocksCdStart({ branch: "main", headSha: "zzz" }, pr), true);
+  assert.equal(runBlocksCdStart({ branch: "MAIN", headSha: "zzz" }, pr), true);
+  assert.equal(runBlocksCdStart({ branch: "feature/x", headSha: "def456" }, pr), true);
+  assert.equal(runBlocksCdStart({ branch: "feature/x", headSha: "zzz" }, pr), false);
+  assert.equal(runBlocksCdStart(null, pr), false);
+});
+
+test("merged PR waits out post-merge CI instead of flagging for a missing CD run", () => {
+  const now = Date.parse("2026-06-01T12:00:00Z");
+  const mergedPr = {
+    pr: {
+      number: 449,
+      title: "Ship slow pipeline change",
+      html_url: "https://github.com/ryabinski-labs/nightlamp/pull/449",
+      merged_at: "2026-06-01T11:00:00Z",
+      head: { sha: "aaa111" },
+      merge_commit_sha: "bbb222",
+      base: { ref: "main" },
+      user: { login: "dev" }
+    },
+    files: [{ filename: "src/app/page.jsx" }]
+  };
+  // The repo deploys, but nothing matches this PR yet -- the old logic flagged
+  // after 15 minutes even while this run was still queued.
+  const otherCdRun = {
+    repo: "ryabinski-labs/nightlamp",
+    workflow: "Deploy Production",
+    runNumber: "#901",
+    status: "completed",
+    conclusion: "success",
+    outcome: "success",
+    branch: "release/other",
+    headSha: "0000ff",
+    createdAt: "2026-05-30T10:00:00Z",
+    updatedAt: "2026-05-30T10:05:00Z",
+    url: "https://github.com/ryabinski-labs/nightlamp/actions/runs/901"
+  };
+  const runningCi = {
+    repo: "ryabinski-labs/nightlamp",
+    workflow: "CI",
+    runNumber: "#88",
+    status: "queued",
+    branch: "main",
+    headSha: "bbb222",
+    createdAt: "2026-06-01T11:01:00Z",
+    updatedAt: "2026-06-01T11:02:00Z",
+    url: "https://github.com/ryabinski-labs/nightlamp/actions/runs/88"
+  };
+  const args = {
+    now,
+    includeCd: true,
+    pullRequests: [],
+    mergedPullRequestsByRepo: new Map([["ryabinski-labs/nightlamp", [mergedPr]]]),
+    cdRowsByRepo: new Map([["ryabinski-labs/nightlamp", [otherCdRun]]])
+  };
+
+  const waiting = buildPipelineTraces({
+    ...args,
+    runningActionsByRepo: new Map([["ryabinski-labs/nightlamp", [runningCi]]])
+  });
+  assert.equal(waiting.flagged.length, 0);
+  assert.equal(waiting.active.length, 1);
+  assert.equal(waiting.active[0].stage, "cd_started");
+  assert.match(waiting.active[0].reason, /post-merge CI is still queued or running/i);
+  assert.equal(waiting.active[0].nextAction.url, runningCi.url);
+  assert.ok(waiting.active[0].evidence.some((item) => item.url === runningCi.url));
+
+  // A workflow run on an unrelated branch is not post-merge CI; the trace still
+  // waits (extended window), but for the plain "waiting for CD" reason.
+  const unrelated = buildPipelineTraces({
+    ...args,
+    runningActionsByRepo: new Map([["ryabinski-labs/nightlamp", [{ ...runningCi, branch: "feature/other", headSha: "cccc99" }]]])
+  });
+  assert.equal(unrelated.flagged.length, 0);
+  assert.equal(unrelated.active.length, 1);
+  assert.match(unrelated.active[0].reason, /Waiting for a matching production CD run/);
+});
+
+test("merged PR still flags after the CD-start window even if post-merge CI never drains", () => {
+  const now = Date.parse("2026-06-01T12:00:00Z");
+  const traces = buildPipelineTraces({
+    now,
+    includeCd: true,
+    pullRequests: [],
+    mergedPullRequestsByRepo: new Map([
+      ["ryabinski-labs/nightlamp", [
+        {
+          pr: {
+            number: 450,
+            title: "Ship stuck pipeline change",
+            html_url: "https://github.com/ryabinski-labs/nightlamp/pull/450",
+            merged_at: "2026-06-01T06:00:00Z",
+            head: { sha: "aaa222" },
+            merge_commit_sha: "bbb333",
+            base: { ref: "main" },
+            user: { login: "dev" }
+          },
+          files: [{ filename: "src/app/page.jsx" }]
+        }
+      ]]
+    ]),
+    cdRowsByRepo: new Map([
+      ["ryabinski-labs/nightlamp", [
+        {
+          repo: "ryabinski-labs/nightlamp",
+          workflow: "Deploy Production",
+          runNumber: "#902",
+          status: "completed",
+          conclusion: "success",
+          outcome: "success",
+          branch: "release/other",
+          headSha: "0000ff",
+          createdAt: "2026-05-30T10:00:00Z",
+          updatedAt: "2026-05-30T10:05:00Z",
+          url: "https://github.com/ryabinski-labs/nightlamp/actions/runs/902"
+        }
+      ]]
+    ]),
+    runningActionsByRepo: new Map([
+      ["ryabinski-labs/nightlamp", [
+        {
+          repo: "ryabinski-labs/nightlamp",
+          workflow: "CI",
+          runNumber: "#90",
+          status: "in_progress",
+          branch: "main",
+          headSha: "bbb333",
+          createdAt: "2026-06-01T06:01:00Z",
+          updatedAt: "2026-06-01T11:59:00Z",
+          url: "https://github.com/ryabinski-labs/nightlamp/actions/runs/90"
+        }
+      ]]
+    ])
+  });
+
+  assert.equal(traces.flagged.length, 1);
+  assert.equal(traces.flagged[0].id, "ryabinski-labs/nightlamp#450");
+  assert.equal(traces.flagged[0].severity, "high");
+  assert.match(traces.flagged[0].reason, /still queued or running and production CD has not started/i);
 });
 
 test("dashboard scoreboard surfaces skipped CD runs without a new lane", () => {
