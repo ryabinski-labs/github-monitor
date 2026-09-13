@@ -24,6 +24,7 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 ### Changed
 
 - Running CI and CD workflows are now flagged as long-running only after they exceed four hours.
+- Merged PRs are no longer flagged for a missing production CD run while post-merge CI is still queued or running on the base branch, and the "no matching CD run" window is now four hours from merge instead of 15 minutes. Slow pipelines are no longer reported as failures before CD has had a chance to start.
 - Failed CD now lists only CD workflow runs that are still failing. A failure that has already been superseded by a newer successful run on the same workflow is no longer surfaced as a current problem; the run remains visible in Finished CD as a historical FAILURE row. The view title now reads "CD workflows still failing".
 - Auto merge now targets only passing PRs with completed checks, while manually mergeable no-CI PRs remain available for explicit user action.
 - Auto merge countdown was shortened from 30 seconds to 15 seconds.
