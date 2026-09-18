@@ -442,6 +442,14 @@ async function getPatToken() {
       }
       return token;
     })();
+    // A rejected promise must not stay memoized. It used to: one lookup that
+    // failed because `gh auth login` had not finished, or because the token was
+    // exported a second after boot, poisoned every GitHub request for the life
+    // of the process, and the only cure was a restart. Dropping it on failure
+    // means the next request simply asks again.
+    githubTokenPromise.catch(() => {
+      githubTokenPromise = null;
+    });
   }
   return githubTokenPromise;
 }

@@ -366,6 +366,14 @@ test("SC-detect-no-extra-requests: a scan where nothing moved costs no compare r
     "the search document must not carry a compare: a static headRef argument would answer about the wrong branch"
   );
 
+  // Without this the token lookup falls through to `gh auth token`, which
+  // succeeds on a developer's machine and fails in CI -- so the compare never
+  // reached fetch there and this test counted zero requests while passing
+  // locally. The exact shape of a test that passes alone and fails on the
+  // runner.
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+
   server.resetGithubValueCache();
   const rows = [{ ...pr({ behindBy: undefined }), headRefName: "feat/x", baseSha: "base1", headSha: "head1" }];
 
@@ -394,6 +402,8 @@ test("SC-detect-no-extra-requests: a scan where nothing moved costs no compare r
   } finally {
     globalThis.fetch = originalFetch;
     server.resetGithubValueCache();
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
   }
 });
 
