@@ -1,0 +1,365 @@
+schema: tdd-artifact/v1
+feature: dashboard-contrast
+title: Dashboard contrast debt
+source:
+  prd: docs/prd/dashboard-contrast.md
+  prd_sha256: 9f68e1d08ab5ccc99bb5acb871b775f45102f21153f261a534b8760ea361fa53
+  issue: https://github.com/ryabinski-labs/github-monitor/issues/126
+# Levelling note. 1 acceptance / 12 integration / 2 unit is integration-heavy,
+# and deliberately so. What is under test is a stylesheet rendered by a browser
+# and a gate whose entire job is to read computed styles off a live page; "what
+# colour does this pixel actually end up" has no unit level. The two genuinely
+# pure things -- the WCAG ratio and alpha compositing -- are at unit, where they
+# belong. Pushing the rest down would mean asserting on stylesheet text, which
+# is the structure-sensitive test the desiderata warn about: it would pass while
+# the page was unreadable, which is precisely the failure this feature exists to
+# stop. The shape to avoid is an acceptance-heavy cone, and there is one
+# acceptance scenario here.
+defaults:
+  priority: P0
+non_goals:
+  - "Non-text contrast (WCAG 1.4.11): borders, the row accent bar, rail dots, button outlines and focus rings are not measured (PRD DL-003, §4)."
+  - "A colour-system redesign: tokens that pass today are not revisited, even where they pass narrowly (PRD §4)."
+  - "`.repo-owner`: fixed in PR #130 before this spec was written; evidence here, not scope (PRD §4)."
+  - "Making axe the contrast oracle: it cannot resolve a background over the row's ::before bar, so it stays for structural rules only (PRD §4, R-001)."
+  - "Disabled controls: WCAG 2.2 exempts inactive components, so the gate skips [disabled] rather than forcing them to 4.5:1 (PRD §4, A-007)."
+open_questions: []
+requirements:
+  - id: REQ-001
+    text: A dismissed row revealed with Show meets 4.5:1 on every text node it contains, in both themes.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 1, criteria 1-2; baseline in §3 (15 violations dark / 19 light, worst 2.15:1)"
+    scenarios:
+      - id: SC-dismissed-contrast-both-themes
+        level: acceptance
+        title: a revealed dismissed row is as readable as a live one
+        given: two rows dismissed in the Failing CI lane and revealed with Show, rendered in the dark theme and again in the light theme
+        when: every text node inside .row-dismissed is measured against its own composited background
+        then: every one of them is at or above 4.5:1
+        oracle: "for each theme, min(contrast of every text node under .row-dismissed) >= 4.5"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-contrast-both-themes: a revealed dismissed row is as readable as a live one'
+        priority: P0
+        doubles: "none for colour; /api/status is a fixture, as in test/repo-identity-colours.test.js"
+        tags: [wcag, issue-126]
+        notes: >-
+          Both themes in one scenario because the requirement is one requirement, but the
+          failure message must name the theme: issue #126's opacity ladder was measured in
+          dark only and concluded 0.90 clears AA, while light still had 4 violations at
+          4.04:1. A single-theme oracle is how that conclusion was reached.
+
+  - id: REQ-002
+    text: A dismissed row is visibly set aside by losing its colour, not by being dimmed, and returns to full colour on hover.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 1, criteria 3-4; §6; DL-002"
+    scenarios:
+      - id: SC-dismissed-greyscale
+        level: integration
+        title: a dismissed row carries no accent colour while a live row keeps its own
+        given: one dismissed row revealed with Show and one live row in the same lane
+        when: the accent bar, status pill, repo name and buttons of each are sampled
+        then: every sampled colour in the dismissed row has zero saturation and at least one sampled colour in the live row does not
+        oracle: "max saturation over the dismissed row's sampled colours === 0 && max saturation over the live row's === > 0"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-greyscale: a dismissed row carries no accent colour while a live row keeps its own'
+        priority: P0
+        doubles: none
+        tags: [affordance]
+        notes: >-
+          This is the guardrail on DL-002. Contrast alone cannot express it: opacity 1.0
+          with no filter would pass REQ-001 and destroy the affordance entirely, which is
+          why the de-emphasis has its own falsifiable check.
+      - id: SC-dismissed-hover-restores-colour
+        level: integration
+        title: hovering a dismissed row brings its colour back
+        given: a dismissed row revealed with Show
+        when: the pointer enters it
+        then: its sampled colours regain saturation, matching the behaviour .row-dismissed:hover has today
+        oracle: "max saturation over the sampled colours > 0 while hovered, === 0 when not"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-hover-restores-colour: hovering a dismissed row brings its colour back'
+        priority: P0
+        doubles: none
+        tags: [affordance, regression]
+
+  - id: REQ-003
+    text: The generic amber status pill meets 4.5:1 in both themes.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 2; §3 baseline (3.76:1 light, the only violation at rest); A-005"
+    scenarios:
+      - id: SC-amber-tag-both-themes
+        level: integration
+        title: the amber pill is readable in both themes
+        given: a .tag rendered in amber in the behind and running lanes
+        when: its text colour is measured against the pill background
+        then: it is at or above 4.5:1 in the dark theme and in the light theme
+        oracle: "contrast(computed colour of .tag, computed background of .tag) >= 4.5 in both themes"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-amber-tag-both-themes: the amber pill is readable in both themes'
+        priority: P0
+        doubles: none
+        tags: [wcag]
+        notes: >-
+          A-005 expects this to be satisfied by applying the existing --amber-on-soft
+          (#7b4f0e light, var(--amber) dark, 5.29:1 on --amber-soft) rather than by minting
+          a second token. The oracle deliberately does not name the token: a different
+          colour that clears 4.5:1 also satisfies the requirement, and asserting the token
+          would be asserting an internal.
+
+  - id: REQ-004
+    text: The gate measures what the page renders, so a surface no list mentions is still measured.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 3, criteria 1-2; DL-004"
+    scenarios:
+      - id: SC-gate-finds-unlisted-surface
+        level: integration
+        title: a failing colour on a surface nothing enumerates is still reported
+        given: a text node injected into a rendered lane with a foreground and background known to measure below 4.5:1
+        when: the gate runs
+        then: it reports that node
+        oracle: "the gate's findings include the injected node's selector, and its reported ratio is within 0.05 of the ratio computed for the injected pair"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-finds-unlisted-surface: a failing colour on a surface nothing enumerates is still reported'
+        priority: P0
+        doubles: "the failing node is injected into the real page; nothing else is stubbed"
+        tags: [gate, coverage]
+        notes: >-
+          The scenario that distinguishes DL-004's answer from the two it beat. A
+          token-pair table or a combinatorial sweep would both pass every other gate
+          scenario and fail this one, because neither can know about a pair nobody listed.
+      - id: SC-gate-visits-every-lane-and-theme
+        level: integration
+        title: coverage cannot shrink and still look like a pass
+        given: the gate configured for the five lanes, two themes and three states the PRD names
+        when: it finishes
+        then: its summary reports at least thirty surface-states visited
+        oracle: "summary.surfaceStates >= 30, and the gate fails when the figure is lower"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-visits-every-lane-and-theme: coverage cannot shrink and still look like a pass'
+        priority: P0
+        doubles: none
+        tags: [gate, coverage, nfr]
+        notes: >-
+          5 lanes x 2 themes x 3 states (resting, dismissed-revealed, hover) = 30, from
+          PRD §13. Without this, deleting a lane from the matrix turns a red gate green.
+
+  - id: REQ-005
+    text: The gate measures the composited colour a pixel actually has, not the token value the stylesheet names.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 3, criterion 3; §1"
+    scenarios:
+      - id: SC-gate-reports-composited-failure
+        level: integration
+        title: text dimmed by an ancestor's opacity is reported at its composited ratio
+        given: a text node whose token colour clears 4.5:1 but whose ancestor carries an opacity that drags the composited result below it
+        when: the gate runs
+        then: it reports the node, and the ratio it reports is the composited one
+        oracle: "the finding's ratio equals the ratio of the composited colour, not the ratio of the token colour, within 0.05"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-reports-composited-failure: text dimmed by an ancestor''s opacity is reported at its composited ratio'
+        priority: P0
+        doubles: none
+        tags: [gate, issue-126]
+        notes: >-
+          This is issue #126 reduced to one check. A gate that reads stylesheet tokens
+          would report nothing here, which is exactly why DL-004 rejected that design.
+
+  - id: REQ-006
+    text: The gate measures the resting page, after entrance animations have finished.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 3, criterion 4; §8 R-002; §13"
+    scenarios:
+      - id: SC-gate-waits-for-animations
+        level: integration
+        title: a staggered entrance fade is not reported as a contrast failure
+        given: a freshly loaded dashboard whose .metric-group elements are still running their entrance fade
+        when: the gate runs
+        then: it reports no .metric-label finding, because their resting colour is --muted-strong at 6.39:1
+        oracle: "no finding whose selector matches .metric-label, and document.getAnimations() reports every animation finished or idle before the first measurement"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-waits-for-animations: a staggered entrance fade is not reported as a contrast failure'
+        priority: P0
+        negative: true
+        doubles: none
+        tags: [gate, false-positive]
+        notes: >-
+          R-002 in full. Four of the five failures in the spec's own source evidence were
+          this animation, caught mid-flight. A gate without this check would open with a
+          list of defects that do not exist, and the first thing anyone would do is turn
+          it off.
+      - id: SC-gate-animation-ceiling
+        level: integration
+        title: an animation that never settles fails the gate loudly rather than hanging
+        given: a page carrying an infinite animation
+        when: the gate waits for animations to settle
+        then: it gives up after eight seconds and fails naming the unsettled animation
+        oracle: "the gate fails within 8s +/- 1s, and its message names the animation that did not settle"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-animation-ceiling: an animation that never settles fails the gate loudly rather than hanging'
+        priority: P0
+        negative: true
+        doubles: "an infinite CSS animation added to the page by the test"
+        tags: [gate, error-path]
+
+  - id: REQ-007
+    text: The gate skips disabled controls, which WCAG 2.2 exempts from 1.4.3.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 3, criterion 5; A-007"
+    scenarios:
+      - id: SC-gate-skips-disabled
+        level: integration
+        title: a disabled button below 4.5:1 is not a finding
+        given: a rendered .merge-button[disabled], which sits at opacity 0.72 and measures below 4.5:1
+        when: the gate runs
+        then: it reports nothing for that button
+        oracle: "no finding whose selector resolves to an element matching [disabled]"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-skips-disabled: a disabled button below 4.5:1 is not a finding'
+        priority: P0
+        negative: true
+        doubles: none
+        tags: [gate, wcag-exemption]
+
+  - id: REQ-008
+    text: A background the gate cannot resolve fails the gate, rather than passing unmeasured.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 3, error path; §8 R-001"
+    scenarios:
+      - id: SC-gate-fails-on-unresolvable-background
+        level: integration
+        title: could-not-decide is reported as a failure, not as a pass
+        given: a text node whose background the gate cannot determine
+        when: the gate runs
+        then: it fails naming that node
+        oracle: "the gate's exit is a failure and its message names the node whose background could not be resolved"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-fails-on-unresolvable-background: could-not-decide is reported as a failure, not as a pass'
+        priority: P0
+        negative: true
+        doubles: "a node constructed by the test to defeat background resolution"
+        tags: [gate, error-path]
+        notes: >-
+          R-001 turned into a standing check. Both pre-existing axe assertions read only
+          `violations` and ignored `incomplete`, and at the default viewport every node
+          landed in `incomplete` -- so they asserted the absence of a list axe never
+          populated. This scenario makes that shape of vacuity impossible here.
+
+  - id: REQ-009
+    text: The gate's contrast computation follows WCAG 2.x relative luminance on composited sRGB values.
+    priority: P0
+    type: functional
+    prd_ref: "§13, first bullet"
+    scenarios:
+      - id: SC-contrast-ratio-known-pairs
+        level: unit
+        title: the ratio computation agrees with published values
+        given: colour pairs whose WCAG contrast ratio is published
+        when: the ratio is computed
+        then: it matches to two decimal places
+        oracle: "ratio(#000,#fff) === 21.00 && ratio(#767676,#ffffff) === 4.54 && ratio(#777777,#ffffff) === 4.48"
+        status: green
+        test_ref: 'test/dashboard-contrast.test.js::SC-contrast-ratio-known-pairs: the ratio computation agrees with published values'
+        priority: P0
+        doubles: none
+        tags: [maths]
+        notes: >-
+          #767676 on white is the canonical WCAG boundary pair -- the lightest grey that
+          passes AA on white -- and #777777 is the next step up, which fails. A computation
+          that gets the 4.5 boundary wrong by a rounding rule would pass a black-on-white
+          check and fail real text.
+      - id: SC-contrast-composite-alpha
+        level: unit
+        title: compositing an alpha over a background is done before the ratio
+        given: a foreground, a background, and an alpha between 0 and 1
+        when: the colour is composited and the ratio computed
+        then: alpha 1 leaves the foreground unchanged, alpha 0 collapses it to the background, and 0.55 lands on the documented mid value
+        oracle: "composite(#ffffff,#000000,1) === #ffffff && composite(#ffffff,#000000,0) === #000000 && composite(#ffffff,#000000,0.55) === #8c8c8c"
+        status: green
+        test_ref: 'test/dashboard-contrast.test.js::SC-contrast-composite-alpha: compositing an alpha over a background is done before the ratio'
+        priority: P0
+        doubles: none
+        tags: [maths, issue-126]
+
+  - id: REQ-010
+    text: A gate failure names what to change.
+    priority: P0
+    type: functional
+    prd_ref: "§5 story 4; §9; DL-005"
+    scenarios:
+      - id: SC-gate-message-fields
+        level: integration
+        title: a failure line carries every field needed to act on it
+        given: a node the gate finds below 4.5:1
+        when: the failure is printed
+        then: the line carries the selector, the foreground and background as hex, the measured ratio to two decimals, the required ratio, the theme and the lane
+        oracle: "the message matches a selector, two /#[0-9a-f]{6}/ colours, a /\\d+\\.\\d{2}:1/ measured ratio, the literal 4.5:1, one of dark|light, and one of the five lane names"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-message-fields: a failure line carries every field needed to act on it'
+        priority: P0
+        doubles: none
+        tags: [gate, dx]
+        notes: >-
+          Moved from P1 to P0 by DL-005: a gate that fails without saying what to change is
+          a release blocker, not a follow-up.
+
+  - id: REQ-011
+    text: The gate adds no more than 60 seconds to npm test.
+    priority: P1
+    type: non-functional
+    prd_ref: "§13, third bullet; A-003"
+    scenarios:
+      - id: SC-gate-runtime-budget
+        level: integration
+        title: the gate stays inside its time budget
+        given: the gate running its full surface matrix
+        when: it finishes
+        then: its own wall-clock is at or under sixty seconds
+        oracle: "the gate's reported wall-clock <= 60000 ms"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-runtime-budget: the gate stays inside its time budget'
+        priority: P1
+        doubles: none
+        tags: [nfr, budget]
+        notes: >-
+          P1, not P0, and the number was A-003 -- an admitted guess, because there was no
+          gate to measure when the spec was written. It has now been measured: 12.5 s for 31
+          surface-states and 678 nodes, 4.8x inside the budget. DL-006 keeps the 60 s ceiling
+          rather than tightening it to the measurement, because a ceiling set at the local
+          number fails on a slower runner with no contrast defect present, which is a flake
+          and not a gate.
+
+  - id: REQ-012
+    text: The dashboard as shipped produces no contrast findings, so the gate fails the suite when one appears.
+    priority: P0
+    type: functional
+    prd_ref: "§5, third P0 story: \"I want a contrast failure to fail the test suite\""
+    scenarios:
+      - id: SC-gate-dashboard-is-clean
+        level: acceptance
+        title: the gate, pointed at the product, reports nothing
+        given: the dashboard rendered with every lane populated
+        when: the gate runs over all five lanes, both themes and all three row states
+        then: it reports zero findings, having measured a non-trivial number of nodes
+        oracle: "findings.length === 0 && summary.nodesMeasured > 200 && summary.surfaceStates >= 30"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-dashboard-is-clean: the gate, pointed at the product, reports nothing'
+        priority: P0
+        doubles: none for colour; /api/status is a fixture, as in the other scenarios here
+        tags: [wcag, regression, standing-gate]
+        notes: >-
+          Added during implementation, not at derivation, and that is the point worth
+          recording. The first pass produced eleven scenarios that exercise the gate against
+          injected probes and four that measure the three known defects -- and not one that
+          points the finished gate at the product. A gate that only ever sees its own test
+          fixtures is not standing over anything. The story it derives from says "fail the
+          test suite" in as many words; the criteria listed under it stop at "reports", which
+          is how the gap got through. The node floor is in the oracle so that a future change
+          which renders nothing cannot report zero findings and look like a pass.

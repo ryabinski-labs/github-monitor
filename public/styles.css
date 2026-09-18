@@ -18,7 +18,17 @@
   --red-soft: #482629;
   --amber: #efb75d;
   --amber-soft: #49391d;
+  /* The colour a .tag's text takes on its own --*-soft background. It is the
+     accent itself wherever the accent already clears 4.5:1 there, and a darker
+     sibling where it does not. Measured, not assumed -- see the light theme,
+     where two of the seven need the override. */
   --amber-on-soft: var(--amber);
+  --red-on-soft: var(--red);
+  --green-on-soft: var(--green);
+  --blue-on-soft: var(--blue);
+  --violet-on-soft: var(--violet);
+  --gray-on-soft: var(--gray);
+  --ink-on-soft: var(--ink);
 
   /* Filtered-mode accent. Red, because the filter is a mode that makes every
      number on the page untrue as an org figure -- the same "do not read this at
@@ -99,7 +109,21 @@
   --red-soft: #f0d8d3;
   --amber: #9a6312;
   --amber-soft: #efddb8;
+  /* --amber on --amber-soft is 3.77:1 and --gray on --gray-soft is 2.90:1 in
+     this theme; both are text and both need 4.5:1. The replacements keep the
+     hue and saturation of the accent and only take lightness away, so the
+     status colour still reads as amber and as grey.
+       --amber-on-soft #7b4f0e on #efddb8 -> 5.29:1
+       --gray-on-soft  #5f5a4e on #e3ddcf -> 5.07:1
+     The other five clear it unchanged: red 4.79, green 5.08, blue 5.31,
+     violet 5.29, ink 11.89. */
   --amber-on-soft: #7b4f0e;
+  --red-on-soft: var(--red);
+  --green-on-soft: var(--green);
+  --blue-on-soft: var(--blue);
+  --violet-on-soft: var(--violet);
+  --gray-on-soft: #5f5a4e;
+  --ink-on-soft: var(--ink);
 
   --flag: var(--red);
   --flag-soft: var(--red-soft);
@@ -1347,8 +1371,21 @@ button.metric.active .metric-dot {
   color: var(--muted);
 }
 
-.row-dismissed { opacity: 0.55; }
-.row-dismissed:hover { opacity: 1; }
+/* De-emphasis by removing colour, not by removing light.
+   `opacity` composites every pixel toward the row's background, so the 0.55
+   this used to carry took the "FAIL" pill from 5.22:1 to 2.56:1 and the meta
+   line with it -- issue #126. Its opacity ladder was walked in the dark theme
+   alone and stopped at 0.90; re-measured in both, dark reached zero violations
+   at 0.90 while light still had four at 4.04:1, so no single value clears both.
+   `grayscale(1)` uses the same luminance coefficients as the contrast formula
+   (0.2126/0.7152/0.0722), so relative luminance -- and therefore every contrast
+   ratio in the row -- is mathematically unchanged, while the row still reads as
+   set aside. Hover restores the colour, as it always did. */
+.row-dismissed {
+  filter: grayscale(1);
+  opacity: 1;
+}
+.row-dismissed:hover { filter: none; }
 
 .trace-head-actions {
   display: inline-flex;
@@ -1431,7 +1468,9 @@ button.metric.active .metric-dot {
   padding: 3px 8px;
   border-radius: var(--radius-pill);
   background: var(--soft, var(--gray-soft));
-  color: var(--accent, var(--ink));
+  /* Not var(--accent): the accent is tuned to be read on the row's paper, and a
+     pill puts it on --*-soft instead, where two of the seven fall under AA. */
+  color: var(--on-soft, var(--accent, var(--ink)));
   font-family: var(--sans);
   font-size: 9.5px;
   font-weight: 700;
