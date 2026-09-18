@@ -2346,8 +2346,16 @@ function renderCdRow(row, view, viewKey) {
   const tagClass = viewKey === "failedCd" ? `tag tag-${statusClass(status)}` : "tag";
   const phaseBadge = renderPhaseBadge(row);
   const keys = viewKey === "failedCd" ? dismissKeys(row) : [];
-  const dismissed = anyDismissed(keys);
-  const dismissButton = keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
+  // An auto-dismissed CD row gets the same treatment as an auto-dismissed
+  // workflow run: the dimmed state and a label saying why, never a Dismiss
+  // button, because pressing it would write a localStorage key for a row the
+  // server dismisses on every scan anyway -- and "Restore all" would then look
+  // broken when the row stayed hidden.
+  const auto = isAutoDismissed(row);
+  const dismissed = auto || anyDismissed(keys);
+  const dismissButton = auto
+    ? `<span class="row-dismiss row-dismiss-auto" title="${escapeHtml(row.autoDismissReason || "Dismissed automatically")}">Auto-dismissed</span>`
+    : keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   return `
     <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">

@@ -20,6 +20,7 @@ import {
   recordRateLimit,
   snapshotRateLimit,
   resetObservedRateBuckets,
+  resetGithubValueCache,
   createScanMetrics,
   scanMetrics,
   recommendRefresh,
@@ -866,6 +867,111 @@ test("runner status endpoint returns only busy runners", async () => {
       }
     ]);
   } finally {
+    await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("/api/status hands the Failed CD lane its cancelled runs already dismissed", async () => {
+  // The wiring test. server.js can hold a correct marker and still never call it
+  // on the CD path -- which is exactly what shipped first, leaving two cancelled
+  // deploys sitting in Failed CD with nothing but a Dismiss button. Asserted
+  // through the real /api/status response, because that is the only surface the
+  // dashboard ever sees.
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+
+  const cdRun = (id, runNumber, conclusion) => ({
+    id,
+    name: "site-deploy",
+    path: ".github/workflows/site-deploy.yml",
+    event: "push",
+    status: "completed",
+    conclusion,
+    created_at: "2026-05-18T20:00:00Z",
+    updated_at: new Date().toISOString(),
+    run_number: runNumber,
+    head_branch: "feat/thing",
+    head_sha: `sha${runNumber}`,
+    display_title: `deploy ${runNumber}`,
+    html_url: `https://github.com/cd-cancel-fixture/app/actions/runs/${id}`
+  });
+
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    const body = options.body ? JSON.parse(options.body) : {};
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4990",
+      "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+      "x-ratelimit-resource": requestUrl.pathname === "/graphql" ? "graphql" : "core"
+    };
+
+    if (requestUrl.pathname === "/user") return Response.json({ login: "maintainer" }, { headers });
+    if (requestUrl.pathname === "/user/orgs") return Response.json([{ login: "cd-cancel-fixture" }], { headers });
+    if (requestUrl.pathname === "/user/repos") return Response.json([], { headers });
+    // Answer the repo listing for whichever owner is asked. The owner list is
+    // memoized per process, so in a full-suite run this handler is reached with
+    // an earlier test's owner and an exact-path match would silently yield an
+    // empty dashboard -- which is what a passing-alone, failing-together test
+    // looks like from the outside.
+    if (/^\/orgs\/[^/]+\/repos$/.test(requestUrl.pathname)) {
+      return Response.json([{ full_name: "cd-cancel-fixture/app", archived: false, owner: { login: "cd-cancel-fixture" } }], { headers });
+    }
+    if (requestUrl.pathname === "/graphql") {
+      assert.ok(body.variables);
+      return Response.json(
+        { data: { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } },
+        { headers }
+      );
+    }
+    if (requestUrl.pathname === "/repos/cd-cancel-fixture/app/actions/workflows") {
+      return Response.json(
+        { workflows: [{ id: 9, name: "site-deploy", path: ".github/workflows/site-deploy.yml", state: "active" }] },
+        { headers }
+      );
+    }
+    if (requestUrl.pathname === "/repos/cd-cancel-fixture/app/actions/workflows/9/runs") {
+      return Response.json({ workflow_runs: [cdRun(501, 450, "cancelled"), cdRun(502, 449, "failure")] }, { headers });
+    }
+    if (requestUrl.pathname === "/repos/cd-cancel-fixture/app/actions/runs") {
+      return Response.json({ workflow_runs: [] }, { headers });
+    }
+
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  // Both ends: inherit nothing from an earlier /api/status test, leave nothing
+  // behind for the next one.
+  resetGithubValueCache();
+  const testServer = await new Promise((resolve) => {
+    const listener = server.listen(0, "127.0.0.1", () => resolve(listener));
+  });
+
+  try {
+    const { port } = testServer.address();
+    const response = await previousFetch(
+      `http://127.0.0.1:${port}/api/status?mode=all&includeCd=1&includeRunners=0&jobs=1`
+    );
+    const data = await response.json();
+    assert.equal(response.status, 200);
+
+    const failed = data.cd.failed;
+    // Pin the lane first: with no CD failures at all, "the cancelled one is
+    // dismissed" would be vacuously true of an empty array.
+    assert.equal(failed.length, 2, "both CD failures reach the lane; dismissal is a flag, not a filter");
+
+    const cancelled = failed.find((run) => run.conclusion === "cancelled");
+    const genuine = failed.find((run) => run.conclusion === "failure");
+    assert.equal(cancelled.autoDismissed, true, "the cancelled deploy arrives pre-dismissed");
+    assert.match(cancelled.autoDismissReason, /[Cc]ancelled/);
+    assert.equal(genuine.autoDismissed, undefined, "a real CD failure is still the operator's problem");
+  } finally {
+    resetGithubValueCache();
     await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
     globalThis.fetch = previousFetch;
     if (previousToken == null) delete process.env.GITHUB_TOKEN;
