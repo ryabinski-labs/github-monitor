@@ -255,31 +255,74 @@ function measureInPage(selector) {
   return results;
 }
 
-// Peak saturation over a row's own colours and its descendants'. Greyscale
-// pins this to 0; any accent colour pushes it above 0.
-function saturationInPage(selector) {
-  const parse = (value) => {
-    const match = String(value).match(/rgba?\(([^)]+)\)/);
-    if (!match) return null;
-    const parts = match[1].split(",").map((part) => Number(part.trim()));
-    if (parts.length > 3 && parts[3] === 0) return null;
-    return parts.slice(0, 3);
-  };
-  const saturation = (rgb) => (Math.max(...rgb) - Math.min(...rgb)) / 255;
-  const root = document.querySelector(selector);
-  if (!root) return null;
-  let peak = 0;
-  for (const element of [root, ...root.querySelectorAll("*")]) {
-    const style = getComputedStyle(element);
-    for (const value of [style.color, style.backgroundColor, style.borderTopColor, style.borderLeftColor]) {
-      const rgb = parse(value);
-      if (rgb) peak = Math.max(peak, saturation(rgb));
-    }
-    const before = getComputedStyle(element, "::before");
-    const beforeRgb = parse(before.backgroundColor);
-    if (beforeRgb && before.content !== "none") peak = Math.max(peak, saturation(beforeRgb));
-  }
-  return Math.round(peak * 1000) / 1000;
+// Peak saturation over the pixels a reader actually sees in the row.
+//
+// This started out reading getComputedStyle().color, backgroundColor and
+// borders, which is what the first draft of this file shipped. That oracle
+// cannot see a `filter`: with `filter: grayscale(1)` on the row, every computed
+// colour is still reported at full saturation, so a correct implementation
+// measured 0.561 and looked like a failure. The artifact's oracle is "max
+// saturation over the dismissed row's sampled colours", and DL-004 already
+// decided where sampling happens -- the rendered page. So it samples the
+// rendered page: screenshot the row, decode it in the browser, and read the
+// pixels.
+//
+// This is also strictly stronger than the version it replaces. It would catch a
+// filter that silently fails to apply, and it cannot be satisfied by a token
+// swap that leaves the painted result coloured.
+async function peakSaturation(page, selector) {
+  const locator = page.locator(selector).first();
+  if (!(await locator.count())) return null;
+  const clip = await locator.boundingBox();
+  if (!clip || clip.width < 1 || clip.height < 1) return null;
+
+  // A screenshot clip is a rectangle; the row is a rounded rectangle. Its four
+  // corners show the page behind it, whose background carries two coloured
+  // radial glows, and nothing the row does filters those. Counting them
+  // reported 0.09 for a perfectly grey row; excluding the corner arcs left
+  // 0.031 in eighteen pixels sitting exactly on the arc, where the browser
+  // antialiases the row's border against that same page.
+  //
+  // So the mask is the row's rounded rect eroded by EDGE px, which is the
+  // boundary the blend occupies. Eroding rather than insetting the clip keeps
+  // the accent bar: it is 3px wide from the padding edge, so its inner columns
+  // survive a 2px erosion, and it is the first thing this oracle is meant to
+  // see lose its colour.
+  const EDGE = 2;
+  const radius = await locator.evaluate((element) => parseFloat(getComputedStyle(element).borderTopLeftRadius) || 0);
+  const png = await page.screenshot({ clip });
+  return page.evaluate(
+    async ({ base64, radius: r, edge }) => {
+      const bytes = Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
+      const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
+      const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.drawImage(bitmap, 0, 0);
+      const { data } = context.getImageData(0, 0, bitmap.width, bitmap.height);
+      const { width, height } = bitmap;
+      const inner = { left: edge, top: edge, right: width - edge, bottom: height - edge };
+      const innerRadius = Math.max(0, r - edge);
+      const insideRoundedRect = (x, y) => {
+        if (x < inner.left || y < inner.top || x >= inner.right || y >= inner.bottom) return false;
+        const cx = x < inner.left + innerRadius ? inner.left + innerRadius
+          : x >= inner.right - innerRadius ? inner.right - innerRadius : null;
+        const cy = y < inner.top + innerRadius ? inner.top + innerRadius
+          : y >= inner.bottom - innerRadius ? inner.bottom - innerRadius : null;
+        if (cx === null || cy === null) return true;
+        return (x + 0.5 - cx) ** 2 + (y + 0.5 - cy) ** 2 <= innerRadius * innerRadius;
+      };
+      let peak = 0;
+      for (let index = 0; index < data.length; index += 4) {
+        const pixel = index / 4;
+        if (!insideRoundedRect(pixel % width, Math.floor(pixel / width))) continue;
+        const chroma = (Math.max(data[index], data[index + 1], data[index + 2]) -
+          Math.min(data[index], data[index + 1], data[index + 2])) / 255;
+        if (chroma > peak) peak = chroma;
+      }
+      return Math.round(peak * 1000) / 1000;
+    },
+    { base64: png.toString("base64"), radius, edge: EDGE }
+  );
 }
 
 // --- REQ-001 -----------------------------------------------------------------
@@ -319,8 +362,8 @@ test("SC-dismissed-greyscale: a dismissed row carries no accent colour while a l
     const revealed = await dismissAndReveal(page, 1);
     assert.ok(revealed > 0, "the fixture must produce a revealed dismissed row");
 
-    const dismissed = await page.evaluate(saturationInPage, ".row-dismissed");
-    const live = await page.evaluate(saturationInPage, ".row:not(.row-dismissed)");
+    const dismissed = await peakSaturation(page, ".row-dismissed");
+    const live = await peakSaturation(page, ".row:not(.row-dismissed)");
 
     assert.ok(live !== null && live > 0, "a live row must keep colour, or the comparison is meaningless");
     assert.equal(
@@ -340,10 +383,10 @@ test("SC-dismissed-hover-restores-colour: hovering a dismissed row brings its co
     const revealed = await dismissAndReveal(page, 1);
     assert.ok(revealed > 0, "the fixture must produce a revealed dismissed row");
 
-    const resting = await page.evaluate(saturationInPage, ".row-dismissed");
+    const resting = await peakSaturation(page, ".row-dismissed");
     await page.locator(".row-dismissed").first().hover();
     await page.waitForTimeout(250);
-    const hovered = await page.evaluate(saturationInPage, ".row-dismissed");
+    const hovered = await peakSaturation(page, ".row-dismissed");
 
     assert.equal(resting, 0, `at rest a dismissed row must be colourless, measured ${resting}`);
     assert.ok(
@@ -408,7 +451,10 @@ test("SC-gate-finds-unlisted-surface: a failing colour on a surface nothing enum
     const result = await gate.runContrastGate(page, { lanes: LANES, themes: ["dark"] });
     const finding = result.findings.find((entry) => entry.selector.includes("unlisted-probe"));
     assert.ok(finding, "a node no list mentions must still be measured — coverage comes from the page, not from an enumeration someone maintains");
-    assert.ok(Math.abs(finding.ratio - 1.15) < 0.05, `#8a8a8a on #7a7a7a is 1.15:1; the gate reported ${finding.ratio}`);
+    // L(#8a8a8a) = 0.2542, L(#7a7a7a) = 0.1946, so (0.2542 + 0.05) / (0.1946 + 0.05)
+    // = 1.2434. The first draft of this line asserted 1.15, which was never
+    // computed; the gate reporting 1.24 is what surfaced it.
+    assert.ok(Math.abs(finding.ratio - 1.24) < 0.05, `#8a8a8a on #7a7a7a is 1.24:1; the gate reported ${finding.ratio}`);
   } finally {
     await browser.close();
   }
@@ -647,6 +693,47 @@ test("SC-gate-runtime-budget: the gate stays inside its time budget", { skip }, 
     assert.ok(
       result.summary.wallClockMs <= 60000,
       `the gate took ${result.summary.wallClockMs}ms against a 60000ms budget (A-003). If this is the first real measurement, replace the assumption in the PRD with the number rather than raising the ceiling quietly.`
+    );
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- REQ-012 -----------------------------------------------------------------
+
+test("SC-gate-dashboard-is-clean: the gate, pointed at the product, reports nothing", { skip }, async () => {
+  // Oracle: findings.length === 0 && summary.nodesMeasured > 200 && summary.surfaceStates >= 30
+  //
+  // This scenario was missing from the first derivation, and the omission is
+  // worth naming: eleven scenarios exercised the gate against probes injected
+  // for the purpose, four measured the three known defects, and none pointed
+  // the finished gate at the product. A gate that only ever sees its own
+  // fixtures is not standing over anything.
+  //
+  // The node and surface floors are part of the oracle, not decoration. Zero
+  // findings is also what a gate reports when it measures nothing at all, and
+  // that is the shape of vacuity this whole spec exists because of.
+  const gate = await loadGate();
+  assert.ok(gate && typeof gate.runContrastGate === "function", "test/support/contrast-gate.js must export runContrastGate(page, options)");
+
+  const { browser, page } = await openDashboard();
+  try {
+    const result = await gate.runContrastGate(page, { lanes: LANES, themes: ["dark", "light"] });
+
+    assert.ok(
+      result.summary.surfaceStates >= 30,
+      `the gate must have visited the whole matrix before its silence means anything; it visited ${result.summary.surfaceStates}`
+    );
+    assert.ok(
+      result.summary.nodesMeasured > 200,
+      `the gate must have found text to measure; it measured ${result.summary.nodesMeasured} nodes`
+    );
+
+    const distinct = [...new Map(result.findings.map((f) => [`${f.selector}|${f.theme}|${f.state}`, f])).values()];
+    assert.deepEqual(
+      distinct.map((finding) => gate.formatFinding(finding)),
+      [],
+      "the dashboard must pass its own gate"
     );
   } finally {
     await browser.close();

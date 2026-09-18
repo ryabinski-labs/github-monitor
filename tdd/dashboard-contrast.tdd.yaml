@@ -3,7 +3,7 @@ feature: dashboard-contrast
 title: Dashboard contrast debt
 source:
   prd: docs/prd/dashboard-contrast.md
-  prd_sha256: 00964aad398057465810d3466fed90b34de5a0f2bd922109617f9799ef0c1f6a
+  prd_sha256: 9f68e1d08ab5ccc99bb5acb871b775f45102f21153f261a534b8760ea361fa53
   issue: https://github.com/ryabinski-labs/github-monitor/issues/126
 # Levelling note. 1 acceptance / 12 integration / 2 unit is integration-heavy,
 # and deliberately so. What is under test is a stylesheet rendered by a browser
@@ -38,7 +38,7 @@ requirements:
         when: every text node inside .row-dismissed is measured against its own composited background
         then: every one of them is at or above 4.5:1
         oracle: "for each theme, min(contrast of every text node under .row-dismissed) >= 4.5"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-contrast-both-themes: a revealed dismissed row is as readable as a live one'
         priority: P0
         doubles: "none for colour; /api/status is a fixture, as in test/repo-identity-colours.test.js"
@@ -62,7 +62,7 @@ requirements:
         when: the accent bar, status pill, repo name and buttons of each are sampled
         then: every sampled colour in the dismissed row has zero saturation and at least one sampled colour in the live row does not
         oracle: "max saturation over the dismissed row's sampled colours === 0 && max saturation over the live row's === > 0"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-greyscale: a dismissed row carries no accent colour while a live row keeps its own'
         priority: P0
         doubles: none
@@ -78,7 +78,7 @@ requirements:
         when: the pointer enters it
         then: its sampled colours regain saturation, matching the behaviour .row-dismissed:hover has today
         oracle: "max saturation over the sampled colours > 0 while hovered, === 0 when not"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-dismissed-hover-restores-colour: hovering a dismissed row brings its colour back'
         priority: P0
         doubles: none
@@ -97,7 +97,7 @@ requirements:
         when: its text colour is measured against the pill background
         then: it is at or above 4.5:1 in the dark theme and in the light theme
         oracle: "contrast(computed colour of .tag, computed background of .tag) >= 4.5 in both themes"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-amber-tag-both-themes: the amber pill is readable in both themes'
         priority: P0
         doubles: none
@@ -122,7 +122,7 @@ requirements:
         when: the gate runs
         then: it reports that node
         oracle: "the gate's findings include the injected node's selector, and its reported ratio is within 0.05 of the ratio computed for the injected pair"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-finds-unlisted-surface: a failing colour on a surface nothing enumerates is still reported'
         priority: P0
         doubles: "the failing node is injected into the real page; nothing else is stubbed"
@@ -138,7 +138,7 @@ requirements:
         when: it finishes
         then: its summary reports at least thirty surface-states visited
         oracle: "summary.surfaceStates >= 30, and the gate fails when the figure is lower"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-visits-every-lane-and-theme: coverage cannot shrink and still look like a pass'
         priority: P0
         doubles: none
@@ -160,7 +160,7 @@ requirements:
         when: the gate runs
         then: it reports the node, and the ratio it reports is the composited one
         oracle: "the finding's ratio equals the ratio of the composited colour, not the ratio of the token colour, within 0.05"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-reports-composited-failure: text dimmed by an ancestor''s opacity is reported at its composited ratio'
         priority: P0
         doubles: none
@@ -182,7 +182,7 @@ requirements:
         when: the gate runs
         then: it reports no .metric-label finding, because their resting colour is --muted-strong at 6.39:1
         oracle: "no finding whose selector matches .metric-label, and document.getAnimations() reports every animation finished or idle before the first measurement"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-waits-for-animations: a staggered entrance fade is not reported as a contrast failure'
         priority: P0
         negative: true
@@ -200,7 +200,7 @@ requirements:
         when: the gate waits for animations to settle
         then: it gives up after eight seconds and fails naming the unsettled animation
         oracle: "the gate fails within 8s +/- 1s, and its message names the animation that did not settle"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-animation-ceiling: an animation that never settles fails the gate loudly rather than hanging'
         priority: P0
         negative: true
@@ -220,7 +220,7 @@ requirements:
         when: the gate runs
         then: it reports nothing for that button
         oracle: "no finding whose selector resolves to an element matching [disabled]"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-skips-disabled: a disabled button below 4.5:1 is not a finding'
         priority: P0
         negative: true
@@ -240,7 +240,7 @@ requirements:
         when: the gate runs
         then: it fails naming that node
         oracle: "the gate's exit is a failure and its message names the node whose background could not be resolved"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-fails-on-unresolvable-background: could-not-decide is reported as a failure, not as a pass'
         priority: P0
         negative: true
@@ -265,7 +265,7 @@ requirements:
         when: the ratio is computed
         then: it matches to two decimal places
         oracle: "ratio(#000,#fff) === 21.00 && ratio(#767676,#ffffff) === 4.54 && ratio(#777777,#ffffff) === 4.48"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast.test.js::SC-contrast-ratio-known-pairs: the ratio computation agrees with published values'
         priority: P0
         doubles: none
@@ -282,7 +282,7 @@ requirements:
         when: the colour is composited and the ratio computed
         then: alpha 1 leaves the foreground unchanged, alpha 0 collapses it to the background, and 0.55 lands on the documented mid value
         oracle: "composite(#ffffff,#000000,1) === #ffffff && composite(#ffffff,#000000,0) === #000000 && composite(#ffffff,#000000,0.55) === #8c8c8c"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast.test.js::SC-contrast-composite-alpha: compositing an alpha over a background is done before the ratio'
         priority: P0
         doubles: none
@@ -301,7 +301,7 @@ requirements:
         when: the failure is printed
         then: the line carries the selector, the foreground and background as hex, the measured ratio to two decimals, the required ratio, the theme and the lane
         oracle: "the message matches a selector, two /#[0-9a-f]{6}/ colours, a /\\d+\\.\\d{2}:1/ measured ratio, the literal 4.5:1, one of dark|light, and one of the five lane names"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-message-fields: a failure line carries every field needed to act on it'
         priority: P0
         doubles: none
@@ -323,13 +323,43 @@ requirements:
         when: it finishes
         then: its own wall-clock is at or under sixty seconds
         oracle: "the gate's reported wall-clock <= 60000 ms"
-        status: red
+        status: green
         test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-runtime-budget: the gate stays inside its time budget'
         priority: P1
         doubles: none
         tags: [nfr, budget]
         notes: >-
-          P1, not P0, and the number is A-003 -- an admitted guess, because there was no
-          gate to measure when the spec was written. The PRD says so in as many words and
-          says the first real run replaces the guess with the measurement. Recorded here so
-          that replacement is a visible edit rather than a forgotten one.
+          P1, not P0, and the number was A-003 -- an admitted guess, because there was no
+          gate to measure when the spec was written. It has now been measured: 12.5 s for 31
+          surface-states and 678 nodes, 4.8x inside the budget. DL-006 keeps the 60 s ceiling
+          rather than tightening it to the measurement, because a ceiling set at the local
+          number fails on a slower runner with no contrast defect present, which is a flake
+          and not a gate.
+
+  - id: REQ-012
+    text: The dashboard as shipped produces no contrast findings, so the gate fails the suite when one appears.
+    priority: P0
+    type: functional
+    prd_ref: "§5, third P0 story: \"I want a contrast failure to fail the test suite\""
+    scenarios:
+      - id: SC-gate-dashboard-is-clean
+        level: acceptance
+        title: the gate, pointed at the product, reports nothing
+        given: the dashboard rendered with every lane populated
+        when: the gate runs over all five lanes, both themes and all three row states
+        then: it reports zero findings, having measured a non-trivial number of nodes
+        oracle: "findings.length === 0 && summary.nodesMeasured > 200 && summary.surfaceStates >= 30"
+        status: green
+        test_ref: 'test/dashboard-contrast-ui.test.js::SC-gate-dashboard-is-clean: the gate, pointed at the product, reports nothing'
+        priority: P0
+        doubles: none for colour; /api/status is a fixture, as in the other scenarios here
+        tags: [wcag, regression, standing-gate]
+        notes: >-
+          Added during implementation, not at derivation, and that is the point worth
+          recording. The first pass produced eleven scenarios that exercise the gate against
+          injected probes and four that measure the three known defects -- and not one that
+          points the finished gate at the product. A gate that only ever sees its own test
+          fixtures is not standing over anything. The story it derives from says "fail the
+          test suite" in as many words; the criteria listed under it stop at "reports", which
+          is how the gap got through. The node floor is in the oracle so that a future change
+          which renders nothing cannot report zero findings and look like a pass.

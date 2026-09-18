@@ -2370,6 +2370,15 @@ function renderRerunButton(row) {
   </button>`;
 }
 
+// The three colour roles a lane hands its cards: the accent, the soft background
+// the accent sits on, and the text colour that is actually legible on that soft
+// background. The third is not always the first. In the light theme --amber on
+// --amber-soft measures 3.77:1 and --gray on --gray-soft measures 2.90:1, both
+// under the 4.5:1 that WCAG 2.2 AA asks of text this size.
+function accentVars(color) {
+  return `--accent: var(--${color}); --soft: var(--${color}-soft); --on-soft: var(--${color}-on-soft);`;
+}
+
 // Shown only on a behind, non-conflicting PR: GitHub answers 422 to an update
 // on a conflicting branch, so offering the button there would be a lie.
 function renderUpdateButton(row) {
@@ -2496,7 +2505,7 @@ function renderPrRow(row, view) {
   const dismissed = anyDismissed(keys);
   const dismissButton = keys.length ? renderDismissButton(keys, `${row.repo} ${row.numberLabel || `#${row.number}`}`) : "";
   return `
-    <article class="row${dismissed ? " row-dismissed" : ""}${row.hasConflict ? " row-conflict" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${dismissed ? " row-dismissed" : ""}${row.hasConflict ? " row-conflict" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
       <div class="row-main">
         ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title)}</div>
@@ -2544,7 +2553,7 @@ function renderCdRow(row, view, viewKey) {
     ? `<span class="row-dismiss row-dismiss-auto" title="${escapeHtml(row.autoDismissReason || "Dismissed automatically")}">Auto-dismissed</span>`
     : keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   return `
-    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
       <div class="row-main">
         ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
@@ -2636,7 +2645,7 @@ function renderTraceRow(row) {
     ? renderDismissButton(keys, `${row.repo} ${row.numberLabel || `#${row.prNumber}`}`)
     : "";
   return `
-    <article class="trace-card trace-${escapeHtml(row.status || "active")}${dismissed ? " row-dismissed" : ""}" style="--accent: var(--${tone}); --soft: var(--${tone}-soft);" aria-label="${escapeHtml(row.repo)} ${escapeHtml(row.numberLabel || `#${row.prNumber}`)} pipeline trace">
+    <article class="trace-card trace-${escapeHtml(row.status || "active")}${dismissed ? " row-dismissed" : ""}" style="${accentVars(tone)}" aria-label="${escapeHtml(row.repo)} ${escapeHtml(row.numberLabel || `#${row.prNumber}`)} pipeline trace">
       <div class="trace-card-head">
         <div class="row-main">
           ${renderRepoLabel(row.repo)}
@@ -2965,7 +2974,7 @@ function renderFinishedCdRow(row, view) {
       </div>`
     : `<p class="review-note">${escapeHtml(summary.lookFor || "Open the run and changed files to inspect this deployment.")}</p>`;
   return `
-    <article class="cd-card" data-outcome="${escapeHtml(outcome || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="cd-card" data-outcome="${escapeHtml(outcome || "")}" style="${accentVars(view.color)}">
       <div class="cd-card-head row" data-href="${escapeHtml(row.url || "")}">
         <div class="row-main">
           ${renderRepoLabel(row.repo)}
@@ -3020,7 +3029,7 @@ function renderWorkflowRunRow(row, view) {
     : keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   const phaseBadge = renderPhaseBadge(row);
   return `
-    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
       <div class="row-main">
         ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
@@ -3040,7 +3049,7 @@ function renderWorkflowRunRow(row, view) {
 function renderDeploymentRow(row, view) {
   const phaseBadge = renderPhaseBadge(row);
   return `
-    <article class="row${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
+    <article class="row${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
       <div class="row-main">
         ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.environment || "Deployment")}</div>

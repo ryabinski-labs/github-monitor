@@ -377,6 +377,7 @@ measurement that matters is the gate's own output.
 | DL-003 | non_functional | What does the contrast gate check? | A. Text only, 4.5:1; B. Text plus non-text 3:1 (WCAG 1.4.11); C. Text plus focus rings only | **A — text only, 4.5:1** | §4, §13 |
 | DL-004 | outputs | How should the gate decide what to measure? | A. Measure the rendered page; B. A hand-maintained token-pair table; C. Every ink token x every surface token | **A — measure the rendered page**; the only design that cannot be defeated by forgetting a pair, and the only one that sees composited `opacity` and `filter` | §5, §7 |
 | DL-005 | acceptance | Which stories are P0 -- the release fails without them? | A. The three recommended (dismissed row, amber pill, gate); B. Any subset of the four | **All four**, including the failure message, which moves up from P1: a gate that fails without saying what to change is a release blocker, not a follow-up | §5 |
+| DL-006 | non_functional | A-003's overturn condition has been met — should the guessed 60 s budget be replaced with the first real measurement? | A. Record the measurement, keep the 60 s budget as the ceiling; B. Tighten the ceiling to the measurement; C. Leave the guess in place | **A — measured 12.5 s on 31 surface-states and 678 nodes; budget stays 60 s.** Tightening to ~12 s would make the suite fail on any slower runner without a contrast defect existing, which is a flake, not a gate. The headroom is now 4.8x and is recorded rather than assumed. Supersedes A-003. | §13, A-003 |
 
 ## Coverage
 
