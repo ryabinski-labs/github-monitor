@@ -36,6 +36,31 @@
   --glow-red: rgba(255, 122, 112, 0.10);
   --glow-blue: rgba(112, 190, 241, 0.12);
 
+  /* Repository identity. Twelve hues assigned by a stable hash of owner/repo,
+     so a repo keeps its colour across reloads, themes and machines. This is
+     identity, not status: the ramp skips the three hue bands the status tokens
+     own -- red around 5, amber around 39, green around 148 -- and sits below
+     them in saturation, so a repo name can never be read as an alarm. The
+     colour lands only on the repo segment of the path --
+     a 10.5px monospace label in the row's top-left corner, where status never
+     appears. Status stays what it has always been: a filled pill and the row's
+     left edge bar. The name itself is still spelled out, so colour is never the
+     only thing carrying the meaning (WCAG 1.4.1).
+     Each value clears 4.5:1 against the hardest background it can land on --
+     the hover surface in dark, the card in light. */
+  --repo-1: #b1bf5a;
+  --repo-2: #89bf5a;
+  --repo-3: #60bf5a;
+  --repo-4: #5abfae;
+  --repo-5: #5ab1bf;
+  --repo-6: #73a4c9;
+  --repo-7: #8b9ed2;
+  --repo-8: #a198d7;
+  --repo-9: #b591d4;
+  --repo-10: #cb86d0;
+  --repo-11: #d188b8;
+  --repo-12: #d28b9e;
+
   --serif: ui-serif, Georgia, "Times New Roman", serif;
   --sans: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
@@ -73,6 +98,23 @@
   --flag: var(--red);
   --flag-soft: var(--red-soft);
   --flag-on-soft: var(--red);
+
+  /* Same twelve hues, re-solved against the light card so each still clears
+     4.5:1 there. Hue order is identical, so a repo does not change identity
+     when the theme flips -- only its lightness does. */
+  --repo-1: #6b7720;
+  --repo-2: #4c7d21;
+  --repo-3: #298122;
+  --repo-4: #217d6e;
+  --repo-5: #247c89;
+  --repo-6: #2e76ad;
+  --repo-7: #3054b5;
+  --repo-8: #4230b5;
+  --repo-9: #7730b5;
+  --repo-10: #ac30b5;
+  --repo-11: #b53089;
+  --repo-12: #b53054;
+
   --blue: #1f5c8c;
   --blue-soft: #d3e1ec;
   --violet: #65458f;
@@ -1311,6 +1353,40 @@ button.metric.active .metric-dot {
   color: var(--muted-strong);
   overflow-wrap: anywhere;
 }
+
+/* The owner repeats on every row and carries no information most of the time,
+   so it recedes and the repo segment -- the only part that differs -- becomes
+   the thing the eye lands on. */
+.repo-owner {
+  color: var(--muted);
+  /* The owner is one hyphenated word, and `overflow-wrap: anywhere` on .repo was
+     happily breaking it at the hyphen -- "ryabinski-" on one line, "labs/name"
+     on the next, which pushed the one word that matters down a line. Keep the
+     owner whole; if an owner really is too long for the column, it ellipsises
+     rather than spilling into the title. */
+  display: inline-block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
+}
+.repo-name {
+  font-weight: 600;
+  color: var(--muted-strong);
+}
+.repo-name[data-repo-colour="1"] { color: var(--repo-1); }
+.repo-name[data-repo-colour="2"] { color: var(--repo-2); }
+.repo-name[data-repo-colour="3"] { color: var(--repo-3); }
+.repo-name[data-repo-colour="4"] { color: var(--repo-4); }
+.repo-name[data-repo-colour="5"] { color: var(--repo-5); }
+.repo-name[data-repo-colour="6"] { color: var(--repo-6); }
+.repo-name[data-repo-colour="7"] { color: var(--repo-7); }
+.repo-name[data-repo-colour="8"] { color: var(--repo-8); }
+.repo-name[data-repo-colour="9"] { color: var(--repo-9); }
+.repo-name[data-repo-colour="10"] { color: var(--repo-10); }
+.repo-name[data-repo-colour="11"] { color: var(--repo-11); }
+.repo-name[data-repo-colour="12"] { color: var(--repo-12); }
 
 .title {
   margin-top: 2px;

@@ -610,6 +610,85 @@ function escapeHtml(value) {
     .replaceAll("'", "&#039;");
 }
 
+// Every row in a dense list begins with the same owner, so the one word that
+// distinguishes them sits fifteen identical characters in. Two things fix that:
+// the owner recedes, and the repo segment takes a colour of its own.
+//
+// Assignment is a small persisted registry rather than a hash of the name. A
+// hash is tempting -- no state, same answer everywhere -- but with nine repos
+// over twelve slots even a perfect hash collides: the expected number of
+// distinct hues is 12 * (1 - (11/12)^9), about 6.6. Two repos sharing a colour
+// on the same screen is precisely the thing this is meant to fix, so the
+// registry hands out a slot nothing else is using and remembers it. A repo then
+// keeps that colour for good, which is what makes it learnable.
+//
+// The order is not 1, 2, 3: those are neighbouring hues, and the first three
+// repos are the ones most likely to be on screen together. It steps around the
+// wheel instead, so a two-repo board gets opposite colours.
+const REPO_COLOUR_COUNT = 12;
+const REPO_COLOUR_ORDER = [1, 7, 4, 10, 2, 8, 5, 11, 3, 9, 6, 12];
+const REPO_COLOUR_KEY = "pr-deck:repo-colours:v1";
+
+let repoColours = null;
+
+function loadRepoColours() {
+  if (repoColours) return repoColours;
+  repoColours = new Map();
+  try {
+    const stored = JSON.parse(localStorage.getItem(REPO_COLOUR_KEY) || "{}");
+    for (const [repo, slot] of Object.entries(stored)) {
+      if (Number.isInteger(slot) && slot >= 1 && slot <= REPO_COLOUR_COUNT) repoColours.set(repo, slot);
+    }
+  } catch {
+    // A blocked or corrupt store is not worth a broken dashboard over: the board
+    // just starts assigning again from an empty registry.
+  }
+  return repoColours;
+}
+
+function repoColour(repo) {
+  const value = String(repo ?? "");
+  if (!value) return 0;
+  const known = loadRepoColours();
+  const existing = known.get(value);
+  if (existing) return existing;
+
+  const used = new Set(known.values());
+  // Past twelve repos every slot is taken and colours have to repeat. Reuse the
+  // least-loaded one rather than the first, so the thirteenth repo collides with
+  // one other and not with four.
+  let slot = REPO_COLOUR_ORDER.find((candidate) => !used.has(candidate));
+  if (!slot) {
+    const load = new Map(REPO_COLOUR_ORDER.map((candidate) => [candidate, 0]));
+    for (const taken of known.values()) load.set(taken, (load.get(taken) || 0) + 1);
+    slot = REPO_COLOUR_ORDER.reduce((best, candidate) => (load.get(candidate) < load.get(best) ? candidate : best));
+  }
+
+  known.set(value, slot);
+  try {
+    localStorage.setItem(REPO_COLOUR_KEY, JSON.stringify(Object.fromEntries(known)));
+  } catch {
+    // Same as above: an unwritable store costs persistence, not the colour.
+  }
+  return slot;
+}
+
+// Splits on the LAST slash so a nested path keeps its tail as the name. A value
+// with no slash at all -- or no value -- still renders, just uncoloured, because
+// a missing owner is not a reason to drop the label.
+function renderRepoLabel(repo) {
+  const value = String(repo ?? "");
+  if (!value) return '<div class="repo"></div>';
+  const cut = value.lastIndexOf("/");
+  if (cut <= 0 || cut === value.length - 1) {
+    return `<div class="repo"><span class="repo-name" data-repo-colour="${repoColour(value)}">${escapeHtml(value)}</span></div>`;
+  }
+  return (
+    `<div class="repo"><span class="repo-owner">${escapeHtml(value.slice(0, cut + 1))}</span>` +
+    `<span class="repo-name" data-repo-colour="${repoColour(value)}">${escapeHtml(value.slice(cut + 1))}</span></div>`
+  );
+}
+
 function formatTime(value) {
   if (!value) return "";
   const date = new Date(value);
@@ -2419,7 +2498,7 @@ function renderPrRow(row, view) {
   return `
     <article class="row${dismissed ? " row-dismissed" : ""}${row.hasConflict ? " row-conflict" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
-        <div class="repo">${escapeHtml(row.repo)}</div>
+        ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title)}</div>
       </div>
       <div class="meta">${escapeHtml(row.numberLabel)} · @${escapeHtml(row.author)}</div>
@@ -2467,7 +2546,7 @@ function renderCdRow(row, view, viewKey) {
   return `
     <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
-        <div class="repo">${escapeHtml(row.repo)}</div>
+        ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
       </div>
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
@@ -2560,7 +2639,7 @@ function renderTraceRow(row) {
     <article class="trace-card trace-${escapeHtml(row.status || "active")}${dismissed ? " row-dismissed" : ""}" style="--accent: var(--${tone}); --soft: var(--${tone}-soft);" aria-label="${escapeHtml(row.repo)} ${escapeHtml(row.numberLabel || `#${row.prNumber}`)} pipeline trace">
       <div class="trace-card-head">
         <div class="row-main">
-          <div class="repo">${escapeHtml(row.repo)}</div>
+          ${renderRepoLabel(row.repo)}
           <div class="title">${escapeHtml(row.numberLabel || `#${row.prNumber}`)} ${escapeHtml(row.title)}</div>
         </div>
         <div class="tag tag-${escapeHtml(statusClass(row.severity || row.status))}">${escapeHtml(status)}</div>
@@ -2889,7 +2968,7 @@ function renderFinishedCdRow(row, view) {
     <article class="cd-card" data-outcome="${escapeHtml(outcome || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="cd-card-head row" data-href="${escapeHtml(row.url || "")}">
         <div class="row-main">
-          <div class="repo">${escapeHtml(row.repo)}</div>
+          ${renderRepoLabel(row.repo)}
           <div class="title">${escapeHtml(row.title || row.workflow)}</div>
         </div>
         <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
@@ -2943,7 +3022,7 @@ function renderWorkflowRunRow(row, view) {
   return `
     <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
-        <div class="repo">${escapeHtml(row.repo)}</div>
+        ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
       </div>
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
@@ -2963,7 +3042,7 @@ function renderDeploymentRow(row, view) {
   return `
     <article class="row${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="--accent: var(--${view.color}); --soft: var(--${view.color}-soft);">
       <div class="row-main">
-        <div class="repo">${escapeHtml(row.repo)}</div>
+        ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.environment || "Deployment")}</div>
       </div>
       <div class="meta">${escapeHtml(row.ref)} ${escapeHtml(row.task)}</div>

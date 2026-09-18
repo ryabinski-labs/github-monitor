@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ## [Unreleased]
 
+### Added
+
+- **Repository colours.** Every row's repo name now carries a colour of its own, so a board drawn from nine repos can be scanned by shape rather than read word by word. The owner is de-emphasised -- it repeats on every row and is rarely the part you are looking for -- and the repo segment takes the colour. A repo keeps its colour for good: the assignment is a small registry in `localStorage`, which hands out a slot nothing else is using rather than hashing the name, because with nine repos over twelve slots a hash collides more often than not. The palette deliberately skips the three hue bands the status colours own -- red, amber and green -- so a repo name can never be misread as an alarm, and every value clears 4.5:1 on both the row and the hover surface in both themes.
+
 ### Fixed
 
 - **Out of date** measured the wrong thing. The lane read `aheadBy` from the base-to-head comparison, which is how many commits the PR *adds*, not how far it has fallen behind. The effect was that every PR with any commits of its own was flagged as stale, every genuinely stale PR was missed, and the pill's number was the PR's own commit count. `Ref.compare(headRef:)` describes the head relative to the base exactly as `/compare/<base>...<head>` does, so the field is `behindBy`; measured against both the REST endpoint and `git rev-list --count`. On the twelve PRs open here that is the difference between flagging ten and flagging the four that are actually behind.
