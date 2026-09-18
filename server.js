@@ -2020,11 +2020,25 @@ function runningCheckLabel(check) {
 //    nothing moved spends nothing, and a scan after a push to main costs one
 //    request per 50 affected PRs.
 //
-// 2. The spec asked for `baseRef.compare(headRef:).behindBy`. That field counts
-//    how far the *base* is behind the head, which is the PR's ahead count. The
-//    number this lane is about -- how far the head is behind the base -- is
-//    `aheadBy` on the same comparison. Measured: a branch five commits behind
-//    main reports { behindBy: 0, aheadBy: 5, status: AHEAD } from the base ref.
+// 2. `baseRef.compare(headRef: <head>)` describes the HEAD ref relative to the
+//    receiver, exactly like the REST endpoint `/compare/<base>...<head>`. So
+//    `behindBy` is how far the head is behind the base -- the number this lane
+//    is about -- and `aheadBy` is the PR's own commit count.
+//
+//    This was briefly implemented the other way round, on a misread of a single
+//    measurement, and shipped in #127: the lane then flagged every PR that had
+//    any commits of its own and never flagged one that was actually stale. Two
+//    checks pin it down, both re-runnable:
+//
+//      REST     /repos/ryabinski-labs/waf/compare/main...feat/remove-password-path
+//               -> { ahead_by: 4, behind_by: 9, status: "diverged" }
+//      GraphQL  ref("refs/heads/main").compare(headRef: "feat/remove-password-path")
+//               -> { aheadBy: 4, behindBy: 9, status: DIVERGED }
+//
+//    and, against a revision git can count independently, a ref four commits
+//    behind main with nothing of its own reports { aheadBy: 0, behindBy: 4,
+//    status: BEHIND } -- matching `git rev-list --count <rev>..main` = 4 and
+//    `git rev-list --count main..<rev>` = 0.
 const BEHIND_COMPARE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 const BEHIND_COMPARE_CHUNK = 50;
 
@@ -2069,7 +2083,7 @@ function buildBehindCompareQuery(chunk) {
     selections.push(
       `  pr${index}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {\n` +
         `    pullRequest(number: ${pr.number}) {\n` +
-        `      baseRef { compare(headRef: $h${index}) { aheadBy } }\n` +
+        `      baseRef { compare(headRef: $h${index}) { behindBy } }\n` +
         `    }\n` +
         `  }`
     );
@@ -2113,7 +2127,7 @@ async function fetchBehindCounts(pullRequests) {
         continue;
       }
       chunk.forEach((pr, index) => {
-        const behindBy = normalizeBehindBy(json?.data?.[`pr${index}`]?.pullRequest?.baseRef?.compare?.aheadBy);
+        const behindBy = normalizeBehindBy(json?.data?.[`pr${index}`]?.pullRequest?.baseRef?.compare?.behindBy);
         pr.behindBy = behindBy;
         // Stored as 0 rather than undefined when the compare gave no usable
         // answer, because the cache treats undefined as a miss -- and a PR whose
@@ -2163,7 +2177,7 @@ function classifyPullRequest(pr) {
     baseRefName: pr.baseRefName || "",
     headRefName: pr.headRefName || "",
     headRepo: pr.headRepository?.nameWithOwner || "",
-    behindBy: normalizeBehindBy(pr.baseRef?.compare?.aheadBy)
+    behindBy: normalizeBehindBy(pr.baseRef?.compare?.behindBy)
   };
   if (!checks.length) {
     return { ...base, state: "pass", checkCount: 0, runningChecks: [] };

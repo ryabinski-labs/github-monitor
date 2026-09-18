@@ -3,7 +3,7 @@ feature: pr-behind-base
 title: Out-of-date PR lane with Update branch action
 source:
   prd: docs/prd/pr-behind-base.md
-  prd_sha256: 9c54d9bb044c2da68e34bd135485e5862c242a535253c4b32cb2c21aa6192211
+  prd_sha256: 7b5e536614a8674aa108badbf2eac4d0c12c530f06b1db294d9557ec905c87e2
 defaults:
   priority: P2
 
@@ -63,6 +63,27 @@ requirements:
         status: green
         test_ref: 'test/behind-base.test.js::SC-detect-same-repo-headref: a same-repo PR compares against a bare branch name'
         doubles: 'GitHub GraphQL transport replaced by a recording stub'
+      - id: SC-detect-compare-field
+        level: integration
+        title: the compare reads how far the head is behind, not its own commit count
+        given: a compare that answers behindBy 9 and aheadBy 3 for a PR the cache has never seen
+        when: the compare pass resolves the count onto the PR
+        then: the PR carries behindBy 9, and the wire query selected behindBy and never aheadBy
+        oracle: 'the sent query matches /behindBy/ and not /aheadBy/, and pr.behindBy === 9'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-detect-compare-field: the compare reads how far the head is behind, not its own commit count'
+        priority: P0
+        doubles: 'globalThis.fetch is replaced to capture the sent query and return a fixed compare'
+        tags: [regression, defect]
+        notes: >-
+          ADDED 2026-09-18 during production validation of #127, which shipped the lane reading
+          the wrong compare field. Ref.compare(headRef:) describes the head relative to the
+          receiver, exactly like REST /compare/<base>...<head>: behindBy is how far the head has
+          fallen behind, aheadBy is what the PR contributes. Reading aheadBy flagged every PR
+          with any commits of its own and never flagged a stale one. No scenario in the original
+          artifact could tell the two apart, because every fixture set only one of them -- so the
+          fixtures now set both, to different values, and this scenario pins the field name on
+          the wire. See R-006 in the PRD for the ground-truth measurements.
       - id: SC-detect-no-extra-requests
         level: integration
         title: a scan where nothing moved costs no compare request
