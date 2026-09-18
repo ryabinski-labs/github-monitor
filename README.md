@@ -158,6 +158,7 @@ All optional except your chosen auth path. Set via environment or `.env`.
 | `SCAN_REPO_FLOOR` | Always scan this many most-recently-pushed repos, whatever the window says (default `10`) |
 | `DEPENDABOT_QUEUE_THRESHOLD` | Enables Dependabot cleanup (disabled by default); its value (`1`–`5000`) is the queued workflow-run depth that additionally triggers run cancellation |
 | `DEPENDABOT_QUEUE_OWNERS` | Optional comma-separated owner allowlist for automatic cleanup |
+| `AUTO_DISMISS_CANCELLED_RUNS` | Set to `0` to keep cancelled workflow runs in the actionable Failing CI list (auto-dismissed by default) |
 | `ETAG_CACHE_DISABLED` | Set to `1` to disable conditional-request caching (debugging) |
 
 ### Scan scope
