@@ -1462,7 +1462,7 @@ button.metric.active .metric-dot {
   justify-self: end;
 }
 
-.open-link, .merge-button, .close-button, .rerun-button {
+.open-link, .merge-button, .close-button, .rerun-button, .update-button {
   display: inline-flex;
   gap: 4px;
   justify-content: center;
@@ -1557,6 +1557,11 @@ button.metric.active .metric-dot {
   color: var(--red);
   opacity: 1;
 }
+/* Geometry, micro-caps and radius come from the shared row-action rule above;
+   only the colour role lives here. No min-width: at 1440 the action group is
+   already ~19px oversubscribed and flex-shrink pays for it out of .open-link,
+   so reserving width for the "Update branch" -> "Updating" -> "Updated" label
+   walk would wrap OPEN PR onto two lines permanently. */
 .update-button {
   border-color: var(--amber);
   background: var(--amber);
@@ -1577,10 +1582,6 @@ button.metric.active .metric-dot {
   color: var(--amber-on-soft);
   cursor: default;
   opacity: 1;
-}
-.update-button:focus-visible {
-  outline: 2px solid var(--ink);
-  outline-offset: 2px;
 }
 
 [data-view="behind"] .merge-button:not(:disabled),
@@ -1615,7 +1616,8 @@ button.metric.active .metric-dot {
 .open-link:focus-visible,
 .merge-button:focus-visible,
 .close-button:focus-visible,
-.rerun-button:focus-visible {
+.rerun-button:focus-visible,
+.update-button:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
