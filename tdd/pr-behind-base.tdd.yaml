@@ -1,0 +1,552 @@
+schema: tdd-artifact/v1
+feature: pr-behind-base
+title: Out-of-date PR lane with Update branch action
+source:
+  prd: docs/prd/pr-behind-base.md
+  prd_sha256: 9c54d9bb044c2da68e34bd135485e5862c242a535253c4b32cb2c21aa6192211
+defaults:
+  priority: P2
+
+non_goals:
+  - 'No bulk "Update all" action; the per-row button is the only trigger (PRD section 4, DL-004).'
+  - 'No server-side auto-update; the server never calls update-branch without a click (PRD section 4, DL-001).'
+  - 'No rebase update method; the button always produces a merge commit (PRD section 4, DL-003).'
+  - 'No header toggle for the lane; it is always on (PRD section 7, DL-010).'
+  - 'Branch protection settings are not read, so the UI never explains why GitHub considers a branch out of date (PRD section 7).'
+  - 'No change to conflict handling, auto-merge, CD tracing, deployments or runners (PRD section 7).'
+
+open_questions: []
+
+requirements:
+  - id: REQ-detection
+    text: >-
+      A scan records, for every open PR, how many commits its head branch is behind its base
+      branch, using the GraphQL query the scan already issues and no additional HTTP request.
+    priority: P0
+    type: functional
+    prd_ref: 'section 12 Integrations; DL-002'
+    scenarios:
+      - id: SC-detect-behind-count
+        level: unit
+        title: behindBy is lifted from the compare field onto the PR object
+        given: a GraphQL PullRequest node whose baseRef.compare reports behindBy 12 and whose baseRefName is main
+        when: classifyPullRequest normalizes the node
+        then: the returned PR object carries behindBy 12 and baseRefName main
+        oracle: 'classifyPullRequest(node).behindBy === 12 && classifyPullRequest(node).baseRefName === "main"'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-detect-behind-count: behindBy is lifted from the compare field onto the PR object'
+        doubles: 'none - classifyPullRequest is a pure function over the node'
+        data:
+          behindBy: 12
+          baseRefName: main
+      - id: SC-detect-fork-headref
+        level: unit
+        title: a fork PR compares against an owner-qualified head ref
+        given: a PR whose head repository is forkowner/repo and whose head branch is feat/x while the base repository is ryabinski-labs/repo
+        when: the scan builds the compare argument for that PR
+        then: the head ref passed to compare is the owner-qualified string forkowner:feat/x
+        oracle: 'the headRef argument sent in the GraphQL variables === "forkowner:feat/x"'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-detect-fork-headref: a fork PR compares against an owner-qualified head ref'
+        doubles: 'GitHub GraphQL transport replaced by a recording stub; the query builder is real'
+        data:
+          headRepo: forkowner/repo
+          headRefName: feat/x
+          baseRepo: ryabinski-labs/repo
+      - id: SC-detect-same-repo-headref
+        level: unit
+        title: a same-repo PR compares against a bare branch name
+        given: a PR whose head and base repositories are both ryabinski-labs/repo and whose head branch is feat/x
+        when: the scan builds the compare argument for that PR
+        then: the head ref passed to compare is the bare string feat/x with no owner prefix
+        oracle: 'the headRef argument sent in the GraphQL variables === "feat/x"'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-detect-same-repo-headref: a same-repo PR compares against a bare branch name'
+        doubles: 'GitHub GraphQL transport replaced by a recording stub'
+      - id: SC-detect-no-extra-requests
+        level: integration
+        title: a scan where nothing moved costs no compare request
+        given: a PR whose base and head SHAs are unchanged since the previous scan
+        when: the compare pass runs again
+        then: the count is answered from the cache and no request is issued
+        oracle: 'fetchBehindCounts issues exactly one batched request for an unseen SHA pair, zero for an unchanged one, and one again once the base SHA moves'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-detect-no-extra-requests: a scan where nothing moved costs no compare request'
+        priority: P0
+        doubles: 'globalThis.fetch is replaced so requests can be counted; the cache is the real module-level one, reset either side'
+        tags: [nfr, quota]
+        notes: >-
+          REWRITTEN 2026-09-18. The original oracle asserted the compare rides inside
+          PR_SEARCH_GRAPHQL for +0 requests. It cannot: Ref.compare(headRef: String!) takes a
+          static argument and the head ref differs per node, so a bulk search over 100 PRs
+          cannot name each one's head. Verified against the live API -- a static alias resolves
+          the same branch name for every node, and a name missing in one repository returns a
+          NOT_FOUND errors entry for that node. The honest guardrail is the steady state: the
+          compare is keyed on the base and head SHAs, so a rescan that finds nothing moved is
+          free and a push to the base costs one request per 50 affected PRs.
+
+  - id: REQ-behind-lane
+    text: >-
+      An open PR that is behind its base branch and has no merge conflict appears in the
+      behind group and in no other pull-request group.
+    priority: P0
+    type: functional
+    prd_ref: 'section 5 story S1; DL-001'
+    scenarios:
+      - id: SC-lane-status-payload
+        level: integration
+        title: the behind lane reaches /api/status, not just groupPullRequests
+        given: a scan whose search returns one PR and whose compare reports it nine commits behind
+        when: /api/status is requested from the real server
+        then: the lane arrives populated in the payload and the PR is in no other lane
+        oracle: 'data.pullRequests.behind has length 1 with behindBy 9, data.summary.behindPrs is 1, and pass/noCi/fail/running/conflicts are all empty'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-lane-status-payload: the behind lane reaches /api/status, not just groupPullRequests'
+        priority: P0
+        doubles: 'globalThis.fetch is stubbed; the real http server and the real scan pipeline run'
+        tags: [wiring]
+        notes: >-
+          ADDED 2026-09-18 during implementation. groupPullRequests can be correct and still
+          never be reached with a behindBy on it, because the scan resolves the compare in a
+          second pass. A lane the pass skips is a lane that is always empty on the only surface
+          the dashboard reads -- the same wiring gap that made an earlier auto-dismiss change
+          fix a lane the operator was not looking at.
+
+      - id: SC-lane-exclusive
+        level: unit
+        title: a behind PR leaves every other lane
+        given: an open PR with behindBy 3, hasConflict false and passing checks
+        when: groupPullRequests partitions the scanned PRs
+        then: the PR is present in the behind group and absent from pass, noCi, fail and running
+        oracle: 'groups.behind includes the PR and none of groups.pass, groups.noCi, groups.fail, groups.running includes it'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-lane-exclusive: a behind PR leaves every other lane'
+        doubles: 'none - groupPullRequests is a pure function over the PR list'
+        data:
+          behindBy: 3
+          hasConflict: false
+          state: pass
+      - id: SC-lane-failing-and-behind
+        level: unit
+        title: a failing PR that is also behind lands in the behind lane, not Failing CI
+        given: an open PR with behindBy 5, hasConflict false and a failing required check
+        when: groupPullRequests partitions the scanned PRs
+        then: the PR is present in the behind group and absent from fail
+        oracle: 'groups.behind includes the PR and groups.fail does not'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-lane-failing-and-behind: a failing PR that is also behind lands in the behind lane, not Failing CI'
+        doubles: none
+        data:
+          behindBy: 5
+          state: fail
+        tags: [screenshot-case]
+      - id: SC-lane-not-behind-unchanged
+        level: unit
+        title: a PR that is level with its base is grouped exactly as before
+        given: an open PR with behindBy 0 and passing checks
+        when: groupPullRequests partitions the scanned PRs
+        then: the PR is present in the pass group and absent from behind
+        oracle: 'groups.pass includes the PR and groups.behind does not'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-lane-not-behind-unchanged: a PR that is level with its base is grouped exactly as before'
+        doubles: none
+      - id: SC-journey-unstick
+        level: acceptance
+        title: the operator finds a stuck PR and unsticks it without leaving the dashboard
+        given: a dashboard served a scan in which one passing PR is 3 commits behind main and the stubbed server accepts the update
+        when: the operator opens the Out of date view, clicks Update branch on that row, and the follow-up scan reports the PR no longer behind
+        then: the PR was visible in the lane, the update was accepted, and after the refresh the lane is empty and the PR is back in Passing CI
+        oracle: 'before the click navBehind is "1"; after the click and the follow-up scan navBehind is "0", navPass increased by 1, and exactly 1 POST to /api/pull-request/update-branch was recorded'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-journey-unstick: the operator finds a stuck PR and unsticks it without leaving the dashboard'
+        doubles: 'server stubbed at the /api/status and /api/pull-request/update-branch boundaries; the real front end runs in Playwright'
+        tags: [journey]
+      - id: SC-lane-rail-count
+        level: integration
+        title: the rail count equals the size of the lane
+        given: a dashboard served a scan containing 4 behind PRs and 6 PRs that are not behind
+        when: the operator loads the dashboard
+        then: the Out of date rail item reads 4 and selecting it renders 4 rows
+        oracle: 'navBehind textContent is "4" and the content area holds 4 .row elements after selecting the view'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-lane-rail-count: the rail count equals the size of the lane'
+        doubles: 'server responses stubbed at the /api/status boundary; the real front end runs in Playwright'
+
+  - id: REQ-conflict-precedence
+    text: >-
+      A PR that is both behind its base branch and conflicting appears in the conflicts
+      group and not in the behind group.
+    priority: P0
+    type: functional
+    prd_ref: 'section 5 story S1; DL-005'
+    scenarios:
+      - id: SC-precedence-conflict-wins
+        level: unit
+        title: conflicts beat behind
+        given: an open PR with behindBy 7 and hasConflict true
+        when: groupPullRequests partitions the scanned PRs
+        then: the PR is present in the conflicts group and absent from behind
+        oracle: 'groups.conflicts includes the PR and groups.behind does not'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-precedence-conflict-wins: conflicts beat behind'
+        doubles: none
+        data:
+          behindBy: 7
+          hasConflict: true
+      - id: SC-precedence-no-update-button
+        level: integration
+        title: a conflicting PR offers no Update branch button
+        given: a dashboard served a scan containing one PR that is both conflicting and behind
+        when: the operator opens the Conflicts view
+        then: the row carries no Update branch button, because GitHub would reject the call
+        oracle: 'the conflicting row contains 0 elements matching .update-button'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-precedence-no-update-button: a conflicting PR offers no Update branch button'
+        negative: true
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+
+  - id: REQ-fail-open
+    text: >-
+      When behindBy is missing or is not a positive integer, the PR is grouped exactly as it
+      is today and never enters the behind lane.
+    priority: P1
+    type: functional
+    prd_ref: 'section 5 story S5; A-003'
+    scenarios:
+      - id: SC-failopen-missing-field
+        level: unit
+        title: a missing behindBy groups the PR as before
+        given: a passing open PR whose behindBy is undefined because the compare field was unavailable
+        when: groupPullRequests partitions the scanned PRs
+        then: the PR is present in the pass group and the behind group is empty
+        oracle: 'groups.pass includes the PR and groups.behind has length 0'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-failopen-missing-field: a missing behindBy groups the PR as before'
+        doubles: none
+      - id: SC-failopen-bad-values
+        level: unit
+        title: null, negative and non-numeric behindBy values never enter the lane
+        given: passing open PRs whose behindBy values are null, minus one, zero and the string "3"
+        when: groupPullRequests partitions the scanned PRs
+        then: none of them appear in the behind group
+        oracle: 'groups.behind has length 0 for every listed behindBy value'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-failopen-bad-values: null, negative and non-numeric behindBy values never enter the lane'
+        negative: true
+        doubles: none
+
+  - id: REQ-update-endpoint
+    text: >-
+      POST /api/pull-request/update-branch with repo and number calls GitHub PUT
+      /repos/{repo}/pulls/{number}/update-branch with no update_method field.
+    priority: P0
+    type: functional
+    prd_ref: 'section 5 story S2; DL-003'
+    scenarios:
+      - id: SC-endpoint-calls-github
+        level: integration
+        title: the route issues the documented GitHub call
+        given: a running server with a stubbed GitHub transport
+        when: POST /api/pull-request/update-branch is called with repo ryabinski-labs/github-monitor and number 118
+        then: exactly one GitHub call is made, PUT to the update-branch path for that PR, whose body contains no update_method key
+        oracle: 'exactly 1 stubbed GitHub call, method PUT, path /repos/ryabinski-labs/github-monitor/pulls/118/update-branch, and update_method is absent from the request body'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-endpoint-calls-github: the route issues the documented GitHub call'
+        doubles: 'GitHub HTTP transport stubbed; the real route handler and body parsing run'
+        data:
+          repo: ryabinski-labs/github-monitor
+          number: 118
+      - id: SC-endpoint-rejects-get
+        level: integration
+        title: the route refuses a non-POST method
+        given: a running server
+        when: GET /api/pull-request/update-branch is requested
+        then: the response status is 405 and no GitHub call is made
+        oracle: 'response status is 405 and the stubbed GitHub transport recorded 0 calls'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-endpoint-rejects-get: the route refuses a non-POST method'
+        negative: true
+        doubles: 'GitHub HTTP transport stubbed and asserted untouched'
+      - id: SC-endpoint-validates-input
+        level: integration
+        title: a malformed repo or number is rejected before GitHub is called
+        given: a running server
+        when: POST /api/pull-request/update-branch is called with repo "not-a-repo" or number 0
+        then: the response status is 400 and no GitHub call is made
+        oracle: 'response status is 400 and the stubbed GitHub transport recorded 0 calls'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-endpoint-validates-input: a malformed repo or number is rejected before GitHub is called'
+        negative: true
+        doubles: 'GitHub HTTP transport stubbed and asserted untouched'
+
+  - id: REQ-update-button
+    text: >-
+      An Out-of-date row carries an Update branch button that moves through ready, in-flight
+      and done states and issues exactly one request per click.
+    priority: P0
+    type: functional
+    prd_ref: 'section 5 story S2; section 6'
+    scenarios:
+      - id: SC-button-present-and-ordered
+        level: integration
+        title: the button renders before Merge in the row actions
+        given: a dashboard served a scan containing one behind, passing PR
+        when: the operator opens the Out of date view
+        then: the row action group contains an Update branch button positioned before the Merge button
+        oracle: 'within one .row-actions, the .update-button index is lower than the .merge-button index'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-button-present-and-ordered: the button renders before Merge in the row actions'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+      - id: SC-button-inflight-single-request
+        level: acceptance
+        title: a second click during the request issues no second request
+        given: an Out-of-date row whose update request is held open by the stubbed server
+        when: the operator clicks Update branch twice in quick succession
+        then: the button reads Updating and is disabled, and the server recorded exactly one request
+        oracle: 'button is disabled, its text is "Updating", and the stub server received exactly 1 POST to /api/pull-request/update-branch'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-button-inflight-single-request: a second click during the request issues no second request'
+        doubles: 'server stubbed with a deferred response; real front end in Playwright'
+      - id: SC-button-success-state
+        level: acceptance
+        title: a successful update reports itself and refreshes
+        given: an Out-of-date row and a stubbed server that returns 200
+        when: the operator clicks Update branch
+        then: the button reads Updated and stays disabled, a toast titled Branch updated names the repo and PR number, and a follow-up scan is requested
+        oracle: 'button text is "Updated", button is disabled, a toast containing "Branch updated" exists, and a follow-up GET /api/status was issued'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-button-success-state: a successful update reports itself and refreshes'
+        doubles: 'server stubbed at the API boundary; real front end in Playwright'
+
+  - id: REQ-update-failure
+    text: >-
+      A rejected update surfaces GitHub own message, returns the button to its enabled state,
+      removes no row and shows no success toast.
+    priority: P0
+    type: functional
+    prd_ref: 'section 5 story S3; DL-009'
+    scenarios:
+      - id: SC-failure-403-message
+        level: acceptance
+        title: a 403 shows GitHub message and re-enables the button
+        given: a stubbed server returning 403 with the message "refusing to allow a GitHub App to update this branch"
+        when: the operator clicks Update branch
+        then: a toast titled Update failed carries that message verbatim, the error panel shows the same message, and the button is enabled and reads Update branch
+        oracle: 'the toast text and the errorPanel text both contain "refusing to allow a GitHub App to update this branch", the button is enabled, and its text is "Update branch"'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-failure-403-message: a 403 shows GitHub''s message and re-enables the button'
+        negative: true
+        doubles: 'server stubbed at the API boundary; real front end in Playwright'
+        data:
+          status: 403
+          message: refusing to allow a GitHub App to update this branch
+      - id: SC-failure-row-survives
+        level: acceptance
+        title: a failed update removes nothing from the lane
+        given: an Out of date view showing 3 rows and a stubbed server returning 422
+        when: the operator clicks Update branch on the first row
+        then: the lane still shows 3 rows, the rail count still reads 3, and no success toast appeared
+        oracle: 'the content area holds 3 .row elements, navBehind textContent is "3", and no toast containing "Branch updated" exists'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-failure-row-survives: a failed update removes nothing from the lane'
+        negative: true
+        doubles: 'server stubbed at the API boundary; real front end in Playwright'
+      - id: SC-failure-transport-recovers
+        level: integration
+        title: a network-level failure never leaves the button stuck
+        given: an Out-of-date row and a server that closes the connection without responding
+        when: the operator clicks Update branch and the request rejects
+        then: a toast titled Update failed appears and the button returns to enabled
+        oracle: 'a toast containing "Update failed" exists and the button is not disabled'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-failure-transport-recovers: a network-level failure never leaves the button stuck'
+        negative: true
+        doubles: 'server stubbed to abort the connection; real front end in Playwright'
+
+  - id: REQ-behind-notification
+    text: >-
+      A PR newly entering the behind lane notifies once, and only when being behind is its
+      only blocker.
+    priority: P1
+    type: functional
+    prd_ref: 'section 5 story S4; DL-007, DL-008'
+    scenarios:
+      - id: SC-notify-stuck-only
+        level: integration
+        title: a passing, non-draft, non-conflicting newly behind PR notifies once
+        given: a previous snapshot without the PR in the behind set and a new snapshot containing it with state pass, isDraft false and hasConflict false
+        when: the notification pass runs
+        then: one popup is produced with title "Branch out of date", a body naming the repo, number label and title, and a tag of the form behind colon prKey
+        oracle: 'sendPopup was called exactly once, with title "Branch out of date" and a tag beginning "behind:"'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-notify-stuck-only: a passing, non-draft, non-conflicting newly behind PR notifies once'
+        doubles: 'sendPopup recorded by a spy; the snapshot-diff logic is real'
+      - id: SC-notify-suppressed-when-other-blockers
+        level: integration
+        title: failing, running, draft and no-CI PRs entering the lane stay silent
+        given: a previous snapshot without the PRs and a new snapshot adding four behind PRs whose states are fail, running, draft and checkCount zero
+        when: the notification pass runs
+        then: no popup and no inbox entry is produced for any of them
+        oracle: 'sendPopup was called 0 times'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-notify-suppressed-when-other-blockers: failing, running, draft and no-CI PRs entering the lane stay silent'
+        negative: true
+        doubles: 'sendPopup recorded by a spy'
+      - id: SC-notify-no-repeat
+        level: integration
+        title: a PR already in the lane does not re-notify on the next scan
+        given: a PR present in the behind set of both the previous and the new snapshot
+        when: the notification pass runs
+        then: no popup is produced
+        oracle: 'sendPopup was called 0 times for that PR key'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-notify-no-repeat: a PR already in the lane does not re-notify on the next scan'
+        negative: true
+        doubles: 'sendPopup recorded by a spy; the wasNotified TTL store is real'
+
+  - id: REQ-behind-pill
+    text: >-
+      An Out-of-date row shows a pill reading the behind count and the base branch, whose title
+      carries the full sentence, truncating a long base branch name rather than overflowing.
+    priority: P1
+    type: functional
+    prd_ref: 'section 5 story S5; section 6; A-002'
+    scenarios:
+      - id: SC-pill-plural-copy
+        level: integration
+        title: the pill shows the count and the base branch
+        given: a behind PR with behindBy 12 on base main
+        when: the Out of date view renders
+        then: the pill visible text reads "12 BEHIND MAIN" and its title begins "12 commits behind main"
+        oracle: 'the whitespace-normalized .behind-pill text is "12 BEHIND MAIN" and its title attribute starts with "12 commits behind main"'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-pill-plural-copy: the pill shows the count and the base branch'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+        data:
+          behindBy: 12
+          baseRefName: main
+      - id: SC-pill-singular-copy
+        level: integration
+        title: a single commit behind reads in the singular
+        given: a behind PR with behindBy 1 on base main
+        when: the Out of date view renders
+        then: the pill title reads in the singular and never says "1 commits"
+        oracle: 'the .behind-pill title starts with "1 commit behind main" and does not contain "1 commits"'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-pill-singular-copy: a single commit behind reads in the singular'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+      - id: SC-pill-long-branch-no-overflow
+        level: integration
+        title: a long base branch name truncates instead of overflowing the row
+        given: a behind PR whose base branch is release/2026-09-hotfix-candidate and a 1280px viewport
+        when: the Out of date view renders
+        then: the pill truncates the branch name, the title carries the untruncated name, and the page has no horizontal scrollbar
+        oracle: 'documentElement scrollWidth is at most 1280, the .behind-pill title contains "release/2026-09-hotfix-candidate", and the ref span scrollWidth exceeds its clientWidth'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-pill-long-branch-no-overflow: a long base branch name truncates instead of overflowing the row'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+        data:
+          baseRefName: release/2026-09-hotfix-candidate
+          viewportWidth: 1280
+        tags: [layout]
+
+  - id: REQ-lane-actions
+    text: >-
+      An Out-of-date row keeps Merge, Close, Open PR and, when failing, Rerun failed, and
+      renders exactly one filled button, which is Update branch.
+    priority: P1
+    type: functional
+    prd_ref: 'section 5 story S6; DL-006, A-009'
+    scenarios:
+      - id: SC-actions-merge-available
+        level: integration
+        title: a mergeable behind PR keeps an enabled Merge button
+        given: a behind PR whose checks pass, which is not a draft and has no conflict
+        when: the Out of date view renders
+        then: the row carries an enabled Merge button alongside Update branch
+        oracle: 'a .merge-button exists in the row and is not disabled'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-actions-merge-available: a mergeable behind PR keeps an enabled Merge button'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+      - id: SC-actions-merge-blocked-reason
+        level: integration
+        title: a non-mergeable behind PR disables Merge and states why
+        given: a behind PR that is a draft
+        when: the Out of date view renders
+        then: the Merge button is disabled and its title states that draft pull requests cannot be merged
+        oracle: 'the .merge-button is disabled and its title is "Draft pull requests cannot be merged"'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-actions-merge-blocked-reason: a non-mergeable behind PR disables Merge and states why'
+        negative: true
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+      - id: SC-actions-one-filled-primary
+        level: integration
+        title: exactly one filled button per row, and it is Update branch
+        given: a behind PR that is also failing CI and is mergeable, so Rerun failed, Update branch and Merge all render
+        when: the Out of date view renders
+        then: only the Update branch button has a non-transparent background; Merge, Rerun failed, Close and Open PR are all transparent-backed
+        oracle: 'exactly 1 button inside .row-actions has a computed background-color with alpha greater than 0, and that button carries the update-button class'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-actions-one-filled-primary: exactly one filled button per row, and it is Update branch'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright, computed styles read from the browser'
+        tags: [visual-hierarchy]
+
+  - id: REQ-empty-state
+    text: >-
+      With no PR behind its base, the Out of date view shows the empty message and no rows.
+    priority: P1
+    type: functional
+    prd_ref: 'section 5 story S1; section 6'
+    scenarios:
+      - id: SC-empty-state-copy
+        level: integration
+        title: the empty lane explains itself
+        given: a dashboard served a scan in which no PR is behind its base
+        when: the operator opens the Out of date view
+        then: the view shows the empty-state sentence and renders no rows
+        oracle: 'the content area text contains "No PRs waiting on a branch update." and holds 0 .row elements'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-empty-state-copy: the empty lane explains itself'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright'
+
+  - id: REQ-contrast
+    text: >-
+      Every new foreground and background pair in the lane measures at least 4.5 to 1 in both
+      the dark and the light theme.
+    priority: P1
+    type: non-functional
+    prd_ref: 'section 13 Non-functional; section 6 Contrast'
+    scenarios:
+      - id: SC-contrast-tokens-both-themes
+        level: unit
+        title: the new token pairs clear the AA floor in both themes
+        given: the token values declared in public/styles.css for the dark root and the light theme root
+        when: WCAG relative-luminance contrast is computed for amber-on-soft against amber-soft, and paper-strong against amber
+        then: every computed ratio is at least 4.5
+        oracle: 'the minimum of the computed contrast ratios across both theme blocks is at least 4.5'
+        status: green
+        test_ref: 'test/behind-base.test.js::SC-contrast-tokens-both-themes: the new token pairs clear the AA floor in both themes'
+        doubles: 'none - the test parses public/styles.css and computes the ratios arithmetically'
+        data:
+          floor: 4.5
+          naiveAmberOnSoftLight: 3.77
+        tags: [nfr, a11y]
+
+  - id: REQ-axe
+    text: >-
+      The Out of date view reports zero axe-core violations at WCAG 2.2 AA in both themes.
+    priority: P1
+    type: non-functional
+    prd_ref: 'section 13 Non-functional; section 6 Accessibility bar'
+    scenarios:
+      - id: SC-axe-clean-both-themes
+        level: acceptance
+        title: the new view is axe-clean in dark and light
+        given: a dashboard rendering the Out of date view with at least one row, once per theme
+        when: axe-core is injected and run against the wcag2a, wcag2aa and wcag22aa tags
+        then: the violations array is empty for both themes
+        oracle: 'the axe run violations array has length 0 for the dark theme and for the light theme'
+        status: green
+        test_ref: 'test/behind-base-ui.test.js::SC-axe-clean-both-themes: the new view is axe-clean in dark and light'
+        doubles: 'server responses stubbed at /api/status; real front end in Playwright with axe-core injected from the existing devDependency'
+        tags: [nfr, a11y]

@@ -91,7 +91,7 @@ Token scopes you need depend on what you want to see:
 
 ## What It Shows
 
-- Open PRs from non-archived repositories, grouped by **passing**, **no-CI**, **failing**, **running**, and **merge-conflict** states
+- Open PRs from non-archived repositories, grouped by **passing**, **no-CI**, **failing**, **running**, **merge-conflict**, and **out-of-date** states
 - Running non-CD GitHub Actions workflow runs, including jobs not represented by an open-PR status rollup
 - Optional **CD/deploy/release/publish** workflow audit, plus CD runs finished in the last 24h and the latest failed CD runs from the last 3 days
 - **Pipeline Traces** for PR journeys that have not completed from CI/merge through successful production CD
@@ -99,7 +99,8 @@ Token scopes you need depend on what you want to see:
 - Busy org and (optional) repository-level self-hosted runners
 - GitHub API request count, remaining quota, and reset time, with **adaptive next-refresh timing**
 - Quota-aware pausing: when quota runs low, auto-refresh pauses and the manual refresh button is disabled until the reset window
-- Browser notifications and an in-app inbox for CI/CD completions and new conflicts
+- **Out of date**: PRs whose branch has fallen behind its base, with a one-click `Update branch` that merges the base in; the lane is exclusive, so a PR waiting on an update is not also listed as merely failing or passing
+- Browser notifications and an in-app inbox for CI/CD completions, new conflicts, and PRs newly blocked on nothing but a branch update
 - Optional **auto-merge** countdown for passing PRs with completed checks
 - One-click reruns for failed CI/CD jobs and their dependent jobs, available on failed run, PR, and pipeline-trace cards
 - Optional automatic Dependabot cleanup: closes PRs with failing CI, cancels queued runs once they reach the configured threshold, and auto-dismisses failed Dependabot runs from Failing CI
@@ -187,10 +188,13 @@ GET  /api/status?mode=all&includeCd=1&includeRunners=0&includeRepoRunners=0&jobs
 GET  /api/runners/status?mode=all&includeRepoRunners=0&jobs=4
 POST /api/pull-request/merge
 POST /api/pull-request/close
+POST /api/pull-request/update-branch
 GET  /api/health
 ```
 
 - `mode` is `all`, `owned`, or `mine`.
+- `POST /api/pull-request/update-branch` takes `{ repo, number }` and merges the base branch into the PR's head. It never rebases, so the contributor's head branch is never force-pushed. GitHub's own refusal is passed through verbatim: a branch-protection rule that blocks the App and a fork nobody can push to are different problems.
+
 - The runner endpoint returns only busy self-hosted runners; set `includeRepoRunners=1` to include repo-level runners.
 - Merge/close requests take JSON like `{"repo":"owner/name","number":123}`. Merge re-checks the PR (see [guarded merges](#how-it-works)) and deletes the head branch on success; close skips CI requirements.
 

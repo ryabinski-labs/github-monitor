@@ -18,6 +18,7 @@
   --red-soft: #482629;
   --amber: #efb75d;
   --amber-soft: #49391d;
+  --amber-on-soft: var(--amber);
 
   /* Filtered-mode accent. Red, because the filter is a mode that makes every
      number on the page untrue as an org figure -- the same "do not read this at
@@ -67,6 +68,7 @@
   --red-soft: #f0d8d3;
   --amber: #9a6312;
   --amber-soft: #efddb8;
+  --amber-on-soft: #7b4f0e;
 
   --flag: var(--red);
   --flag-soft: var(--red-soft);
@@ -893,6 +895,11 @@ button.metric.active .metric-dot {
 .metric-conflict[disabled] strong,
 .metric-conflict strong:empty::before { color: var(--ink); }
 .dot.conflict { color: var(--red); }
+.dot.amber-ring {
+  color: var(--amber);
+  background: transparent;
+  border: 2px solid currentColor;
+}
 
 /* —————————————————————— LOADING + ERROR —————————————————————— */
 .loading, .error-panel {
@@ -1462,6 +1469,53 @@ button.metric.active .metric-dot {
   color: var(--red);
   opacity: 1;
 }
+.update-button {
+  border-color: var(--amber);
+  background: var(--amber);
+  color: var(--paper-strong);
+  white-space: nowrap;
+}
+.update-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--amber) 84%, black);
+  background: color-mix(in srgb, var(--amber) 84%, black);
+}
+.update-button:disabled {
+  cursor: wait;
+  opacity: 0.82;
+}
+.update-button[data-state="updated"]:disabled {
+  border-color: color-mix(in srgb, var(--amber) 58%, var(--line-strong));
+  background: var(--amber-soft);
+  color: var(--amber-on-soft);
+  cursor: default;
+  opacity: 1;
+}
+.update-button:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+}
+
+[data-view="behind"] .merge-button:not(:disabled),
+[data-view="behind"] .rerun-button:not(:disabled) {
+  background: transparent;
+}
+[data-view="behind"] .merge-button:not(:disabled) {
+  border-color: var(--green);
+  color: var(--green);
+}
+[data-view="behind"] .merge-button:not(:disabled):hover {
+  background: var(--green);
+  color: var(--paper-strong);
+}
+[data-view="behind"] .rerun-button:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--blue);
+}
+[data-view="behind"] .rerun-button:not(:disabled):hover {
+  background: var(--blue);
+  color: var(--paper-strong);
+}
+
 .open-link::after {
   content: "↗";
   font-weight: 500;
@@ -2248,6 +2302,38 @@ button.metric.active .metric-dot {
   width: 11px;
   height: 11px;
   stroke: currentColor;
+}
+
+.behind-pill {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  max-width: 190px;
+  padding: 3px 8px 3px 6px;
+  border: 1px solid color-mix(in srgb, var(--amber) 32%, transparent);
+  border-radius: var(--radius-pill);
+  background: var(--amber-soft);
+  color: var(--amber-on-soft);
+  font-family: var(--sans);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.behind-pill svg {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  stroke: currentColor;
+}
+/* The branch name is the only part that can be arbitrarily long, so it is the
+   only part allowed to clip. The untruncated name stays in the pill's title. */
+.behind-pill-ref {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .draft-pill {

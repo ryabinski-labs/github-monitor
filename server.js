@@ -81,6 +81,11 @@ const PR_SEARCH_GRAPHQL = `
           mergeable
           headRefOid
           baseRefName
+          baseRefOid
+          headRefName
+          headRepository {
+            nameWithOwner
+          }
           author {
             login
           }
@@ -138,6 +143,7 @@ const PR_BY_NUMBER_GRAPHQL = `
         mergeable
         headRefOid
         baseRefName
+        baseRefOid
         headRefName
         headRepository {
           nameWithOwner
@@ -436,6 +442,14 @@ async function getPatToken() {
       }
       return token;
     })();
+    // A rejected promise must not stay memoized. It used to: one lookup that
+    // failed because `gh auth login` had not finished, or because the token was
+    // exported a second after boot, poisoned every GitHub request for the life
+    // of the process, and the only cure was a restart. Dropping it on failure
+    // means the next request simply asks again.
+    githubTokenPromise.catch(() => {
+      githubTokenPromise = null;
+    });
   }
   return githubTokenPromise;
 }
@@ -1992,6 +2006,141 @@ function runningCheckLabel(check) {
   return `${check.context || "status context"} [${check.state || "UNKNOWN"}]`;
 }
 
+// --- "branch behind base" detection -------------------------------------------
+//
+// Two corrections to docs/prd/pr-behind-base.md, both verified against the live
+// GraphQL API on 2026-09-18 rather than by introspecting field names alone:
+//
+// 1. The spec assumed the compare could ride inside PR_SEARCH_GRAPHQL for zero
+//    extra requests. It cannot: `Ref.compare(headRef: String!)` takes a static
+//    argument, and the head ref differs per node, so a bulk search over 100 PRs
+//    has no way to name each one's head. Detection therefore runs as a second,
+//    aliased GraphQL document, chunked by owner (App tokens are per
+//    installation) and keyed on the base and head SHAs -- so a scan where
+//    nothing moved spends nothing, and a scan after a push to main costs one
+//    request per 50 affected PRs.
+//
+// 2. The spec asked for `baseRef.compare(headRef:).behindBy`. That field counts
+//    how far the *base* is behind the head, which is the PR's ahead count. The
+//    number this lane is about -- how far the head is behind the base -- is
+//    `aheadBy` on the same comparison. Measured: a branch five commits behind
+//    main reports { behindBy: 0, aheadBy: 5, status: AHEAD } from the base ref.
+const BEHIND_COMPARE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const BEHIND_COMPARE_CHUNK = 50;
+
+// A cross-repository compare needs the head qualified with its owner, or GitHub
+// resolves the branch name inside the base repository and answers about the
+// wrong branch. Same-repo PRs pass the bare name. Accepts either a raw GraphQL
+// node or a classified PR, because the scan has both shapes in hand.
+function compareHeadRef(pr) {
+  if (!pr) return "";
+  const baseRepo = pr.repository?.nameWithOwner || pr.repo || "";
+  const headRepo = pr.headRepository?.nameWithOwner || pr.headRepo || "";
+  const headRefName = pr.headRefName || "";
+  if (!headRefName) return "";
+  if (!headRepo || headRepo === baseRepo) return headRefName;
+  const [headOwner] = headRepo.split("/");
+  return headOwner ? `${headOwner}:${headRefName}` : headRefName;
+}
+
+// Fail-open (A-003): anything that is not a positive integer leaves behindBy
+// undefined, and an undefined behindBy groups the PR exactly as it is grouped
+// today. A compare that errors must never empty the other lanes.
+function normalizeBehindBy(value) {
+  return Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function isBehindBase(pr) {
+  return normalizeBehindBy(pr?.behindBy) !== undefined;
+}
+
+function behindCacheKey(pr) {
+  return `behind:${pr.repo}#${pr.number}:${pr.baseSha || ""}:${pr.headSha || ""}`;
+}
+
+function buildBehindCompareQuery(chunk) {
+  const variables = {};
+  const declarations = [];
+  const selections = [];
+  chunk.forEach((pr, index) => {
+    const { owner, name } = parseRepo(pr.repo);
+    variables[`h${index}`] = compareHeadRef(pr);
+    declarations.push(`$h${index}: String!`);
+    selections.push(
+      `  pr${index}: repository(owner: ${JSON.stringify(owner)}, name: ${JSON.stringify(name)}) {\n` +
+        `    pullRequest(number: ${pr.number}) {\n` +
+        `      baseRef { compare(headRef: $h${index}) { aheadBy } }\n` +
+        `    }\n` +
+        `  }`
+    );
+  });
+  return { query: `query(${declarations.join(", ")}) {\n${selections.join("\n")}\n}`, variables };
+}
+
+// Resolves behindBy in place. Never throws: every failure path leaves behindBy
+// undefined, which is the pre-feature grouping.
+async function fetchBehindCounts(pullRequests) {
+  const pendingByOwner = new Map();
+  for (const pr of pullRequests || []) {
+    if (!pr?.repo || !pr.number || !pr.headRefName || !pr.baseRefName) continue;
+    const key = behindCacheKey(pr);
+    const cached = githubValueCache.get(key);
+    if (cached?.value !== undefined && cached.expiresAt > Date.now()) {
+      pr.behindBy = normalizeBehindBy(cached.value);
+      continue;
+    }
+    const [owner] = pr.repo.split("/");
+    if (!owner) continue;
+    if (!pendingByOwner.has(owner)) pendingByOwner.set(owner, []);
+    pendingByOwner.get(owner).push(pr);
+  }
+
+  for (const [owner, pending] of pendingByOwner) {
+    for (let start = 0; start < pending.length; start += BEHIND_COMPARE_CHUNK) {
+      const chunk = pending.slice(start, start + BEHIND_COMPARE_CHUNK);
+      let json;
+      try {
+        const { query, variables } = buildBehindCompareQuery(chunk);
+        // Deliberately not githubGraphql: that helper throws on any errors entry,
+        // and one deleted head branch in a chunk of fifty would then cost every
+        // other PR in the chunk its count. Partial data is exactly what we want.
+        json = await githubRequest(githubGraphqlUrl, {
+          method: "POST",
+          body: { query, variables },
+          ownerHint: owner
+        });
+      } catch {
+        continue;
+      }
+      chunk.forEach((pr, index) => {
+        const behindBy = normalizeBehindBy(json?.data?.[`pr${index}`]?.pullRequest?.baseRef?.compare?.aheadBy);
+        pr.behindBy = behindBy;
+        // Stored as 0 rather than undefined when the compare gave no usable
+        // answer, because the cache treats undefined as a miss -- and a PR whose
+        // head branch is gone would then pay for the same failed compare on
+        // every single scan. Not behind and could-not-tell group identically.
+        githubValueCache.set(behindCacheKey(pr), {
+          value: behindBy ?? 0,
+          expiresAt: Date.now() + BEHIND_COMPARE_CACHE_TTL_MS
+        });
+      });
+    }
+  }
+  return pullRequests;
+}
+
+function buildUpdateBranchRequest(repo, number) {
+  const { repo: normalizedRepo } = parseRepo(repo);
+  const pullNumber = parsePullNumber(number);
+  return {
+    method: "PUT",
+    path: `/repos/${normalizedRepo}/pulls/${pullNumber}/update-branch`,
+    // No update_method key: its absence is what makes GitHub produce a merge
+    // commit. Sending "rebase" would force-push the contributor's head branch.
+    body: {}
+  };
+}
+
 function classifyPullRequest(pr) {
   const checks = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes?.filter(Boolean) || [];
   const mergeable = pr.mergeable || "UNKNOWN";
@@ -2010,9 +2159,11 @@ function classifyPullRequest(pr) {
     mergeable,
     hasConflict,
     headSha: pr.headRefOid || "",
+    baseSha: pr.baseRefOid || "",
     baseRefName: pr.baseRefName || "",
     headRefName: pr.headRefName || "",
-    headRepo: pr.headRepository?.nameWithOwner || ""
+    headRepo: pr.headRepository?.nameWithOwner || "",
+    behindBy: normalizeBehindBy(pr.baseRef?.compare?.aheadBy)
   };
   if (!checks.length) {
     return { ...base, state: "pass", checkCount: 0, runningChecks: [] };
@@ -2055,6 +2206,7 @@ async function fetchPrQuery(queryText, { ownerHint } = {}) {
     if (!search.pageInfo?.hasNextPage) break;
     endCursor = search.pageInfo.endCursor;
   }
+  await fetchBehindCounts(pullRequests);
   return pullRequests;
 }
 
@@ -2065,7 +2217,9 @@ async function fetchPullRequestByNumber(repo, number) {
   if (!pr) {
     throw new HttpError(404, `Pull request ${repo}#${number} was not found.`);
   }
-  return classifyPullRequest(pr);
+  const classified = classifyPullRequest(pr);
+  await fetchBehindCounts([classified]);
+  return classified;
 }
 
 async function getAccount() {
@@ -4083,6 +4237,7 @@ async function buildDashboardData(requestUrl) {
     failingPrs: prGroups.fail.length + failedActions.length,
     runningPrs: prGroups.running.length + runningActions.length,
     conflictPrs: prGroups.conflicts.length,
+    behindPrs: prGroups.behind.length,
     runningCd: runningCd.length,
     finishedCd: finishedCd.length,
     skippedCd: finishedCd.filter((row) => row.outcome === "skipped").length,
@@ -4339,14 +4494,21 @@ async function autoMergeConfig(req, res) {
 }
 
 function groupPullRequests(pullRequests) {
+  // Exclusive lanes, in precedence order: a conflicting PR is a conflict even
+  // when it is also behind (DL-005 -- GitHub answers 422 to an update on it),
+  // and a behind PR leaves whichever CI lane it would otherwise sit in, because
+  // being behind is the thing actually stopping it from merging.
+  const behind = (pr) => !pr.hasConflict && isBehindBase(pr);
+  const open = (pr) => !pr.hasConflict && !isBehindBase(pr);
   return {
-    pass: pullRequests.filter((pr) => pr.state === "pass" && pr.checkCount > 0 && !pr.hasConflict).sort(sortByRepoAndNumber),
+    pass: pullRequests.filter((pr) => pr.state === "pass" && pr.checkCount > 0 && open(pr)).sort(sortByRepoAndNumber),
     noCi: pullRequests
-      .filter((pr) => pr.state === "pass" && pr.checkCount === 0 && !pr.isDraft && !pr.hasConflict)
+      .filter((pr) => pr.state === "pass" && pr.checkCount === 0 && !pr.isDraft && open(pr))
       .sort(sortByRepoAndNumber),
-    fail: pullRequests.filter((pr) => pr.state === "fail" && !pr.hasConflict).sort(sortByRepoAndNumber),
-    running: pullRequests.filter((pr) => pr.state === "running" && !pr.hasConflict).sort(sortByRepoAndNumber),
-    conflicts: pullRequests.filter((pr) => pr.hasConflict).sort(sortByRepoAndNumber)
+    fail: pullRequests.filter((pr) => pr.state === "fail" && open(pr)).sort(sortByRepoAndNumber),
+    running: pullRequests.filter((pr) => pr.state === "running" && open(pr)).sort(sortByRepoAndNumber),
+    conflicts: pullRequests.filter((pr) => pr.hasConflict).sort(sortByRepoAndNumber),
+    behind: pullRequests.filter(behind).sort(sortByRepoAndNumber)
   };
 }
 
@@ -4466,6 +4628,35 @@ async function mergePullRequest(req, res) {
   const number = parsePullNumber(body.number);
   autoMergeState.candidates.delete(autoMergeKey(repo, number));
   await sendJson(res, 200, await executeMergePullRequest(repo, number, body.mergeMethod));
+}
+
+async function updatePullRequestBranch(req, res) {
+  if (req.method !== "POST") {
+    throw new HttpError(405, "Method not allowed");
+  }
+
+  const body = await readJsonBody(req);
+  const request = buildUpdateBranchRequest(body.repo, body.number);
+  const { repo } = parseRepo(body.repo);
+  const number = parsePullNumber(body.number);
+  const result = await githubRequest(request.path, { method: request.method, body: request.body });
+
+  // The compare is cached on the base and head SHAs, both of which the update
+  // changes, so drop every cached count for this PR rather than guessing the
+  // new key -- otherwise the row would keep claiming a count GitHub just made
+  // stale until the entry aged out.
+  const cachePrefix = `behind:${repo}#${number}:`;
+  for (const key of githubValueCache.keys()) {
+    if (key.startsWith(cachePrefix)) githubValueCache.delete(key);
+  }
+
+  await sendJson(res, 200, {
+    updated: true,
+    message: result?.message || "Branch update queued.",
+    repo,
+    number,
+    numberLabel: `#${number}`
+  });
 }
 
 async function closePullRequest(req, res) {
@@ -4631,6 +4822,10 @@ const server = http.createServer(async (req, res) => {
       await autoMergeConfig(req, res);
       return;
     }
+    if (requestUrl.pathname === "/api/pull-request/update-branch") {
+      await updatePullRequestBranch(req, res);
+      return;
+    }
     if (requestUrl.pathname === "/api/pull-request/close") {
       await closePullRequest(req, res);
       return;
@@ -4709,6 +4904,13 @@ export {
   bestProductionUrlCandidate,
   buildChangeSummary,
   classifyPullRequest,
+  compareHeadRef,
+  normalizeBehindBy,
+  isBehindBase,
+  fetchBehindCounts,
+  buildUpdateBranchRequest,
+  updatePullRequestBranch,
+  PR_SEARCH_GRAPHQL,
   extractProductionUrlsFromText,
   groupPullRequests,
   applyActionRunEvidenceToPullRequests,
