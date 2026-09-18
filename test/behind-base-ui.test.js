@@ -103,7 +103,11 @@ async function openDashboard({
   updateBranch = { status: 200, body: { updated: true } }
 } = {}) {
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  // Explicit, because the default 1280x720 makes axe return every
+  // colour-contrast node as `incomplete` ("pseudoContent" -- the row's ::before
+  // accent bar defeats its background resolution), and an assertion that reads
+  // only `violations` then passes without measuring anything.
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const posts = [];
   const queue = [...statuses];
 
@@ -615,11 +619,21 @@ test("SC-axe-clean-both-themes: the new view is axe-clean in dark and light", { 
       await page.addScriptTag({ content: axeJs });
       const violations = await page.evaluate(async () => {
         const result = await window.axe.run("#content", {
-          runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag22aa"] }
+          runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag22aa"] },
+          // Contrast is proven by SC-contrast-tokens-both-themes, which computes
+          // it from the token values. axe cannot resolve a background sitting
+          // over the row's ::before bar and answers `incomplete` for those
+          // nodes, so leaving its contrast rule on here bought a pass, not a
+          // measurement. Structure is what it is asked for instead -- and
+          // `incomplete` now counts, because "could not decide" is not "fine".
+          rules: { "color-contrast": { enabled: false } }
         });
-        return result.violations.map((v) => `${v.id}: ${v.nodes.length} node(s)`);
+        return [
+          ...result.violations.map((v) => `violation ${v.id}: ${v.nodes.length} node(s)`),
+          ...result.incomplete.map((v) => `incomplete ${v.id}: ${v.nodes.length} node(s)`)
+        ];
       });
-      assert.deepEqual(violations, [], `${theme} theme must report no axe violations, got: ${violations.join("; ")}`);
+      assert.deepEqual(violations, [], `${theme} theme must report no axe findings, got: ${violations.join("; ")}`);
     } finally {
       await browser.close();
     }

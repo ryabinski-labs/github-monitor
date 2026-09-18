@@ -571,3 +571,17 @@ requirements:
         test_ref: 'test/behind-base-ui.test.js::SC-axe-clean-both-themes: the new view is axe-clean in dark and light'
         doubles: 'server responses stubbed at /api/status; real front end in Playwright with axe-core injected from the existing devDependency'
         tags: [nfr, a11y]
+        notes: >-
+          STRENGTHENED 2026-09-18. As first written this asserted only that
+          result.violations was empty, with every rule enabled. That passed
+          without measuring colour: axe cannot resolve a background that sits
+          over the row's ::before accent bar and returns those nodes as
+          `incomplete` with messageKey "pseudoContent" -- and at Playwright's
+          default 1280x720 viewport it returns every node in #content that way,
+          so the assertion was vacuous at the width it ran at. Found while
+          auditing the light theme, which had a real 4.25:1 failure on
+          .repo-owner that this scenario did not catch. The harness now pins a
+          1440x900 viewport, the colour-contrast rule is disabled here because
+          SC-contrast-tokens-both-themes measures it properly from the token
+          values, and `incomplete` counts as a finding: axe declining to decide
+          is not the same as the row passing.
