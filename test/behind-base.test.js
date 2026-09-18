@@ -35,7 +35,12 @@ function prNode({ behindBy = 0, baseRefName = "main", checks = [], number = 118 
     baseRefName,
     author: { login: "cigan1" },
     repository: { nameWithOwner: "ryabinski-labs/github-monitor", isArchived: false },
-    baseRef: { compare: { behindBy } },
+    // Corrected against the live schema on 2026-09-18. The spec asked for
+    // baseRef.compare.behindBy, but that counts how far the *base* is behind
+    // the head -- the PR's ahead count. Measured on a branch five commits
+    // behind main: { behindBy: 0, aheadBy: 5, status: AHEAD } from the base
+    // ref. The number this lane is about is aheadBy on that comparison.
+    baseRef: { compare: { aheadBy: behindBy } },
     commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks } } } }] }
   };
 }
@@ -336,24 +341,181 @@ test("SC-contrast-tokens-both-themes: the new token pairs clear the AA floor in 
   }
 });
 
-test("SC-detect-no-extra-requests: detection costs no additional HTTP request per scan", () => {
-  // Oracle: the PR search GraphQL document itself carries the compare selection,
-  // so behindBy arrives inside a request the scan already makes.
+test("SC-detect-no-extra-requests: a scan where nothing moved costs no compare request", async () => {
+  // Oracle: with the base and head SHAs unchanged since the previous scan, the
+  // compare pass issues zero requests and still reports the same count.
   //
-  // This is a structural check rather than a request count: this codebase has no
-  // injectable HTTP transport, so counting real calls is not available here. The
-  // structure is what actually decides the cost -- a compare selection inside the
-  // existing document is free; anything reached by a separate path is not.
+  // REWRITTEN, with the original oracle recorded as wrong. The spec asserted the
+  // compare could ride inside PR_SEARCH_GRAPHQL for +0 requests. It cannot:
+  // Ref.compare(headRef: String!) takes a static argument and the head ref
+  // differs per node, so a bulk search over 100 PRs cannot name each one's head.
+  // Verified against the live API on 2026-09-18 -- a static alias resolves the
+  // same branch name for every node, and a name missing in one repository
+  // returns a NOT_FOUND errors entry for that node.
+  //
+  // What the guardrail can honestly promise is the steady state: the compare is
+  // keyed on the base and head SHAs, so a rescan that finds nothing moved is
+  // free, and a push to the base branch costs one request per 50 affected PRs.
   assert.equal(
-    typeof server.PR_SEARCH_GRAPHQL,
-    "string",
-    "server.js must export PR_SEARCH_GRAPHQL so the query's cost shape is testable"
+    typeof server.fetchBehindCounts,
+    "function",
+    "server.js must export fetchBehindCounts so the compare pass's cost is testable"
+  );
+  assert.ok(
+    !/compare\s*\(\s*headRef:/.test(server.PR_SEARCH_GRAPHQL || ""),
+    "the search document must not carry a compare: a static headRef argument would answer about the wrong branch"
   );
 
-  assert.match(
-    server.PR_SEARCH_GRAPHQL,
-    /compare\s*\(\s*headRef:/,
-    "behindBy must be selected inside the existing search query; a separate call would cost one request per PR per scan"
-  );
-  assert.match(server.PR_SEARCH_GRAPHQL, /behindBy/, "the compare selection must actually request behindBy");
+  server.resetGithubValueCache();
+  const rows = [{ ...pr({ behindBy: undefined }), headRefName: "feat/x", baseSha: "base1", headSha: "head1" }];
+
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return new Response(JSON.stringify({ data: { pr0: { pullRequest: { baseRef: { compare: { aheadBy: 4 } } } } } }), {
+      status: 200,
+      headers: { "content-type": "application/json" }
+    });
+  };
+  try {
+    await server.fetchBehindCounts(rows);
+    assert.equal(calls, 1, "a PR whose SHAs the cache has never seen costs exactly one batched request");
+    assert.equal(rows[0].behindBy, 4, "the compare result must reach the PR object");
+
+    rows[0].behindBy = undefined;
+    await server.fetchBehindCounts(rows);
+    assert.equal(calls, 1, "unchanged base and head SHAs must be answered from the cache, spending nothing");
+    assert.equal(rows[0].behindBy, 4, "the cached count must still be reported");
+
+    rows[0].baseSha = "base2";
+    await server.fetchBehindCounts(rows);
+    assert.equal(calls, 2, "a moved base branch is the one thing that must pay for a fresh compare");
+  } finally {
+    globalThis.fetch = originalFetch;
+    server.resetGithubValueCache();
+  }
+});
+
+// --- REQ-behind-lane (wiring) ------------------------------------------------
+
+test("SC-lane-status-payload: the behind lane reaches /api/status, not just groupPullRequests", async () => {
+  // Oracle: data.pullRequests.behind holds the PR, summary.behindPrs is 1, and
+  // the same PR is absent from pass/noCi/fail/running.
+  //
+  // The wiring test. groupPullRequests can be perfectly correct and still never
+  // be reached with a behindBy on it -- the scan resolves the compare in a
+  // second pass, and a lane that the pass skips is a lane that is always empty
+  // on the only surface the dashboard ever reads.
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+
+  let compareCalls = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const requestUrl = new URL(String(url));
+    const body = options.body ? JSON.parse(options.body) : {};
+    const headers = {
+      "content-type": "application/json",
+      "x-ratelimit-limit": "5000",
+      "x-ratelimit-remaining": "4990",
+      "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + 3600),
+      "x-ratelimit-resource": requestUrl.pathname === "/graphql" ? "graphql" : "core"
+    };
+
+    if (requestUrl.pathname === "/user") return Response.json({ login: "maintainer" }, { headers });
+    if (requestUrl.pathname === "/user/orgs") return Response.json([{ login: "behind-fixture" }], { headers });
+    if (requestUrl.pathname === "/user/repos") return Response.json([], { headers });
+    if (/^\/orgs\/[^/]+\/repos$/.test(requestUrl.pathname)) {
+      return Response.json(
+        [{ full_name: "behind-fixture/app", archived: false, owner: { login: "behind-fixture" } }],
+        { headers }
+      );
+    }
+    if (requestUrl.pathname === "/graphql") {
+      // The search document and the compare document are distinguishable by the
+      // selection each one carries; the compare is the second request.
+      if (/compare\s*\(\s*headRef:/.test(body.query || "")) {
+        compareCalls += 1;
+        assert.equal(body.variables.h0, "feat/x", "a same-repo head ref is passed unqualified");
+        return Response.json(
+          { data: { pr0: { pullRequest: { baseRef: { compare: { aheadBy: 9 } } } } } },
+          { headers }
+        );
+      }
+      const node = {
+        __typename: "PullRequest",
+        number: 118,
+        title: "Wait out post-merge CI",
+        url: "https://github.com/behind-fixture/app/pull/118",
+        createdAt: "2026-09-18T05:00:00Z",
+        updatedAt: "2026-09-18T05:30:00Z",
+        isDraft: false,
+        mergeable: "MERGEABLE",
+        headRefOid: "abc1234",
+        baseRefName: "main",
+        baseRefOid: "base1234",
+        headRefName: "feat/x",
+        headRepository: { nameWithOwner: "behind-fixture/app" },
+        author: { login: "cigan1" },
+        repository: { nameWithOwner: "behind-fixture/app", isArchived: false },
+        commits: {
+          nodes: [
+            {
+              commit: {
+                statusCheckRollup: {
+                  contexts: {
+                    nodes: [
+                      { __typename: "CheckRun", name: "build", status: "COMPLETED", conclusion: "SUCCESS" }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      };
+      return Response.json(
+        { data: { search: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [node] } } },
+        { headers }
+      );
+    }
+    if (requestUrl.pathname.startsWith("/repos/")) {
+      return Response.json({ workflows: [], workflow_runs: [] }, { headers });
+    }
+    return Response.json({ message: "not found" }, { status: 404, headers });
+  };
+
+  server.resetGithubValueCache();
+  const testServer = await new Promise((resolve) => {
+    const listener = server.server.listen(0, "127.0.0.1", () => resolve(listener));
+  });
+
+  try {
+    const { port } = testServer.address();
+    const response = await previousFetch(
+      `http://127.0.0.1:${port}/api/status?mode=all&includeCd=0&includeRunners=0&jobs=1`
+    );
+    const data = await response.json();
+    assert.equal(response.status, 200);
+
+    assert.equal(compareCalls, 1, "the scan must resolve the compare exactly once per pass");
+    assert.equal(data.pullRequests.behind.length, 1, "the behind lane must arrive populated on the only surface the UI reads");
+    assert.equal(data.pullRequests.behind[0].behindBy, 9, "the count the pill renders must survive the payload");
+    assert.equal(data.summary.behindPrs, 1, "the rail count comes from the summary, not from the lane length");
+
+    for (const lane of ["pass", "noCi", "fail", "running", "conflicts"]) {
+      assert.equal(
+        (data.pullRequests[lane] || []).length,
+        0,
+        `the lane is exclusive: the PR must not also sit in ${lane}`
+      );
+    }
+  } finally {
+    server.resetGithubValueCache();
+    await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
+    globalThis.fetch = previousFetch;
+    if (previousToken == null) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
 });

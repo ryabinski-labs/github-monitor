@@ -152,6 +152,15 @@ async function openDashboard({
   return { browser, page, posts };
 }
 
+async function waitForBehindNotice(page, expected = 1) {
+  await page.waitForFunction(
+    (count) => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]")
+      .filter((item) => String(item.tag || "").startsWith("behind:")).length >= count,
+    expected,
+    { timeout: 5000 }
+  );
+}
+
 async function railCount(page, id) {
   return page.evaluate((elementId) => document.getElementById(elementId)?.textContent ?? null, id);
 }
@@ -378,10 +387,11 @@ test("SC-notify-stuck-only: a passing, non-draft, non-conflicting newly behind P
   });
   try {
     await page.evaluate(() => document.querySelector("#refresh")?.click());
-    await page.waitForFunction(() => document.body.textContent?.includes("Branch out of date"), null, { timeout: 5000 });
+    await waitForBehindNotice(page);
     const inbox = await page.evaluate(() => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]"));
     const entries = inbox.filter((item) => String(item.tag || "").startsWith("behind:"));
     assert.equal(entries.length, 1, "a PR stuck only on the update must announce itself exactly once");
+    assert.equal(entries[0].title, "Branch out of date", "the notice must name the state it is reporting");
   } finally {
     await browser.close();
   }
@@ -420,7 +430,7 @@ test("SC-notify-no-repeat: a PR already in the lane does not re-notify on the ne
   });
   try {
     await page.evaluate(() => document.querySelector("#refresh")?.click());
-    await page.waitForFunction(() => document.body.textContent?.includes("Branch out of date"), null, { timeout: 5000 });
+    await waitForBehindNotice(page);
     await page.evaluate(() => document.querySelector("#refresh")?.click());
     await page.waitForTimeout(500);
     const inbox = await page.evaluate(() => JSON.parse(localStorage.getItem("pr-deck:inbox:v1") || "[]"));

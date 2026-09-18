@@ -53,7 +53,9 @@ disabled merge button under the out-of-date banner.
 - **Target:** 1 action -- the Update branch button on the Out-of-date row -- from the first
   release of this feature.
 - **Guardrail metrics:**
-  - Requests per scan must not increase (0 additional HTTP requests, DL-002).
+  - Requests per scan must not increase measurably: 0 additional requests on a scan where
+    no base or head branch moved, and at most 1 per 50 affected PRs otherwise (revised from
+    a flat 0 -- see R-001 and R-005).
   - The PR pass must still complete inside `SCAN_PASS_DEADLINE_MS` (180000 ms,
     `server.js:309`); a partial-scan banner appearing after this change is a regression.
   - Inbox entries per scan must not rise enough to evict unrelated alerts from the
@@ -213,9 +215,10 @@ dismiss keys, so a reload shows whatever the current scan reports.
 
 | ID | Risk or question | Type | Owner | Resolve by |
 |---|---|---|---|---|
-| R-001 | **Resolved 2026-09-18.** `Ref.compare(headRef: String!): Comparison` was confirmed against the live GitHub GraphQL schema by introspection; `Comparison` exposes `aheadBy`, `behindBy`, `status`, `commits`, `baseTarget`, `headTarget`. DL-002 stands and the zero-extra-requests guarantee holds. The fork-qualified `owner:branch` head ref (A-004) is the remaining untested input. | Risk | Implementer | Closed |
+| R-001 | **Resolved, then corrected during implementation 2026-09-18.** `Ref.compare(headRef: String!): Comparison` exists, and the fork-qualified `owner:branch` head ref works. Two things the introspection did not catch, both since measured against the live API: (a) the argument is **static per selection**, so a bulk search over 100 PRs cannot name each node's own head ref -- the compare cannot ride inside `PR_SEARCH_GRAPHQL`, and the zero-extra-requests guarantee does **not** hold as written (see R-005 and section 13); (b) on `baseRef.compare(headRef: <head>)` the field that counts how far the *head* is behind is **`aheadBy`**, not `behindBy` -- `behindBy` there counts how far the base is behind the head, which is the PR's ahead count. A branch five commits behind main reports `{ behindBy: 0, aheadBy: 5, status: AHEAD }` from its base ref. | Risk | Implementer | Closed with corrections |
 | R-002 | Risk: adding `compare` per PR may raise GraphQL point cost or server-side latency enough to push the PR pass past `SCAN_PASS_DEADLINE_MS` (180000 ms). Measure the pass duration before and after on the largest installation. | Risk | Implementer | Before merge |
 | R-003 | Risk: under GitHub App auth the update merge commit is attributed to the App, not to the operator -- your screenshot's banner reads "This merge commit will be associated with cigan1." Some branch protection rules refuse App pushes entirely (`docs/github-app-setup.md:133`), which surfaces only as the DL-009 error toast. | Risk | Operator | Accepted; no mitigation planned |
+| R-005 | **Correction, 2026-09-18.** Detection runs as a second, aliased GraphQL document rather than inside the search query, for the reason in R-001(a). It is chunked by owner, because App installation tokens are per-owner, and keyed on the base and head SHAs, so a scan that finds nothing moved spends nothing and a push to a base branch costs one request per 50 affected PRs. A compare that errors for one PR (deleted head branch, unreadable fork) leaves that PR's count undefined and the rest of the chunk intact, which is A-003's fail-open applied per row. Measured on five live PRs: 0.66 s for the batch, 0 ms and 0 requests on the immediate rescan. | Risk | Implementer | Closed |
 | R-004 | Risk: `behindBy` is computed at scan time, so a PR can fall behind between the scan and the click. The update still succeeds (GitHub recomputes), but a PR can also *stop* being behind, in which case GitHub returns 422 and the DL-009 error path fires on a PR that needed nothing. | Risk | Implementer | Accepted; the error copy must not imply a failure the operator caused |
 
 ## 9. Instrumentation
@@ -262,10 +265,12 @@ only.
   local-first, no-cloud-state constraint intact.
 - **Migration:** None. No schema, no disk format change; the ETag cache on disk is unaffected.
 - **Integrations:**
-  - **GitHub GraphQL** (`githubGraphql`, `server.js:1098`) -- detection. `PR_SEARCH_GRAPHQL`
-    and `PR_BY_NUMBER_GRAPHQL` (`server.js:65`, `server.js:126`) gain
-    `baseRef { compare(headRef: <head>) { behindBy } }`. Auth is the existing App-installation
-    or PAT token; no new credential, no new Accept header.
+  - **GitHub GraphQL** -- detection. `PR_SEARCH_GRAPHQL` and `PR_BY_NUMBER_GRAPHQL` gain
+    `baseRefOid`, `headRefName` and `headRepository`, which are what the compare needs and
+    what keys its cache. The compare itself is a separate aliased document per owner chunk:
+    `baseRef { compare(headRef: $hN) { aheadBy } }` (see R-001 for why it is neither inside
+    the search query nor spelled `behindBy`). Auth is the existing App-installation or PAT
+    token; no new credential, no new Accept header.
   - **GitHub REST** `PUT /repos/{owner}/{repo}/pulls/{number}/update-branch` -- the action.
     Called through the existing `githubRequest` helper. Needs `Contents: Read & write`, which
     the App already requests (`docs/github-app-setup.md:45`); no new permission.
@@ -274,9 +279,12 @@ only.
 
 ## 13. Non-functional requirements
 
-- **Requests per scan: +0.** Detection adds no HTTP request; `behindBy` rides inside the
-  GraphQL query the scan already issues (DL-002). Measured by comparing the per-installation
-  `remaining` delta across one full scan at `/api/health` before and after.
+- **Requests per scan: +0 in the steady state, +1 per 50 affected PRs after a branch moves.**
+  Revised from a flat +0, which R-001(a) showed to be unachievable. The compare result is
+  cached on the base and head SHAs, so a rescan that finds neither changed issues nothing;
+  a push to a base branch invalidates every PR on it and costs one batched request per 50.
+  Measured directly rather than by quota delta: 0.66 s and one request cold, 0 ms and zero
+  requests warm, over five live PRs.
 - **PR pass duration: within `SCAN_PASS_DEADLINE_MS` = 180000 ms** (`server.js:309`), at the
   existing concurrency of `DEFAULT_SCAN_JOBS = 8`, on the largest installation the operator
   scans. Measured at the scan-metrics store that already reports partial scans (R-002).

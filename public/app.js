@@ -34,6 +34,7 @@ const PHASE_THRESHOLDS_MS = {
   no_ci: 24 * 60 * 60 * 1000,
   failing_ci: 2 * 60 * 60 * 1000,
   conflicts: 24 * 60 * 60 * 1000,
+  behind_base: 8 * 60 * 60 * 1000,
   action_running: 4 * 60 * 60 * 1000,
   cd_running: 4 * 60 * 60 * 1000,
   deployment_running: 45 * 60 * 1000,
@@ -76,6 +77,13 @@ const state = {
   countdownTimer: null,
   nextRefreshAt: null,
   refreshReason: "",
+  // A failed merge, close, rerun or branch update used to reach the error panel
+  // and be wiped out of it microseconds later: every one of those handlers ends
+  // in a finally that calls render(), and render() rewrites the panel from the
+  // scan's warnings. The toast survived, the panel did not, so the one place
+  // that shows GitHub's full refusal was empty by the time anyone looked.
+  // Holding it here lets render() put it back.
+  actionError: "",
   inboxOpen: false,
   inbox: loadInbox(),
   traceCache: loadTraceCache(),
@@ -86,6 +94,8 @@ const state = {
   autoMerge: persisted.autoMerge !== false,
   merging: new Set(),
   merged: new Set(),
+  updating: new Set(),
+  updated: new Set(),
   closing: new Set(),
   closed: new Set(),
   rerunning: new Set(),
@@ -109,6 +119,13 @@ const views = {
     empty: "No PRs with merge conflicts.",
     color: "red",
     rows: (data) => data.pullRequests.conflicts || []
+  },
+  behind: {
+    kicker: "Out of date",
+    title: "PRs whose branch is behind the base branch",
+    empty: "No PRs waiting on a branch update.",
+    color: "amber",
+    rows: (data) => data.pullRequests.behind || []
   },
   running: {
     kicker: "Open PRs with CI running",
@@ -175,7 +192,7 @@ const views = {
   }
 };
 
-const viewOrder = ["fail", "conflicts", "running", "pass", "noCi", "pipelineTraces", "runningCd", "finishedCd", "deployments", "runners", "failedCd"];
+const viewOrder = ["fail", "conflicts", "behind", "running", "pass", "noCi", "pipelineTraces", "runningCd", "finishedCd", "deployments", "runners", "failedCd"];
 
 const els = {
   account: document.querySelector("#account"),
@@ -245,6 +262,7 @@ const navIds = {
   noCi: "navNoCi",
   fail: "navFail",
   conflicts: "navConflicts",
+  behind: "navBehind",
   running: "navRunning",
   runningCd: "navRunningCd",
   finishedCd: "navFinishedCd",
@@ -798,6 +816,7 @@ function currentPrPhase(row) {
   if (state.merging.has(key)) return "merge_pending";
   if (state.autoMerges.has(key)) return "auto_merge_waiting";
   if (row.hasConflict) return "conflicts";
+  if (isBehindBase(row)) return "behind_base";
   if (row.state === "running") return "ci_running";
   if (row.state === "fail") return "failing_ci";
   if (row.state === "pass" && row.checkCount === 0) return "no_ci";
@@ -814,6 +833,7 @@ function phaseLabel(phase) {
     no_ci: "No CI",
     failing_ci: "Failing CI",
     conflicts: "Conflict",
+    behind_base: "Out of date",
     action_running: "Workflow running",
     cd_running: "CD running",
     deployment_running: "Deployment",
@@ -907,7 +927,8 @@ function annotateDataWithPhaseAges(data) {
     noCi: (data.pullRequests?.noCi || []).map(decoratePr),
     fail: (data.pullRequests?.fail || []).map(decoratePr),
     running: (data.pullRequests?.running || []).map(decoratePr),
-    conflicts: (data.pullRequests?.conflicts || []).map(decoratePr)
+    conflicts: (data.pullRequests?.conflicts || []).map(decoratePr),
+    behind: (data.pullRequests?.behind || []).map(decoratePr)
   };
   const actions = {
     ...(data.actions || {}),
@@ -943,7 +964,8 @@ function annotateDataWithPhaseAges(data) {
     ...pullRequests.noCi,
     ...pullRequests.fail,
     ...pullRequests.running,
-    ...pullRequests.conflicts
+    ...pullRequests.conflicts,
+    ...pullRequests.behind
   ]);
   const traces = groupTraceRows([...staleTraces, ...flattenTraces(data.traces)]);
   savePhaseAges();
@@ -1090,13 +1112,23 @@ function buildActivitySnapshot(data) {
     ...(data?.pullRequests?.noCi || []),
     ...(data?.pullRequests?.fail || []),
     ...(data?.pullRequests?.running || []),
-    ...(data?.pullRequests?.conflicts || [])
+    ...(data?.pullRequests?.conflicts || []),
+    ...(data?.pullRequests?.behind || [])
   ];
   return {
     includeCd: Boolean(data?.options?.includeCd),
     ci: new Map((data?.pullRequests?.running || []).map((row) => [prKey(row), row])),
     cd: new Map((data?.cd?.running || []).map((row) => [actionKey(row), row])),
     conflicts: new Set(allPrs.filter((row) => row.hasConflict).map((row) => prKey(row))),
+    // Only a PR whose *only* remaining blocker is the update announces itself
+    // (DL-008). A failing, running, draft or no-CI PR that happens to be behind
+    // has a different problem, and one merge to main would otherwise flood the
+    // inbox with rows the operator cannot act on yet.
+    behind: new Set(
+      allPrs
+        .filter((row) => isBehindBase(row) && !row.hasConflict && !row.isDraft && row.state === "pass" && row.checkCount > 0)
+        .map((row) => prKey(row))
+    ),
     traces: new Map(flattenTraces(data?.traces).map((row) => [traceKey(row), row]))
   };
 }
@@ -1240,7 +1272,8 @@ function notifyCompletedActions(previousSnapshot, data) {
     ...(data?.pullRequests?.noCi || []),
     ...(data?.pullRequests?.fail || []),
     ...(data?.pullRequests?.running || []),
-    ...(data?.pullRequests?.conflicts || [])
+    ...(data?.pullRequests?.conflicts || []),
+    ...(data?.pullRequests?.behind || [])
   ];
   const prByKey = new Map(allPrs.map((row) => [prKey(row), row]));
   for (const key of nextSnapshot.conflicts) {
@@ -1252,6 +1285,18 @@ function notifyCompletedActions(previousSnapshot, data) {
       `${pr.repo} ${pr.numberLabel}: ${pr.title}`,
       `conflict:${key}`,
       { url: pr.url, kind: "conflict", tone: "danger" }
+    );
+  }
+
+  for (const key of nextSnapshot.behind) {
+    if (previousSnapshot.behind?.has(key)) continue;
+    const pr = prByKey.get(key);
+    if (!pr) continue;
+    sendPopup(
+      "Branch out of date",
+      `${pr.repo} ${pr.numberLabel}: ${pr.title}`,
+      `behind:${key}`,
+      { url: pr.url, kind: "behind", tone: "warning" }
     );
   }
 
@@ -1347,6 +1392,13 @@ function setLoading(isLoading) {
   state.loading = isLoading;
   els.loading.classList.toggle("hidden", !isLoading);
   updateRefreshButtonState();
+}
+
+// Errors raised by a user action outlive the render that follows them; a scan
+// clears them, because by then the panel should describe the fresh data.
+function setActionError(message) {
+  state.actionError = message || "";
+  setError(state.actionError, "error");
 }
 
 function setError(message, tone = "error") {
@@ -1668,6 +1720,7 @@ async function refresh({ source = "manual" } = {}) {
     return;
   }
   setLoading(true);
+  state.actionError = "";
   setError("");
   try {
     const response = await fetch(`/api/status?${buildParams().toString()}`);
@@ -1769,6 +1822,7 @@ function displayCounts(data) {
       (row) => (row.kind === "workflowRun" ? actionKey(row) : prKey(row))
     ).length,
     conflictPrs: filteredVisibleRows(data?.pullRequests?.conflicts).length,
+    behindPrs: filteredVisibleRows(data?.pullRequests?.behind).length,
     runningPrs: filteredVisibleRows(
       [...(data?.pullRequests?.running || []), ...(data?.actions?.running || [])],
       (row) => (row.kind === "workflowRun" ? actionKey(row) : prKey(row))
@@ -1887,6 +1941,7 @@ function renderMetrics(data) {
     noCi: counts.noCiPrs,
     fail: counts.failingPrs,
     conflicts: counts.conflictPrs,
+    behind: counts.behindPrs,
     running: counts.runningPrs,
     runningCd: counts.runningCd,
     finishedCd: counts.finishedCd,
@@ -1900,6 +1955,7 @@ function renderMetrics(data) {
     noCi: totals.noCiPrs,
     fail: totals.failingPrs,
     conflicts: totals.conflictPrs,
+    behind: totals.behindPrs,
     running: totals.runningPrs,
     runningCd: totals.runningCd,
     finishedCd: totals.finishedCd,
@@ -2012,7 +2068,8 @@ function render() {
     syncAccountOptions(data.accounts);
   }
 
-  setError(dashboardWarning(data), "warning");
+  if (state.actionError) setError(state.actionError, "error");
+  else setError(dashboardWarning(data), "warning");
   renderRefreshStatus();
   renderMetrics(data);
   updateTabTitle(data);
@@ -2045,6 +2102,7 @@ function render() {
     ? rows.map((row) => renderRow(row, state.view, view)).join("")
     : renderEmptyState(view, all.length);
   const dismissBar = renderDismissBar(dismissedCount, activeDismissable);
+  els.content.dataset.view = state.view;
   els.content.innerHTML = `${state.view === "pipelineTraces" ? renderTraceFilterBar(data) : ""}${dismissBar}${body}`;
 }
 
@@ -2055,7 +2113,7 @@ function render() {
 // after app updates.
 function dismissKeys(row) {
   if (!row) return [];
-  if (["fail", "running"].includes(state.view)) {
+  if (["fail", "running", "behind"].includes(state.view)) {
     return normalizeDismissKeys(row.kind === "workflowRun" ? actionKey(row) : prKey(row));
   }
   if (state.view === "failedCd") return normalizeDismissKeys(actionKey(row));
@@ -2152,12 +2210,24 @@ function renderTraceFilterBar(data) {
 function renderRow(row, viewKey, view) {
   if (viewKey === "fail" && row.kind === "workflowRun") return renderWorkflowRunRow(row, view);
   if (viewKey === "running" && row.kind === "workflowRun") return renderWorkflowRunRow(row, view);
-  if (["pass", "noCi", "fail", "running", "conflicts"].includes(viewKey)) return renderPrRow(row, view);
+  if (["pass", "noCi", "fail", "running", "conflicts", "behind"].includes(viewKey)) return renderPrRow(row, view);
   if (viewKey === "pipelineTraces") return renderTraceRow(row);
   if (viewKey === "finishedCd") return renderFinishedCdRow(row, view);
   if (["runningCd", "finishedCd", "failedCd"].includes(viewKey)) return renderCdRow(row, view, viewKey);
   if (viewKey === "deployments") return renderDeploymentRow(row, view);
   return renderRunnerRow(row, view);
+}
+
+// Mirrors the server's isBehindBase: anything that is not a positive integer
+// means "we do not know", and an unknown count must never move a row.
+function isBehindBase(row) {
+  return Number.isInteger(row?.behindBy) && row.behindBy > 0;
+}
+
+function behindSentence(row) {
+  const count = row.behindBy;
+  const base = row.baseRefName || "the base branch";
+  return `${count} commit${count === 1 ? "" : "s"} behind ${base} — merge the latest ${base} into this branch`;
 }
 
 function mergeBlockReason(row) {
@@ -2221,6 +2291,32 @@ function renderRerunButton(row) {
   </button>`;
 }
 
+// Shown only on a behind, non-conflicting PR: GitHub answers 422 to an update
+// on a conflicting branch, so offering the button there would be a lie.
+function renderUpdateButton(row) {
+  if (!isBehindBase(row) || row.hasConflict) return "";
+  const key = mergeKey(row.repo, row.number);
+  const isUpdating = state.updating.has(key);
+  const isUpdated = state.updated.has(key);
+  const label = isUpdated ? "Updated" : isUpdating ? "Updating" : "Update branch";
+  const title = isUpdated
+    ? "GitHub accepted the branch update"
+    : isUpdating
+    ? "Asking GitHub to merge the base branch into this one..."
+    : behindSentence(row);
+  return `<button
+    class="update-button"
+    type="button"
+    data-repo="${escapeHtml(row.repo)}"
+    data-number="${escapeHtml(row.number)}"
+    data-title="${escapeHtml(row.title)}"
+    data-state="${isUpdated ? "updated" : isUpdating ? "updating" : "ready"}"
+    aria-label="${escapeHtml(label)} ${escapeHtml(row.repo)} ${escapeHtml(row.numberLabel)}"
+    title="${escapeHtml(title)}"
+    ${isUpdating || isUpdated ? "disabled" : ""}
+  >${escapeHtml(label)}</button>`;
+}
+
 function renderPrActions(row, dismissButton = "") {
   const key = mergeKey(row.repo, row.number);
   const reason = mergeBlockReason(row);
@@ -2277,6 +2373,7 @@ function renderPrActions(row, dismissButton = "") {
   return `
     <div class="row-actions">
       ${row.state === "fail" ? renderRerunButton(row) : ""}
+      ${renderUpdateButton(row)}
       ${mergeButton}
       ${closeButton}
       <a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open PR</a>
@@ -2305,6 +2402,16 @@ function renderPrRow(row, view) {
   const draftBadge = row.isDraft
     ? `<span class="draft-pill" title="Draft pull request">Draft</span>`
     : "";
+  // The pill drops the word "commits" because the full sentence crowds the
+  // [FAIL] [DRAFT] pills beside it; the sentence lives in the title (A-002).
+  const behindBadge = isBehindBase(row)
+    ? `<span class="behind-pill" title="${escapeHtml(behindSentence(row))}">
+         <svg viewBox="0 0 24 24" aria-hidden="true">
+           <path d="M12 4v13m0 0-5-5m5 5 5-5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+         </svg>
+         ${escapeHtml(row.behindBy)} behind <span class="behind-pill-ref">${escapeHtml(row.baseRefName || "base")}</span>
+       </span>`
+    : "";
   const phaseBadge = renderPhaseBadge(row);
   const keys = dismissKeys(row);
   const dismissed = anyDismissed(keys);
@@ -2319,6 +2426,7 @@ function renderPrRow(row, view) {
       <div class="tag-group">
         <span class="tag">${escapeHtml(stateLabel)}</span>
         ${conflictBadge}
+        ${behindBadge}
         ${draftBadge}
         ${phaseBadge}
       </div>
@@ -3150,7 +3258,7 @@ async function mergePullRequest(button) {
   clearAutoMerge(key);
   state.merging.add(key);
   state.merged.delete(key);
-  setError("");
+  setActionError("");
   render();
   try {
     const response = await fetch("/api/pull-request/merge", {
@@ -3179,10 +3287,49 @@ async function mergePullRequest(button) {
     );
     await refreshAfterMutation("merge");
   } catch (error) {
-    setError(error.message);
+    setActionError(error.message);
     showToast("Merge failed", error.message);
   } finally {
     state.merging.delete(key);
+    render();
+  }
+}
+
+async function updatePullRequestBranch(button) {
+  const repo = button.dataset.repo;
+  const number = Number(button.dataset.number);
+  const key = mergeKey(repo, number);
+  const title = button.dataset.title || `#${number}`;
+  if (!repo || !Number.isInteger(number)) return;
+  if (state.updating.has(key) || state.updated.has(key)) return;
+
+  state.updating.add(key);
+  state.updated.delete(key);
+  setActionError("");
+  render();
+  try {
+    const response = await fetch("/api/pull-request/update-branch", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo, number })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      // GitHub's own words, not a paraphrase: a branch-protection refusal and a
+      // fork the App cannot push to are different problems, and only GitHub
+      // knows which one this is (DL-009).
+      throw new Error(data.error || "Unable to update branch");
+    }
+    state.updating.delete(key);
+    state.updated.add(key);
+    render();
+    showToast("Branch updated", `${repo} ${data.numberLabel || `#${number}`}: ${title}.`);
+    await refreshAfterMutation("update-branch");
+  } catch (error) {
+    setActionError(error.message);
+    showToast("Update failed", error.message);
+  } finally {
+    state.updating.delete(key);
     render();
   }
 }
@@ -3198,7 +3345,7 @@ async function closePullRequest(button) {
   clearAutoMerge(key);
   state.closing.add(key);
   state.closed.delete(key);
-  setError("");
+  setActionError("");
   render();
   try {
     const response = await fetch("/api/pull-request/close", {
@@ -3222,7 +3369,7 @@ async function closePullRequest(button) {
     );
     await refreshAfterMutation("close");
   } catch (error) {
-    setError(error.message);
+    setActionError(error.message);
     showToast("Close failed", error.message);
   } finally {
     state.closing.delete(key);
@@ -3455,6 +3602,14 @@ els.content.addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   mergePullRequest(button);
+});
+
+els.content.addEventListener("click", (event) => {
+  const button = event.target.closest(".update-button");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  updatePullRequestBranch(button);
 });
 
 els.content.addEventListener("click", (event) => {
