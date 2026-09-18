@@ -46,6 +46,7 @@ import {
   dependabotQueueDepth,
   shouldCleanDependabotQueue,
   markAutoDismissedDependabotRuns,
+  markAutoDismissedCancelledRuns,
   hasFailedCiSignal,
   cleanupDependabotWorkload,
   runDependabotQueueScan,
@@ -309,6 +310,43 @@ test("failed Dependabot runs arrive pre-dismissed only when cleanup is enabled",
   // The caller's rows are never mutated in place.
   assert.equal(runs[0].autoDismissed, undefined);
   assert.deepEqual(markAutoDismissedDependabotRuns(undefined, { enabled: true }), []);
+});
+
+test("a cancelled run arrives pre-dismissed; every other failure stays actionable", () => {
+  // The distinction that matters: "cancelled" is the only conclusion where the
+  // dashboard offers nothing a user can usefully do, so it is the only one that
+  // gets dismissed for them. timed_out and startup_failure are real failures --
+  // dismissing those would hide work.
+  const runs = [
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#13", conclusion: "cancelled" },
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#14", conclusion: "failure" },
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#15", conclusion: "timed_out" },
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#16", conclusion: "startup_failure" },
+    { kind: "workflowRun", repo: "acme/app", runNumber: "#17", conclusion: "action_required" }
+  ];
+
+  const marked = markAutoDismissedCancelledRuns(runs, { enabled: true });
+  assert.equal(marked[0].autoDismissed, true);
+  assert.match(marked[0].autoDismissReason, /[Cc]ancelled/);
+  for (const index of [1, 2, 3, 4]) {
+    assert.equal(
+      marked[index].autoDismissed,
+      undefined,
+      `${runs[index].conclusion} is a failure someone must still deal with`
+    );
+  }
+
+  // The caller's rows are never mutated in place.
+  assert.equal(runs[0].autoDismissed, undefined);
+});
+
+test("AUTO_DISMISS_CANCELLED_RUNS=0 puts cancelled runs back in the actionable list", () => {
+  // The escape hatch has to actually reach the rows, not merely exist: a repo
+  // that cancels runs deliberately and wants to see them needs this to work.
+  const runs = [{ kind: "workflowRun", repo: "acme/app", runNumber: "#13", conclusion: "cancelled" }];
+  assert.equal(markAutoDismissedCancelledRuns(runs, { enabled: false })[0].autoDismissed, undefined);
+  assert.deepEqual(markAutoDismissedCancelledRuns(undefined, { enabled: true }), []);
+  assert.deepEqual(markAutoDismissedCancelledRuns(null, { enabled: true }), []);
 });
 
 test("refresh recommendations pause when GitHub API quota is low", () => {

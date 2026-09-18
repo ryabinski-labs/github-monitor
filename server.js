@@ -1267,6 +1267,25 @@ function markAutoDismissedDependabotRuns(runs, { enabled = DEPENDABOT_QUEUE_THRE
     : run));
 }
 
+// A cancelled run is not a failure anybody can act on. Most of them are the
+// concurrency group doing its job -- a new push cancels the run still going for
+// the previous commit -- and the rest were cancelled on purpose. Either way the
+// only move left is Dismiss, so the server makes it for you: cancelled runs
+// arrive pre-dismissed, out of the Failing CI list and its tile, still reachable
+// behind the dismissed bar's "Show". Set AUTO_DISMISS_CANCELLED_RUNS=0 to keep
+// them in the actionable list.
+//
+// Scoped to CI runs on purpose. A cancelled *CD* run means the change never
+// reached production, which is very much actionable, so failedCd is left alone.
+const AUTO_DISMISS_CANCELLED_RUNS = process.env.AUTO_DISMISS_CANCELLED_RUNS !== "0";
+
+function markAutoDismissedCancelledRuns(runs, { enabled = AUTO_DISMISS_CANCELLED_RUNS } = {}) {
+  if (!enabled || !Array.isArray(runs)) return runs || [];
+  return runs.map((run) => (run?.conclusion === "cancelled"
+    ? { ...run, autoDismissed: true, autoDismissReason: "Cancelled run — auto-dismissed, nothing to act on" }
+    : run));
+}
+
 const IGNORED_RUN_URLS = parseIgnoredRunUrls(process.env.IGNORED_RUN_URLS || "https://github.com/ryabinski-labs/echothread/actions/runs/31115181511");
 
 function parseIgnoredRunUrls(value) {
@@ -3097,7 +3116,7 @@ async function fetchActionsForRepo(repo) {
         failureReason: await fetchWorkflowRunFailureReason(repo, run)
       }));
       return {
-        failed: markIgnoredRuns(failed),
+        failed: markIgnoredRuns(markAutoDismissedCancelledRuns(failed)),
         running: markIgnoredRuns(running)
       };
     } catch {
@@ -4733,6 +4752,7 @@ export {
   shouldCleanDependabotQueue,
   summarizeScanErrors,
   markAutoDismissedDependabotRuns,
+  markAutoDismissedCancelledRuns,
   hasFailedCiSignal,
   attachBusyRunnerJobs,
   cleanupDependabotWorkload,
