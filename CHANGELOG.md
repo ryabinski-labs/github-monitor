@@ -6,6 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ## [Unreleased]
 
+### Fixed
+
+- The repo owner failed WCAG AA in the light theme. `--muted` measures 4.26:1 on a row and 4.01:1 on a tinted conflict row, and 4.48:1 against the hover surface in dark -- so the label shipped in the previous entry was below the bar on three surfaces. It has its own token now, solved against every background a row actually uses.
+- Two accessibility assertions were passing without measuring anything. axe cannot resolve a background that sits over the row's `::before` accent bar, so it returns those nodes as `incomplete` rather than as violations -- and at Playwright's default 1280px viewport it returns *every* node in `#content` that way. Both axe tests read only `violations`, so both were vacuous at the width they ran at. They now pin an explicit viewport, count `incomplete` as a finding, and leave colour to the checks that compute it from the token values against every real row background.
+
 ### Added
 
 - **Repository colours.** Every row's repo name now carries a colour of its own, so a board drawn from nine repos can be scanned by shape rather than read word by word. The owner is de-emphasised -- it repeats on every row and is rarely the part you are looking for -- and the repo segment takes the colour. A repo keeps its colour for good: the assignment is a small registry in `localStorage`, which hands out a slot nothing else is using rather than hashing the name, because with nine repos over twelve slots a hash collides more often than not. The palette deliberately skips the three hue bands the status colours own -- red, amber and green -- so a repo name can never be misread as an alarm, and every value clears 4.5:1 on both the row and the hover surface in both themes.

@@ -48,6 +48,12 @@
      only thing carrying the meaning (WCAG 1.4.1).
      Each value clears 4.5:1 against the hardest background it can land on --
      the hover surface in dark, the card in light. */
+  /* The owner is deliberately quieter than the name, but "quieter" still has to
+     clear 4.5:1 -- and on the hover surface, not just the resting row. --muted
+     measures 4.48:1 against .row:hover here, which is why this is its own token
+     rather than a reuse. */
+  --repo-owner-ink: #97a6b0;
+
   --repo-1: #b1bf5a;
   --repo-2: #89bf5a;
   --repo-3: #60bf5a;
@@ -102,6 +108,12 @@
   /* Same twelve hues, re-solved against the light card so each still clears
      4.5:1 there. Hue order is identical, so a repo does not change identity
      when the theme flips -- only its lightness does. */
+  /* Light theme: --muted is 4.26:1 on the row and 4.01:1 on the tinted conflict
+     row, so it failed twice over. This clears 4.71:1 at its worst and is still
+     visibly lighter than --muted-strong, which is what keeps the owner secondary
+     to the name. */
+  --repo-owner-ink: #6f6a5c;
+
   --repo-1: #6b7720;
   --repo-2: #4c7d21;
   --repo-3: #298122;
@@ -1358,7 +1370,7 @@ button.metric.active .metric-dot {
    so it recedes and the repo segment -- the only part that differs -- becomes
    the thing the eye lands on. */
 .repo-owner {
-  color: var(--muted);
+  color: var(--repo-owner-ink);
   /* The owner is one hyphenated word, and `overflow-wrap: anywhere` on .repo was
      happily breaking it at the hyphen -- "ryabinski-" on one line, "labs/name"
      on the next, which pushed the one word that matters down a line. Keep the

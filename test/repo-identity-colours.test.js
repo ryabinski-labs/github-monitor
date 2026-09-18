@@ -100,7 +100,12 @@ function statusFixture(pass) {
 
 async function openDashboard({ theme = "dark" } = {}) {
   const browser = await chromium.launch();
-  const page = await browser.newPage();
+  // An explicit viewport, because the default 1280x720 is not a neutral choice:
+  // at that width axe returns every colour-contrast node as `incomplete` with
+  // messageKey "pseudoContent" -- the row's ::before accent bar defeats its
+  // background resolution -- and an assertion that only reads `violations` then
+  // passes while proving nothing. See the incomplete check below.
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const status = statusFixture(REPOS.map((repo, index) => passPr(repo, 100 + index)));
 
   await page.addInitScript(
@@ -239,57 +244,83 @@ for (const theme of ["dark", "light"]) {
   test(`every repo colour clears 4.5:1 on the row and on hover in the ${theme} theme`, { skip }, async () => {
     const { browser, page } = await openDashboard({ theme });
     try {
-      const { swatches, rowBg, hoverBg } = await page.evaluate(() => {
+      const swatches = await page.evaluate(() => {
         const styles = getComputedStyle(document.documentElement);
         const read = (name) => styles.getPropertyValue(name).trim();
-        return {
-          swatches: Array.from({ length: 12 }, (_, index) => read(`--repo-${index + 1}`)),
-          rowBg: read("--paper-strong"),
-          hoverBg: read("--surface-hover")
-        };
+        return [
+          ...Array.from({ length: 12 }, (_, index) => [`--repo-${index + 1}`, read(`--repo-${index + 1}`)]),
+          ["--repo-owner-ink", read("--repo-owner-ink")]
+        ];
       });
 
-      const row = parseColour(rowBg);
-      const hover = parseColour(hoverBg);
+      // Not one background but every one a repo label actually lands on. Each
+      // lane tints its rows, and the tinted conflict row is a harder background
+      // than the plain one -- --muted cleared the plain row at 4.26:1 and still
+      // failed the conflict row at 4.01:1, so checking a single surface is how a
+      // failure hides.
+      const backgrounds = new Map();
+      for (const view of ["pass", "fail", "conflicts", "behind", "running"]) {
+        const found = await page.evaluate((name) => {
+          const rail = document.querySelector(`.rail-item[data-view="${name}"]`);
+          if (!rail) return null;
+          rail.click();
+          const row = document.querySelector(".row");
+          return row ? getComputedStyle(row).backgroundColor : null;
+        }, view);
+        if (found) backgrounds.set(found, view);
+      }
+      const hoverBg = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--surface-hover").trim());
+      backgrounds.set(hoverBg, "hover");
+      assert.ok(backgrounds.size >= 2, "the sweep must find more than one row background to be worth running");
 
-      swatches.forEach((swatch, index) => {
-        assert.ok(swatch, `--repo-${index + 1} must be defined in the ${theme} theme`);
+      for (const [token, swatch] of swatches) {
+        assert.ok(swatch, `${token} must be defined in the ${theme} theme`);
         const colour = parseColour(swatch);
-        const onRow = contrast(colour, row);
-        const onHover = contrast(colour, hover);
-        assert.ok(
-          onRow >= 4.5,
-          `--repo-${index + 1} (${swatch}) is ${onRow.toFixed(2)}:1 on the row background in ${theme}; WCAG 2.2 AA needs 4.5:1`
-        );
-        assert.ok(
-          onHover >= 4.5,
-          `--repo-${index + 1} (${swatch}) is ${onHover.toFixed(2)}:1 on the hover background in ${theme}; a row must stay readable under the cursor`
-        );
-      });
+        for (const [background, where] of backgrounds) {
+          const measured = contrast(colour, parseColour(background));
+          assert.ok(
+            measured >= 4.5,
+            `${token} (${swatch}) is ${measured.toFixed(2)}:1 on the ${where} background (${background}) in the ${theme} theme; WCAG 2.2 AA needs 4.5:1`
+          );
+        }
+      }
     } finally {
       await browser.close();
     }
   });
 
-  // Scoped to #content, matching the existing axe assertion in
-  // test/behind-base-ui.test.js. The rail and the metric tiles carry contrast
-  // violations that predate this change and are tracked separately.
-  test(`axe reports no violations on the coloured repo labels in the ${theme} theme`, { skip }, async () => {
+  test(`axe reports no structural violations around the repo labels in the ${theme} theme`, { skip }, async () => {
     const { browser, page } = await openDashboard({ theme });
     try {
       await page.addScriptTag({ content: axeJs });
       const results = await page.evaluate(async () => {
         const run = await window.axe.run("#content", {
-          runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag22aa"] }
+          runOnly: { type: "tag", values: ["wcag2a", "wcag2aa", "wcag22aa"] },
+          // colour-contrast is measured above, from the token values against
+          // every real row background. axe's own contrast rule cannot resolve a
+          // background that sits over the row's ::before accent bar: it returns
+          // those nodes as `incomplete` with messageKey "pseudoContent", and at
+          // the default 1280px viewport it returns EVERY node that way. An
+          // assertion that reads only `violations` therefore passed this file
+          // and the one in behind-base-ui.test.js while proving nothing about
+          // colour. Structure is what axe is reliable for here, so that is what
+          // it is asked for.
+          rules: { "color-contrast": { enabled: false } }
         });
-        return run.violations.map((violation) => ({
-          id: violation.id,
-          impact: violation.impact,
-          nodes: violation.nodes.map((node) => node.target.join(" "))
-        }));
+        const flatten = (list, bucket) =>
+          list.map((entry) => ({
+            bucket,
+            id: entry.id,
+            nodes: entry.nodes.map((node) => node.target.join(" "))
+          }));
+        // `incomplete` is axe saying it could not decide, which is not the same
+        // as a pass and must not be read as one. A contrast rule that cannot
+        // resolve a background has not cleared the row -- it has declined to
+        // look at it.
+        return [...flatten(run.violations, "violation"), ...flatten(run.incomplete, "incomplete")];
       });
 
-      assert.deepEqual(results, [], `axe violations in the ${theme} theme: ${JSON.stringify(results, null, 2)}`);
+      assert.deepEqual(results, [], `axe findings in the ${theme} theme: ${JSON.stringify(results, null, 2)}`);
     } finally {
       await browser.close();
     }
