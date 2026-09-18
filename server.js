@@ -921,6 +921,16 @@ function snapshotRateLimit(metrics) {
   };
 }
 
+// Test support, in the same spirit as resetObservedRateBuckets. The /api/status
+// tests boot the real server against a mocked fetch in one process, so whatever
+// the first of them memoizes here -- the owner list, a repo's workflows, a
+// repo's runs -- is still cached when the next one runs against a different
+// fixture. That makes a test pass alone and fail in the suite, in whichever
+// direction the fixtures happen to differ. Clearing between tests is the fix.
+function resetGithubValueCache() {
+  githubValueCache.clear();
+}
+
 async function cachedGithubValue(key, ttlMs, loader) {
   const now = Date.now();
   const cached = githubValueCache.get(key);
@@ -1275,8 +1285,15 @@ function markAutoDismissedDependabotRuns(runs, { enabled = DEPENDABOT_QUEUE_THRE
 // behind the dismissed bar's "Show". Set AUTO_DISMISS_CANCELLED_RUNS=0 to keep
 // them in the actionable list.
 //
-// Scoped to CI runs on purpose. A cancelled *CD* run means the change never
-// reached production, which is very much actionable, so failedCd is left alone.
+// Applies to failed CD runs as well. The first cut spared them on the theory
+// that a cancelled deploy means production never got the change -- but both
+// cancelled CD runs on the live dashboard turned out to be a feature branch's
+// release-images and site-deploy, cancelled together by the concurrency group on
+// the next push. Identical noise, same empty set of available actions. The
+// question a cancelled deploy really raises -- did this change reach production
+// -- is answered by the pipeline-trace lane, which reads a merged PR's own CD
+// evidence against TRACE_CD_START_SLA_MS rather than this row list, and which is
+// unaffected because these runs are flagged, never dropped.
 const AUTO_DISMISS_CANCELLED_RUNS = process.env.AUTO_DISMISS_CANCELLED_RUNS !== "0";
 
 function markAutoDismissedCancelledRuns(runs, { enabled = AUTO_DISMISS_CANCELLED_RUNS } = {}) {
@@ -3066,7 +3083,7 @@ async function fetchCdForRepo(repo) {
   });
 
   return {
-    failed: perWorkflow.flatMap((group) => group.failed),
+    failed: markAutoDismissedCancelledRuns(perWorkflow.flatMap((group) => group.failed)),
     finished: perWorkflow.flatMap((group) => group.finished),
     running: perWorkflow.flatMap((group) => group.running)
   };
@@ -4725,6 +4742,7 @@ export {
   scanScopeSnapshot,
   snapshotRateLimit,
   resetObservedRateBuckets,
+  resetGithubValueCache,
   createScanMetrics,
   scanMetrics,
   recommendRefresh,

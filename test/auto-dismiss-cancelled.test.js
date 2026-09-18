@@ -9,6 +9,11 @@
 // row: out of the list and the Failing CI tile, counted in the dismissed bar,
 // revealed by "Show", and never written to localStorage.
 //
+// The same rule covers cancelled CD runs. QA found both cancelled rows on the
+// live dashboard were one feature branch's release-images and site-deploy,
+// cancelled together by the concurrency group on the next push -- the same noise
+// with the same empty set of actions, sitting in Failed CD with a Dismiss button.
+//
 // The rows here carry the shape the server produces (server.test.js pins the
 // marking itself); this file pins what the dashboard does with it.
 //
@@ -61,7 +66,30 @@ const cancelledRun = workflowRun("acme/alpha", 201, {
 });
 const failedRun = workflowRun("acme/bravo", 202);
 
-function statusFixture(failedRuns) {
+function cdRun(repo, runNumber, extra = {}) {
+  return {
+    repo,
+    workflow: "site-deploy",
+    runNumber: `#${runNumber}`,
+    title: `deploy ${runNumber}`,
+    branch: "feat/thing",
+    status: "completed",
+    conclusion: "failure",
+    createdAt: "2026-06-04T11:00:00Z",
+    url: `https://github.com/${repo}/actions/runs/${runNumber}`,
+    ...extra
+  };
+}
+
+const cancelledCd = cdRun("acme/waf", 375, {
+  workflow: "release-images",
+  conclusion: "cancelled",
+  autoDismissed: true,
+  autoDismissReason: "Cancelled run — auto-dismissed, nothing to act on"
+});
+const failedCd = cdRun("acme/waf", 376);
+
+function statusFixture(failedRuns, failedCdRuns = []) {
   return {
     account: "test-account",
     accounts: ["test-account"],
@@ -72,13 +100,13 @@ function statusFixture(failedRuns) {
     summary: {
       repos: 2,
       passingPrs: 0, noCiPrs: 0, failingPrs: failedRuns.length, conflictPrs: 0, runningPrs: 0,
-      runningCd: 0, finishedCd: 0, failedCd: 0, skippedCd: 0,
+      runningCd: 0, finishedCd: 0, failedCd: failedCdRuns.length, skippedCd: 0,
       runningDeployments: 0, busyRunners: 0,
       flaggedJourneys: 0, activeJourneys: 0, shippedJourneys: 0, tracingUnknown: 0
     },
     pullRequests: { pass: [], noCi: [], fail: [], running: [], conflicts: [] },
     actions: { failed: failedRuns, running: [] },
-    cd: { running: [], finished: [], failed: [] },
+    cd: { running: [], finished: [], failed: failedCdRuns },
     deployments: { running: [] },
     runners: { busy: [] },
     traces: { flagged: [], active: [], completed: [], unknown: [] },
@@ -87,16 +115,16 @@ function statusFixture(failedRuns) {
   };
 }
 
-async function openDashboard(failedRuns) {
+async function openDashboard(failedRuns, { view = "fail", failedCdRuns = [] } = {}) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
 
-  await page.addInitScript(() => {
-    localStorage.setItem("pr-deck:v1", JSON.stringify({ view: "fail" }));
+  await page.addInitScript((startView) => {
+    localStorage.setItem("pr-deck:v1", JSON.stringify({ view: startView }));
     localStorage.removeItem("pr-deck:dismissed:v1");
-  });
+  }, view);
 
-  const body = JSON.stringify(statusFixture(failedRuns));
+  const body = JSON.stringify(statusFixture(failedRuns, failedCdRuns));
   await page.route("**/*", async (route) => {
     const p = new URL(route.request().url()).pathname;
     if (p === "/" || p === "/index.html") return route.fulfill({ contentType: "text/html", body: indexHtml });
@@ -142,6 +170,9 @@ test("Show reveals the cancelled run, labelled automatic and with no rerun to pr
     await page.waitForFunction(() => document.querySelectorAll("article.row").length === 2);
 
     const auto = page.locator("article.row", { hasText: "Superseded by a newer push" });
+    // count() resolves immediately; innerText() on a missing element would sit
+    // out the full 30s locator timeout and turn a regression into a hang.
+    assert.equal(await auto.locator(".row-dismiss-auto").count(), 1, "the row carries the automatic label");
     assert.equal(await auto.locator(".row-dismiss-auto").innerText(), "Auto-dismissed");
     assert.equal(await auto.locator("[data-dismiss-key]").count(), 0, "no per-row dismiss control on an auto row");
     assert.match(await auto.locator(".tag").first().innerText(), /cancelled/i, "the run still reads as cancelled");
@@ -177,6 +208,55 @@ test("Restore all does not drag cancelled runs back into the list", { skip }, as
     await page.waitForFunction(() => document.querySelectorAll("article.row").length === 2);
     assert.match(await page.locator(".dismiss-bar-label").innerText(), /1 dismissed item/);
     assert.deepEqual(await readDismissedKeys(page), [], "restore clears every user dismissal");
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- the same rule in the Failed CD lane -------------------------------------
+
+test("a cancelled CD run leaves Failed CD too", { skip }, async () => {
+  const { browser, page } = await openDashboard([], { view: "failedCd", failedCdRuns: [cancelledCd, failedCd] });
+  try {
+    await page.waitForSelector("article.row");
+    // The real CD failure has to survive, or "the cancelled deploy is gone" is
+    // just as true of a lane that rendered nothing at all.
+    assert.equal(await page.locator("article.row").count(), 1, "the real CD failure stays actionable");
+    assert.match(await page.locator("article.row .title").innerText(), /deploy 376/);
+    assert.equal(await page.locator("#metricFailedCd").innerText(), "1", "Failed CD tile drops the cancelled run");
+    assert.match(await page.locator(".dismiss-bar-label").innerText(), /1 dismissed item/);
+    assert.deepEqual(await readDismissedKeys(page), [], "auto-dismissals never touch localStorage");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("a revealed cancelled CD run is labelled, not handed a Dismiss button", { skip }, async () => {
+  // The bug this pins: renderCdRow read only the local dismissal map, so an
+  // auto-dismissed CD row rendered undimmed with a live Dismiss button. Pressing
+  // it wrote a localStorage key for a row the server re-dismisses every scan,
+  // which then made "Restore all" look broken when the row stayed hidden.
+  const { browser, page } = await openDashboard([], { view: "failedCd", failedCdRuns: [cancelledCd, failedCd] });
+  try {
+    await page.waitForSelector("[data-dismiss-toggle]");
+    await page.click("[data-dismiss-toggle]");
+    await page.waitForFunction(() => document.querySelectorAll("article.row").length === 2);
+
+    const auto = page.locator("article.row", { hasText: "deploy 375" });
+    // count() resolves immediately; innerText() on a missing element would sit
+    // out the full 30s locator timeout and turn a regression into a hang.
+    assert.equal(await auto.locator(".row-dismiss-auto").count(), 1, "the row carries the automatic label");
+    assert.equal(await auto.locator(".row-dismiss-auto").innerText(), "Auto-dismissed");
+    assert.equal(await auto.locator("[data-dismiss-key]").count(), 0, "no per-row dismiss control on an auto row");
+    assert.ok(
+      (await auto.getAttribute("class")).includes("row-dismissed"),
+      "the row reads as dismissed rather than looking actionable"
+    );
+    assert.match(
+      await auto.locator(".row-dismiss-auto").getAttribute("title"),
+      /[Cc]ancelled/,
+      "the row says why it was dismissed"
+    );
   } finally {
     await browser.close();
   }
