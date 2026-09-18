@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Out of date** measured the wrong thing. The lane read `aheadBy` from the base-to-head comparison, which is how many commits the PR *adds*, not how far it has fallen behind. The effect was that every PR with any commits of its own was flagged as stale, every genuinely stale PR was missed, and the pill's number was the PR's own commit count. `Ref.compare(headRef:)` describes the head relative to the base exactly as `/compare/<base>...<head>` does, so the field is `behindBy`; measured against both the REST endpoint and `git rev-list --count`. On the twelve PRs open here that is the difference between flagging ten and flagging the four that are actually behind.
+
 ### Added
 
 - **Out of date**: a new PR lane for branches that have fallen behind their base, with an `Update branch` button that merges the base in without leaving the dashboard. An open PR whose head is behind its base and has no conflict leaves whichever CI lane it was in and appears here instead, because being behind is what is actually stopping it from merging; a conflicting PR still belongs to Conflicts, since GitHub refuses an update on one. Each row states how far behind it is and against which branch, keeps its `Merge`, `Close` and `Rerun failed` actions, and announces itself once when the update is the *only* thing left blocking it. Detection is cached on the base and head commits, so a scan that finds nothing moved costs no extra request.

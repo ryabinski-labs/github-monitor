@@ -35,12 +35,13 @@ function prNode({ behindBy = 0, baseRefName = "main", checks = [], number = 118 
     baseRefName,
     author: { login: "cigan1" },
     repository: { nameWithOwner: "ryabinski-labs/github-monitor", isArchived: false },
-    // Corrected against the live schema on 2026-09-18. The spec asked for
-    // baseRef.compare.behindBy, but that counts how far the *base* is behind
-    // the head -- the PR's ahead count. Measured on a branch five commits
-    // behind main: { behindBy: 0, aheadBy: 5, status: AHEAD } from the base
-    // ref. The number this lane is about is aheadBy on that comparison.
-    baseRef: { compare: { aheadBy: behindBy } },
+    // baseRef.compare(headRef:) describes the head relative to the base, the
+    // same way REST's /compare/<base>...<head> does, so behindBy is how far the
+    // head is behind and aheadBy is the PR's own commit count. #127 shipped it
+    // inverted; aheadBy is set here to a different, non-zero number precisely so
+    // that reading the wrong field can never accidentally produce the right
+    // answer. See the ground-truth measurements in server.js.
+    baseRef: { compare: { behindBy, aheadBy: behindBy + 3 } },
     commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes: checks } } } }] }
   };
 }
@@ -119,6 +120,52 @@ test("SC-detect-same-repo-headref: a same-repo PR compares against a bare branch
   });
 
   assert.equal(headRef, "feat/x", "a same-repo compare must not be owner-prefixed");
+});
+
+test("SC-detect-compare-field: the compare reads how far the head is behind, not its own commit count", async () => {
+  // Oracle: the wire query selects behindBy, and a compare answering
+  // { behindBy: 9, aheadBy: 3 } puts 9 -- not 3 -- on the PR object.
+  //
+  // This is the scenario #127 did not have, and its absence is why the lane
+  // shipped inverted. baseRef.compare(headRef:) describes the head relative to
+  // the base, exactly like REST's /compare/<base>...<head>: behindBy is how far
+  // the head has fallen behind, aheadBy is what the PR itself contributes.
+  // Reading aheadBy flagged every PR that had any commits and never flagged a
+  // stale one. The two numbers differ here so only the correct field passes.
+  assert.ok(
+    !/compare\s*\([^)]*\)\s*\{[^}]*\baheadBy\b/.test(readFileSync(path.join(root, "server.js"), "utf8")),
+    "the compare selection must not ask for aheadBy: that is the PR's own commit count, not its staleness"
+  );
+
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
+  server.resetGithubValueCache();
+
+  const rows = [{ ...pr({ behindBy: undefined }), headRefName: "feat/x", baseSha: "base1", headSha: "head1" }];
+  const originalFetch = globalThis.fetch;
+  let sentQuery = "";
+  globalThis.fetch = async (_url, init) => {
+    sentQuery = JSON.parse(init.body).query;
+    return new Response(
+      JSON.stringify({ data: { pr0: { pullRequest: { baseRef: { compare: { behindBy: 9, aheadBy: 3 } } } } } }),
+      { status: 200, headers: { "content-type": "application/json" } }
+    );
+  };
+  try {
+    await server.fetchBehindCounts(rows);
+    assert.match(sentQuery, /behindBy/, "the compare document must select behindBy");
+    assert.doesNotMatch(sentQuery, /aheadBy/, "the compare document must not select aheadBy");
+    assert.equal(
+      rows[0].behindBy,
+      9,
+      "the lane must report how far the branch is behind its base, not how many commits the PR adds"
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+    server.resetGithubValueCache();
+    if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
 });
 
 // --- REQ-behind-lane ---------------------------------------------------------
@@ -381,10 +428,15 @@ test("SC-detect-no-extra-requests: a scan where nothing moved costs no compare r
   let calls = 0;
   globalThis.fetch = async () => {
     calls += 1;
-    return new Response(JSON.stringify({ data: { pr0: { pullRequest: { baseRef: { compare: { aheadBy: 4 } } } } } }), {
-      status: 200,
-      headers: { "content-type": "application/json" }
-    });
+    return new Response(
+      // aheadBy is deliberately a different number: reading the wrong field
+      // must not be able to produce the expected answer by coincidence.
+      JSON.stringify({ data: { pr0: { pullRequest: { baseRef: { compare: { behindBy: 4, aheadBy: 11 } } } } } }),
+      {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      }
+    );
   };
   try {
     await server.fetchBehindCounts(rows);
@@ -449,7 +501,7 @@ test("SC-lane-status-payload: the behind lane reaches /api/status, not just grou
         compareCalls += 1;
         assert.equal(body.variables.h0, "feat/x", "a same-repo head ref is passed unqualified");
         return Response.json(
-          { data: { pr0: { pullRequest: { baseRef: { compare: { aheadBy: 9 } } } } } },
+          { data: { pr0: { pullRequest: { baseRef: { compare: { behindBy: 9, aheadBy: 2 } } } } } },
           { headers }
         );
       }
