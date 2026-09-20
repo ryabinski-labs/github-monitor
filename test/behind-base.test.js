@@ -168,6 +168,68 @@ test("SC-detect-compare-field: the compare reads how far the head is behind, not
   }
 });
 
+test("a base-branch push invalidates a cached zero even when the PR baseRefOid is unchanged", async () => {
+  const previousToken = process.env.GITHUB_TOKEN;
+  const previousFetch = globalThis.fetch;
+  process.env.GITHUB_TOKEN = "test-token";
+  server.resetGithubValueCache();
+  let calls = 0;
+  globalThis.fetch = async () => Response.json({ data: {
+    pr0: { pullRequest: { baseRef: { compare: { behindBy: calls++ === 0 ? 0 : 4 } } } }
+  } });
+  const node = (tip) => ({
+    ...prNode(), headRefName: "feat/x", baseRefOid: "old-pr-base",
+    baseRef: { target: { oid: tip } }
+  });
+  try {
+    assert.match(server.PR_SEARCH_GRAPHQL, /baseRef\s*\{\s*target\s*\{\s*oid/);
+    const before = classifyPullRequest(node("base1"));
+    await server.fetchBehindCounts([before]);
+    assert.equal(before.behindBy, undefined);
+    await server.fetchBehindCounts([classifyPullRequest(node("base1"))]);
+    assert.equal(calls, 1, "a successful zero remains cacheable");
+    const after = classifyPullRequest(node("base2"));
+    await server.fetchBehindCounts([after]);
+    assert.equal(calls, 2);
+    assert.equal(after.behindBy, 4);
+    assert.deepEqual(groupPullRequests([after]).behind, [after]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    server.resetGithubValueCache();
+    if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
+test("partial compare failures retry while successful siblings stay cached", async () => {
+  const previousToken = process.env.GITHUB_TOKEN;
+  const previousFetch = globalThis.fetch;
+  process.env.GITHUB_TOKEN = "test-token";
+  server.resetGithubValueCache();
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    return Response.json(calls === 1 ? {
+      errors: [{ message: "Comparison temporarily unavailable", path: ["pr1"] }],
+      data: { pr0: { pullRequest: { baseRef: { compare: { behindBy: 3 } } } }, pr1: null }
+    } : { data: { pr0: { pullRequest: { baseRef: { compare: { behindBy: 7 } } } } } });
+  };
+  const rows = [1, 2].map((number) => pr({ number, headRefName: "feat/x", baseSha: "base1", headSha: "head1" }));
+  try {
+    await server.fetchBehindCounts(rows);
+    assert.equal(rows[0].behindBy, 3);
+    assert.equal(rows[1].behindBy, undefined);
+    await server.fetchBehindCounts(rows);
+    assert.equal(calls, 2, "an unknown result must not suppress retries for six hours");
+    assert.deepEqual(rows.map((row) => row.behindBy), [3, 7]);
+  } finally {
+    globalThis.fetch = previousFetch;
+    server.resetGithubValueCache();
+    if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+});
+
 // --- REQ-behind-lane ---------------------------------------------------------
 
 test("SC-lane-exclusive: a behind PR leaves every other lane", () => {
@@ -269,64 +331,53 @@ test("SC-failopen-bad-values: null, negative and non-numeric behindBy values nev
 
 // --- REQ-update-endpoint -----------------------------------------------------
 
-test("SC-endpoint-calls-github: the route issues the documented GitHub call", () => {
-  // Oracle: exactly 1 PUT to /repos/{repo}/pulls/{number}/update-branch, no
-  // update_method key in the body (DL-003 -- merge commit, never rebase).
-  assert.equal(
-    typeof server.buildUpdateBranchRequest,
-    "function",
-    "server.js must export buildUpdateBranchRequest(repo, number) so the GitHub call shape is testable without a live server"
-  );
-
-  const request = server.buildUpdateBranchRequest("ryabinski-labs/github-monitor", 118);
-
-  assert.equal(request.method, "PUT", "GitHub's update-branch endpoint is a PUT");
-  assert.equal(
-    request.path,
-    "/repos/ryabinski-labs/github-monitor/pulls/118/update-branch",
-    "the path must address the PR being updated"
-  );
-  assert.ok(
-    !("update_method" in (request.body || {})),
-    "omitting update_method is what makes this a merge-commit update; sending 'rebase' would force-push the head branch"
-  );
-});
-
-test("SC-endpoint-rejects-get: the route refuses a non-POST method", () => {
-  // Oracle: response status is 405 and the stubbed GitHub transport recorded 0 calls
-  assert.equal(
-    typeof server.updatePullRequestBranch,
-    "function",
-    "server.js must export the updatePullRequestBranch(req, res) handler"
-  );
-
+async function withUpdateEndpoint(run) {
+  const previousFetch = globalThis.fetch;
+  const previousToken = process.env.GITHUB_TOKEN;
+  process.env.GITHUB_TOKEN = "test-token";
   const calls = [];
-  const res = { statusCode: 0, writeHead(status) { this.statusCode = status; }, end() {} };
+  globalThis.fetch = async (url, options) => {
+    calls.push({ url: String(url), ...options });
+    return Response.json({ message: "Updating pull request branch." }, { status: 202 });
+  };
+  await new Promise((resolve) => server.server.listen(0, "127.0.0.1", resolve));
+  const endpoint = `http://127.0.0.1:${server.server.address().port}/api/pull-request/update-branch`;
+  try {
+    await run((options) => previousFetch(endpoint, options), calls);
+  } finally {
+    await new Promise((resolve) => server.server.close(resolve));
+    globalThis.fetch = previousFetch;
+    if (previousToken === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = previousToken;
+  }
+}
 
-  assert.rejects(
-    () => server.updatePullRequestBranch({ method: "GET" }, res),
-    (error) => error.status === 405,
-    "a GET must be refused with 405 before any GitHub call is considered"
-  );
-  assert.equal(calls.length, 0, "a refused method must spend no GitHub quota");
+test("SC-endpoint-calls-github: the route issues the documented GitHub call", async () => {
+  await withUpdateEndpoint(async (request, calls) => {
+    const response = await request({ method: "POST", body: JSON.stringify({ repo: "fixture/app", number: 118 }) });
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).updated, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "PUT");
+    assert.equal(calls[0].url, "https://api.github.com/repos/fixture/app/pulls/118/update-branch");
+    assert.deepEqual(JSON.parse(calls[0].body), {}, "omit update_method so GitHub merges rather than rebases");
+  });
 });
 
-test("SC-endpoint-validates-input: a malformed repo or number is rejected before GitHub is called", () => {
-  // Oracle: response status is 400 and the stubbed GitHub transport recorded 0 calls
-  assert.equal(
-    typeof server.buildUpdateBranchRequest,
-    "function",
-    "server.js must export buildUpdateBranchRequest(repo, number)"
-  );
+test("SC-endpoint-rejects-get: the route refuses a non-POST method", async () => {
+  await withUpdateEndpoint(async (request, calls) => {
+    assert.equal((await request({ method: "GET" })).status, 405);
+    assert.equal(calls.length, 0, "invalid methods must never reach GitHub");
+  });
+});
 
-  assert.throws(
-    () => server.buildUpdateBranchRequest("not-a-repo", 118),
-    "a repo without an owner/name shape must be rejected, not sent to GitHub"
-  );
-  assert.throws(
-    () => server.buildUpdateBranchRequest("ryabinski-labs/github-monitor", 0),
-    "PR number 0 does not exist and must be rejected before the call"
-  );
+test("SC-endpoint-validates-input: a malformed repo or number is rejected before GitHub is called", async () => {
+  await withUpdateEndpoint(async (request, calls) => {
+    for (const body of [{ repo: "not-a-repo", number: 118 }, { repo: "fixture/app", number: 0 }]) {
+      assert.equal((await request({ method: "POST", body: JSON.stringify(body) })).status, 400);
+    }
+    assert.equal(calls.length, 0, "invalid inputs must never reach GitHub");
+  });
 });
 
 // --- REQ-contrast ------------------------------------------------------------
@@ -517,6 +568,7 @@ test("SC-lane-status-payload: the behind lane reaches /api/status, not just grou
         headRefOid: "abc1234",
         baseRefName: "main",
         baseRefOid: "base1234",
+        baseRef: { target: { oid: "live-base1234" } },
         headRefName: "feat/x",
         headRepository: { nameWithOwner: "behind-fixture/app" },
         author: { login: "cigan1" },

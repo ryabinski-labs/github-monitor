@@ -109,6 +109,7 @@ async function openDashboard({
   // only `violations` then passes without measuring anything.
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const posts = [];
+  const statusRequests = [];
   const queue = [...statuses];
 
   await page.addInitScript(
@@ -132,6 +133,7 @@ async function openDashboard({
     if (pathname === "/favicon.svg") return route.fulfill({ contentType: "image/svg+xml", body: "<svg xmlns='http://www.w3.org/2000/svg'/>" });
 
     if (pathname === "/api/status") {
+      statusRequests.push(request.url());
       const next = queue.length > 1 ? queue.shift() : queue[0];
       return route.fulfill({ contentType: "application/json", body: JSON.stringify(next) });
     }
@@ -153,7 +155,7 @@ async function openDashboard({
 
   await page.goto("http://localhost/");
   await page.waitForSelector("#rail");
-  return { browser, page, posts };
+  return { browser, page, posts, statusRequests };
 }
 
 async function waitForBehindNotice(page, expected = 1) {
@@ -294,8 +296,10 @@ test("SC-button-inflight-single-request: a second click during the request issue
 test("SC-button-success-state: a successful update reports itself and refreshes", { skip }, async () => {
   // Oracle: button reads "Updated" and is disabled, a "Branch updated" toast
   // names the PR, and a follow-up scan was requested.
-  const { browser, page } = await openDashboard({
-    statuses: [statusFixture({ behind: [behindPr()] }), statusFixture({ behind: [], pass: [behindPr({ behindBy: 0 })] })]
+  const { browser, page, statusRequests } = await openDashboard({
+    // GitHub may still report the old comparison on the follow-up scan. Keep
+    // the row visible so its completed state is measured, not assumed.
+    statuses: [statusFixture({ behind: [behindPr()] })]
   });
   try {
     await selectBehindView(page);
@@ -308,6 +312,12 @@ test("SC-button-success-state: a successful update reports itself and refreshes"
     const toast = await page.locator(".toast").first().textContent();
     assert.match(toast, /Branch updated/, "a successful update must announce itself");
     assert.match(toast, /#118/, "the toast must name the PR it updated");
+    assert.match(toast, /ryabinski-labs\/github-monitor/, "the toast must name the repository");
+    const button = page.locator(".update-button").first();
+    assert.equal((await button.textContent()).trim(), "Updated");
+    assert.equal(await button.isDisabled(), true);
+    await page.waitForFunction(() => document.querySelector("#refresh")?.disabled === false);
+    assert.equal(statusRequests.length, 2, "success must request a follow-up status scan");
   } finally {
     await browser.close();
   }
@@ -333,6 +343,7 @@ test("SC-failure-403-message: a 403 shows GitHub's message and re-enables the bu
 
     const panel = await page.locator("#errorPanel").textContent();
     assert.match(panel, new RegExp(message), "the error panel must carry GitHub's own words, not a paraphrase");
+    assert.ok((await page.locator(".toast").first().textContent()).includes(message), "the toast must also carry GitHub's message");
 
     const button = page.locator(".update-button").first();
     assert.equal(await button.isDisabled(), false, "a failed update must leave the button usable");
@@ -396,6 +407,10 @@ test("SC-notify-stuck-only: a passing, non-draft, non-conflicting newly behind P
     const entries = inbox.filter((item) => String(item.tag || "").startsWith("behind:"));
     assert.equal(entries.length, 1, "a PR stuck only on the update must announce itself exactly once");
     assert.equal(entries[0].title, "Branch out of date", "the notice must name the state it is reporting");
+    const pr = behindPr();
+    assert.equal(entries[0].body, `${pr.repo} ${pr.numberLabel}: ${pr.title}`);
+    assert.equal(entries[0].tag, `behind:${pr.url}`);
+    assert.equal(entries[0].url, pr.url);
   } finally {
     await browser.close();
   }
@@ -634,6 +649,41 @@ test("SC-axe-clean-both-themes: the new view is axe-clean in dark and light", { 
         ];
       });
       assert.deepEqual(violations, [], `${theme} theme must report no axe findings, got: ${violations.join("; ")}`);
+    } finally {
+      await browser.close();
+    }
+  }
+});
+
+test("behind lane keeps branch status, checks, and actions separate across screen sizes", { skip }, async () => {
+  for (const theme of ["dark", "light"]) {
+    const { browser, page } = await openDashboard({ theme, statuses: [statusFixture({ behind: [
+      behindPr({ baseRefName: "release/2026-09-hotfix-candidate" }),
+      behindPr({ number: 119, state: "fail", failedRuns: [{ runId: 101, workflow: "CI" }] })
+    ] })] });
+    try {
+      for (const [width, height] of [[375, 667], [390, 844], [430, 932], [1280, 900], [1440, 900], [1728, 1000]]) {
+        await page.setViewportSize({ width, height });
+        await page.waitForSelector("#content .behind-pill");
+        const failures = await page.evaluate(() => {
+          const problems = [];
+          if (document.documentElement.scrollWidth > innerWidth) problems.push("page overflows horizontally");
+          for (const row of document.querySelectorAll("#content .row")) {
+            const pill = row.querySelector(".behind-pill").getBoundingClientRect();
+            const summary = row.children[3].getBoundingClientRect();
+            if (Math.min(pill.right, summary.right) > Math.max(pill.left, summary.left)
+              && Math.min(pill.bottom, summary.bottom) > Math.max(pill.top, summary.top)) problems.push("branch pill overlaps check summary");
+            const bounds = row.getBoundingClientRect();
+            for (const action of row.querySelectorAll(".row-actions > *")) {
+              const rect = action.getBoundingClientRect();
+              if (rect.left < bounds.left || rect.right > bounds.right) problems.push("action escapes row");
+              if (innerWidth <= 430 && rect.height < 44) problems.push("mobile action is smaller than 44px");
+            }
+          }
+          return problems;
+        });
+        assert.deepEqual(failures, [], `${theme} ${width}x${height}`);
+      }
     } finally {
       await browser.close();
     }

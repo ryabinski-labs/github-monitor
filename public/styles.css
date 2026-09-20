@@ -2318,6 +2318,19 @@ button.metric.active .metric-dot {
 }
 
 /* —————————————————————— RESPONSIVE —————————————————————— */
+@media (min-width: 1301px) {
+  /* The behind lane adds a branch pill and an action. Give its status column
+     the pill's full width and put actions on their own line so neither can
+     collide with the check summary in a dense desktop row. */
+  .row:has(.behind-pill) {
+    grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) minmax(190px, auto) minmax(120px, 0.5fr);
+  }
+  .row:has(.behind-pill) > .row-actions {
+    grid-column: 1 / -1;
+    flex-wrap: wrap;
+  }
+}
+
 @media (max-width: 1300px) {
   .row {
     grid-template-columns: minmax(0, 1fr) auto;
