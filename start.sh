@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # GitHub Monitor — startup script
-# Verifies prerequisites, then launches the server and opens the dashboard.
+# Verifies prerequisites, then launches the server.
 
 set -euo pipefail
 
@@ -89,20 +89,5 @@ fi
 echo
 bold "Starting server…"
 dim  "(Ctrl-C to stop)"
-
-# 4. Open browser shortly after the server boots
-(
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 0.4
-    if curl -fsS -o /dev/null "${URL}" 2>/dev/null; then
-      if command -v open >/dev/null 2>&1; then
-        open "${URL}"
-      elif command -v xdg-open >/dev/null 2>&1; then
-        xdg-open "${URL}" >/dev/null 2>&1 || true
-      fi
-      break
-    fi
-  done
-) &
 
 PORT="${PORT}" exec node server.js

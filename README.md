@@ -62,7 +62,7 @@ Handy variants:
 ```bash
 GITHUB_TOKEN=<your-token> npm start   # use an explicit token
 PORT=4180 npm start                   # use a different port
-npm run dev                           # guided launch: checks Node, credentials, port, then opens the browser
+npm run dev                           # guided launch: checks Node, credentials, and port, then starts the server
 ```
 
 Prefer a config file? Copy [`.env.example`](.env.example) to `.env` and fill in what you need.
