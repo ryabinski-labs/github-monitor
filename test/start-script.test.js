@@ -16,7 +16,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 // runners ship gh in /usr/bin, so `withGh: false` only meant "no gh" on a
 // machine that happens to keep it somewhere else. Everything start.sh invokes
 // is either stubbed here or symlinked in by name.
-const HOST_TOOLS = ["dirname", "sleep"];
+const HOST_TOOLS = ["dirname"];
 
 // With PATH replaced, bash cannot be found by name -- not for the script itself
 // and not for the stubs' shebang lines.
@@ -49,10 +49,6 @@ async function stage({ env = {}, withGh = true, ghStatusExit = 0, ghToken = "stu
   };
   // The real port check would fail whenever a dashboard is already running.
   await stub("lsof", "exit 1");
-  // Lets the browser-opening subshell finish on its first pass instead of
-  // sleeping through ten retries.
-  await stub("curl", "exit 0");
-  await stub("open", "exit 0");
   if (withGh) {
     await stub(
       "gh",
