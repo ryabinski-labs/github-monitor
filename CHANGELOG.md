@@ -8,6 +8,10 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ### Fixed
 
+- **Out of date** rows keep the branch pill and check summary separate on desktop, with wrapping actions on their own line. Responsive regression checks cover both themes and mobile widths.
+
+- **Out of date** now invalidates cached comparisons when the live base branch advances. GitHub's PR `baseRefOid` can remain on an older commit, hiding newly stale branches for six hours. Detection uses `baseRef.target.oid` instead and retries incomplete comparisons on the next scan instead of caching them as zero.
+
 - The repo owner failed WCAG AA in the light theme. `--muted` measures 4.26:1 on a row and 4.01:1 on a tinted conflict row, and 4.48:1 against the hover surface in dark -- so the label shipped in the previous entry was below the bar on three surfaces. It has its own token now, solved against every background a row actually uses.
 - Two accessibility assertions were passing without measuring anything. axe cannot resolve a background that sits over the row's `::before` accent bar, so it returns those nodes as `incomplete` rather than as violations -- and at Playwright's default 1280px viewport it returns *every* node in `#content` that way. Both axe tests read only `violations`, so both were vacuous at the width they ran at. They now pin an explicit viewport, count `incomplete` as a finding, and leave colour to the checks that compute it from the token values against every real row background.
 

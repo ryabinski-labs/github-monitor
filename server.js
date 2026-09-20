@@ -82,6 +82,7 @@ const PR_SEARCH_GRAPHQL = `
           headRefOid
           baseRefName
           baseRefOid
+          baseRef { target { oid } }
           headRefName
           headRepository {
             nameWithOwner
@@ -144,6 +145,7 @@ const PR_BY_NUMBER_GRAPHQL = `
         headRefOid
         baseRefName
         baseRefOid
+        baseRef { target { oid } }
         headRefName
         headRepository {
           nameWithOwner
@@ -2098,7 +2100,7 @@ async function fetchBehindCounts(pullRequests) {
   for (const pr of pullRequests || []) {
     if (!pr?.repo || !pr.number || !pr.headRefName || !pr.baseRefName) continue;
     const key = behindCacheKey(pr);
-    const cached = githubValueCache.get(key);
+    const cached = pr.baseSha && pr.headSha ? githubValueCache.get(key) : undefined;
     if (cached?.value !== undefined && cached.expiresAt > Date.now()) {
       pr.behindBy = normalizeBehindBy(cached.value);
       continue;
@@ -2127,16 +2129,16 @@ async function fetchBehindCounts(pullRequests) {
         continue;
       }
       chunk.forEach((pr, index) => {
-        const behindBy = normalizeBehindBy(json?.data?.[`pr${index}`]?.pullRequest?.baseRef?.compare?.behindBy);
-        pr.behindBy = behindBy;
-        // Stored as 0 rather than undefined when the compare gave no usable
-        // answer, because the cache treats undefined as a miss -- and a PR whose
-        // head branch is gone would then pay for the same failed compare on
-        // every single scan. Not behind and could-not-tell group identically.
-        githubValueCache.set(behindCacheKey(pr), {
-          value: behindBy ?? 0,
-          expiresAt: Date.now() + BEHIND_COMPARE_CACHE_TTL_MS
-        });
+        const count = json?.data?.[`pr${index}`]?.pullRequest?.baseRef?.compare?.behindBy;
+        pr.behindBy = normalizeBehindBy(count);
+        // Unknown is not zero: retry failed/partial comparisons on the next
+        // scan. Only cache known counts with both commit identities available.
+        if (Number.isInteger(count) && count >= 0 && pr.baseSha && pr.headSha) {
+          githubValueCache.set(behindCacheKey(pr), {
+            value: count,
+            expiresAt: Date.now() + BEHIND_COMPARE_CACHE_TTL_MS
+          });
+        }
       });
     }
   }
@@ -2173,7 +2175,9 @@ function classifyPullRequest(pr) {
     mergeable,
     hasConflict,
     headSha: pr.headRefOid || "",
-    baseSha: pr.baseRefOid || "",
+    // baseRefOid can lag behind pushes to the base branch. Cache comparisons
+    // against the live ref tip, not the PR's recorded base commit.
+    baseSha: pr.baseRef?.target?.oid || "",
     baseRefName: pr.baseRefName || "",
     headRefName: pr.headRefName || "",
     headRepo: pr.headRepository?.nameWithOwner || "",
