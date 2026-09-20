@@ -29,7 +29,7 @@ const PHASE_AGE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const PHASE_THRESHOLDS_MS = {
   ci_running: 4 * 60 * 60 * 1000,
   merge_pending: 2 * 60 * 1000,
-  auto_merge_waiting: 5 * 60 * 1000,
+  auto_merge_waiting: 60 * 60 * 1000,
   passing_ci: 8 * 60 * 60 * 1000,
   no_ci: 24 * 60 * 60 * 1000,
   failing_ci: 2 * 60 * 60 * 1000,
