@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps the GitHub Monitor dashboard alive.
+
+  The dashboard is the queue source for anything that scales CI against it:
+  when it is down, callers see failed polls and hold their current state
+  instead of scaling, so a dashboard that quietly died overnight stops new CI
+  from getting runners until someone notices. Nothing used to supervise it --
+  start.sh runs the server in the foreground and it dies with its terminal.
+  KeepAlive is the fix: launchd restarts it after a crash, a clean exit, or a
+  bare `kill`, and RunAtLoad brings it up with the login session.
+
+  Install:
+    cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
+  Stop deliberately (a bare `kill` only triggers a restart):
+    launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor
+
+  Logs:
+    ~/Library/Logs/github-monitor.log
+
+  The paths below are this machine's checkout; edit them if yours differs.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ryabinski.github-monitor</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/cigan/Documents/projects/github-monitor/start.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/cigan/Documents/projects/github-monitor</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <!-- A crash loop must not hot-loop against GitHub's API. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/cigan/Library/Logs/github-monitor.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/cigan/Library/Logs/github-monitor.log</string>
+
+    <!-- launchd starts with a minimal PATH; start.sh looks up node, gh and
+         lsof by name. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
