@@ -67,6 +67,25 @@ npm run dev                           # guided launch: checks Node, credentials,
 
 Prefer a config file? Copy [`.env.example`](.env.example) to `.env` and fill in what you need.
 
+### Keep it running with launchd (macOS)
+
+`npm start` and `npm run dev` both live in the foreground and die with their
+terminal. Anything that polls this dashboard for queue depth sees failed reads
+while it is down and holds its state rather than scaling, so a dashboard that
+died overnight silently stops CI from getting runners. The checked-in
+LaunchAgent keeps it up instead:
+
+```bash
+cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
+```
+
+It runs `./start.sh`, starts with your login session, and `launchd` restarts it
+after a crash or a bare `kill`. Stop it deliberately with
+`launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor`; output goes to
+`~/Library/Logs/github-monitor.log`. The plist hardcodes this machine's
+checkout path, so edit it if your clone lives elsewhere.
+
 ## Authentication
 
 Pick one path. The server never persists your credential.
