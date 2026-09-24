@@ -8,6 +8,8 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ### Fixed
 
+- **Running CD** now shows a deploy or release workflow within one refresh instead of up to ten minutes. The lane read a per-workflow cache with a 10-minute TTL, so a run started outside the dashboard -- a push, a schedule, a release dispatch, someone else's rerun -- stayed invisible until the TTL expired or a dashboard-performed action happened to drop it. Running state now comes from the repo-wide actions feed the CI lanes already refresh every 60 seconds, a CD run appearing or changing state drops the enriched CD caches so finished and failed rows rebuild in the same scan, and a run that ends leaves the running lane immediately instead of sitting there until the cache expired.
+
 - **Out of date** rows keep the branch pill and check summary separate on desktop, with wrapping actions on their own line. Responsive regression checks cover both themes and mobile widths.
 
 - **Out of date** now invalidates cached comparisons when the live base branch advances. GitHub's PR `baseRefOid` can remain on an older commit, hiding newly stale branches for six hours. Detection uses `baseRef.target.oid` instead and retries incomplete comparisons on the next scan instead of caching them as zero.

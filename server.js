@@ -248,13 +248,16 @@ const CD_WORKFLOW_CACHE_TTL_MS = 15 * 60 * 1000;
 // at all the TTL has to outlive one whole pass plus the gap to the next, hence a
 // value well above the pass deadline rather than a nudge up from 60s.
 //
-// Blast radius is the CD panel only -- fetchWorkflowRuns has a single caller, in
-// fetchCdForRepo. CI status on pull requests comes from a different cache and is
-// unaffected. Staleness is further bounded by invalidation: the two mutations the
-// dashboard itself performs, rerunning failed jobs and the Dependabot queue
-// cleanup, both call invalidateWorkflowRunCaches(), so a user action never reads
-// its own stale result. What this defers is a CD run started elsewhere (a push, a
-// schedule, someone else's rerun), which can take up to the TTL to appear.
+// Blast radius is the CD panel's enriched lanes -- fetchWorkflowRuns has a single
+// caller, in fetchCdForRepo. CI status on pull requests comes from a different
+// cache and is unaffected. The TTL cannot hide a running CD run: the running lane
+// is fed by the 60s actions feed (fetchActionsForRepo), and a CD run that appears
+// or changes state there drops this cache via observeCdFeed, so the enriched
+// finished lane catches up in the same pass as the transition. The two mutations
+// the dashboard itself performs, rerunning failed jobs and the Dependabot queue
+// cleanup, also call invalidateWorkflowRunCaches(), so a user action never reads
+// its own stale result. What is still deferred is enriched detail for a repo that
+// no scan pass reached between the change and the read.
 const WORKFLOW_RUN_CACHE_TTL_MS =
   Math.max(0, Number(process.env.WORKFLOW_RUN_CACHE_TTL_SECONDS || 600)) * 1000;
 const RUNNING_ACTION_CACHE_TTL_MS = 60 * 1000;
@@ -394,6 +397,12 @@ function sameAutoMergeOwners(a, b) {
 }
 
 const githubValueCache = new Map();
+
+// The last CD-run state each repo's actions feed showed, keyed repo -> fingerprint
+// (see cdFeedFingerprint). A change here means a CD run started, changed state, or
+// finished. That is exactly when the 10-minute CD caches must not be trusted, so
+// observeCdFeed drops them and the same scan pass rebuilds enriched rows.
+const cdFeedFingerprints = new Map();
 
 function run(command, args, { timeoutMs = 120000 } = {}) {
   return new Promise((resolve, reject) => {
@@ -945,6 +954,7 @@ function snapshotRateLimit(metrics) {
 // direction the fixtures happen to differ. Clearing between tests is the fix.
 function resetGithubValueCache() {
   githubValueCache.clear();
+  cdFeedFingerprints.clear();
 }
 
 async function cachedGithubValue(key, ttlMs, loader) {
@@ -3261,11 +3271,34 @@ async function fetchCdForRepo(repo) {
   };
 }
 
+// One request per repo, reused three ways: the running CI lane, the failed CI
+// lane, and -- the reason this order matters -- the CD panel's running lane. The
+// repo-wide feed is the freshest thing the scan has (60s TTL) and covers every
+// CD workflow at once, where the enriched CD path fetches per workflow behind a
+// 10-minute cache. So a CD run started, or finished, elsewhere appears here
+// first; cdRuns below carries it, and observeCdFeed drops the enriched caches on
+// a transition so the finished lane is rebuilt in the same pass.
 async function fetchActionsForRepo(repo) {
   return cachedGithubValue(`actions:${repo}`, RUNNING_ACTION_CACHE_TTL_MS, async () => {
     try {
       const json = await githubRequest(`/repos/${repo}/actions/runs`, { query: { per_page: 20 } });
       const runs = json?.workflow_runs || [];
+      const cdFeedRuns = runs.filter((run) => isCdWorkflowRun(run));
+      observeCdFeed(repo, cdFeedRuns);
+      const cdRuns = cdFeedRuns.map((run) => ({
+        ...(run.id ? { runId: run.id } : {}),
+        createdAt: run.created_at || "",
+        updatedAt: run.updated_at || "",
+        repo,
+        workflow: run.name || "Workflow",
+        runNumber: `#${run.run_number}`,
+        status: run.status || "",
+        conclusion: run.conclusion || "",
+        branch: run.head_branch || "",
+        ...(run.head_sha || run.head_commit?.id ? { headSha: run.head_sha || run.head_commit?.id } : {}),
+        title: run.display_title || run.name || "",
+        url: run.html_url || ""
+      }));
       const running = runs
         .filter((run) => RUNNING_RUN_STATUSES.has(run.status))
         .filter((run) => !isCdWorkflowRun(run))
@@ -3306,12 +3339,50 @@ async function fetchActionsForRepo(repo) {
       }));
       return {
         failed: markIgnoredRuns(markAutoDismissedCancelledRuns(failed)),
-        running: markIgnoredRuns(running)
+        running: markIgnoredRuns(running),
+        cdRuns
       };
     } catch {
-      return { failed: [], running: [] };
+      return { failed: [], running: [], cdRuns: [] };
     }
   });
+}
+
+// Identity + state only. updated_at is deliberately excluded: a long-running
+// deploy ticks it without transitioning, and rebuilding the enriched caches on
+// every tick would defeat the TTL the comment above WORKFLOW_RUN_CACHE_TTL_MS
+// exists to protect.
+function cdFeedFingerprint(runs) {
+  return (runs || [])
+    .map((run) => `${run.id || run.html_url || ""}:${run.status || ""}:${run.conclusion || ""}`)
+    .sort()
+    .join("|");
+}
+
+function observeCdFeed(repo, cdRuns) {
+  const fingerprint = cdFeedFingerprint(cdRuns);
+  const previous = cdFeedFingerprints.get(repo);
+  cdFeedFingerprints.set(repo, fingerprint);
+  if (previous !== undefined && previous !== fingerprint) invalidateCdWorkflowRunCaches(repo);
+}
+
+// The running lane has two sources with different jobs. The fresh feed is
+// authoritative for every URL it carries -- including a run the enriched cache
+// still believes is running because it finished minutes ago. A cached row that
+// has aged out of the feed's 20-run window is kept, because a long deploy is
+// exactly the row the 20-run window can miss and the one an operator most wants
+// to see. Fresh rows come first so de-duplication prefers them.
+function mergeCdRunningRows(cachedRunning, feedRuns) {
+  const feedByUrl = new Map();
+  for (const run of feedRuns || []) {
+    if (run?.url) feedByUrl.set(run.url, run);
+  }
+  const fresh = (feedRuns || []).filter((run) => RUNNING_RUN_STATUSES.has(run.status));
+  const stillRunning = (cachedRunning || []).filter((run) => {
+    const feed = run?.url ? feedByUrl.get(run.url) : null;
+    return !feed || RUNNING_RUN_STATUSES.has(feed.status);
+  });
+  return uniqueBy([...fresh, ...stillRunning], (run) => run?.url || JSON.stringify(run));
 }
 
 function workflowRunMatchesPullRequest(run, pr) {
@@ -3616,6 +3687,14 @@ async function cleanupDependabotWorkload({ repos, jobs = 4, cancelRuns = true })
 
 function invalidateWorkflowRunCaches(repo) {
   githubValueCache.delete(`actions:${repo}`);
+  invalidateCdWorkflowRunCaches(repo);
+}
+
+// The CD lane's cached inputs: the active-workflow list and the per-workflow run
+// pages. Dropped whenever the running picture changes so failed and finished rows
+// are rebuilt from that change instead of waiting out the TTL clock.
+function invalidateCdWorkflowRunCaches(repo) {
+  githubValueCache.delete(`cd-workflows:${repo}`);
   for (const key of githubValueCache.keys()) {
     if (key.startsWith(`workflow-runs:${repo}:`)) githubValueCache.delete(key);
   }
@@ -4182,15 +4261,17 @@ async function buildDashboardData(requestUrl) {
 
   repos = await listRepos({ mode, me, pullRequests, jobs, owners });
 
-  // These three passes each fan out over the same repo list and none of them
-  // reads another's result -- busyRunners below is the only consumer, and it
-  // runs after all of them. Awaiting them one after another was costing three
-  // serial passes over 89 repos for no reason. Same request count, a third of
-  // the wall clock.
+  // The actions pass runs before the CD pass, not beside it, and that ordering is
+  // load-bearing: its feed is what tells observeCdFeed a CD run started or
+  // finished, and the invalidation has to land before the CD pass reads the
+  // caches it drops. The CD pass would otherwise serve a run that finished
+  // minutes ago while the finished lane stayed empty. The actions pass is the
+  // lightest of the three (one request per repo), so the wall clock it adds is
+  // small; CD and deployments still fan out together.
   if (repos.length) {
     const wantCd = Boolean(includeCd);
-    const [actionGroups, cdOutcome, deploymentOutcome] = await Promise.all([
-      mapLimit(repos, jobs, fetchActionsForRepo),
+    const actionGroups = await mapLimit(repos, jobs, fetchActionsForRepo);
+    const [cdOutcome, deploymentOutcome] = await Promise.all([
       wantCd ? settledScanPass(repos, jobs, fetchCdForRepo, () => ({ failed: [], finished: [], running: [] })) : null,
       wantCd ? settledScanPass(repos, jobs, fetchRunningDeploymentsForRepo, () => []) : null
     ]);
@@ -4207,14 +4288,21 @@ async function buildDashboardData(requestUrl) {
     if (cdOutcome) {
       if (cdOutcome.failed) degraded.add("cd");
       const cdGroups = cdOutcome.results;
-      cdRowsByRepo = new Map(cdGroups.map((group, index) => [
-        repos[index],
-        [...group.failed, ...group.finished, ...group.running]
+      // The running lane is rebuilt from the fresh feed rather than taken from
+      // the cached CD groups alone, so it stays complete even on a pass the
+      // deadline truncated before it reached a repo.
+      const runningByRepo = repos.map((repo, index) => mergeCdRunningRows(
+        cdGroups[index]?.running || [],
+        actionGroups[index]?.cdRuns || []
+      ));
+      cdRowsByRepo = new Map(repos.map((repo, index) => [
+        repo,
+        [...(cdGroups[index]?.failed || []), ...(cdGroups[index]?.finished || []), ...runningByRepo[index]]
       ]));
       failedCd = uniqueBy(cdGroups.flatMap((group) => group.failed), (run) => run.url || JSON.stringify(run))
         .filter((run) => !run.resolvedBy);
       finishedCd = uniqueBy(cdGroups.flatMap((group) => group.finished), (run) => run.url || JSON.stringify(run));
-      runningCd = uniqueBy(cdGroups.flatMap((group) => group.running), (run) => run.url || JSON.stringify(run));
+      runningCd = uniqueBy(runningByRepo.flat(), (run) => run.url || JSON.stringify(run));
     }
 
     if (deploymentOutcome) {
@@ -4957,6 +5045,12 @@ export {
   QUEUE_MAX_PAGES,
   QUEUE_PAGE_SIZE,
   DEPLOYMENT_SCAN_LIMIT,
+  fetchCdForRepo,
+  fetchActionsForRepo,
+  observeCdFeed,
+  cdFeedFingerprint,
+  mergeCdRunningRows,
+  invalidateCdWorkflowRunCaches,
   fetchRunningDeploymentsForRepo,
   fetchRecentDeploymentTargets,
   scanScopeSnapshot,
