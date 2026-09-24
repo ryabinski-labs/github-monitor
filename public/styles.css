@@ -2329,6 +2329,29 @@ button.metric.active .metric-dot {
     grid-column: 1 / -1;
     flex-wrap: wrap;
   }
+
+  /* A CD row's identifying text is its title, not its run number. Give the
+     title the flexible track, hold the short "Deploy #1304" meta at its
+     natural width, and cap the branch-and-time track so a long branch
+     ellipsises instead of squeezing the title. The old order opened
+     "main · Sep 24, 6:06" and orphaned "AM" onto a third line while the title
+     clamped hundreds of pixels early (issue #142). A failed row carries a
+     reason in that track alongside the time, so it earns the wider cap. */
+  .row-cd {
+    grid-template-columns: minmax(0, 1.6fr) max-content minmax(76px, auto) minmax(140px, 220px) auto;
+  }
+  .row-cd-detail {
+    grid-template-columns: minmax(0, 1.6fr) max-content minmax(76px, auto) minmax(140px, 320px) auto;
+  }
+}
+
+/* The branch and time read as one line at every width; below the desktop grid
+   the row gives every child a full-width track, where a long branch would
+   otherwise wrap mid-timestamp. */
+.row-cd > .meta {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 @media (max-width: 1300px) {

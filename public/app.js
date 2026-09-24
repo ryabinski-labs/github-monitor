@@ -2533,8 +2533,14 @@ function renderPhaseBadge(row) {
   return `<span class="phase-pill${row.phaseStale ? " phase-pill-stale" : ""}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
 }
 
+function cdStatusLabel(status) {
+  const text = String(status || "").replace(/_/g, " ").trim();
+  return text ? text.charAt(0).toUpperCase() + text.slice(1) : "";
+}
+
 function renderCdRow(row, view, viewKey) {
   const status = viewKey === "runningCd" ? row.status : row.conclusion;
+  const statusLabel = viewKey === "runningCd" ? cdStatusLabel(status) : status;
   const timeDetail = [row.branch, formatTime(row.createdAt)].filter(Boolean).join(" · ");
   const detail = viewKey === "failedCd" || row.failureReason
     ? [`Reason: ${failureDetail(row, "CD failed")}`, timeDetail].filter(Boolean).join(" · ")
@@ -2553,14 +2559,14 @@ function renderCdRow(row, view, viewKey) {
     ? `<span class="row-dismiss row-dismiss-auto" title="${escapeHtml(row.autoDismissReason || "Dismissed automatically")}">Auto-dismissed</span>`
     : keys.length ? renderDismissButton(keys, `${row.workflow} ${row.runNumber}`) : "";
   return `
-    <article class="row${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
+    <article class="row row-cd${viewKey === "failedCd" ? " row-cd-detail" : ""}${dismissed ? " row-dismissed" : ""}${row.phaseStale ? " row-stale" : ""}" data-href="${escapeHtml(row.url || "")}" style="${accentVars(view.color)}">
       <div class="row-main">
         ${renderRepoLabel(row.repo)}
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
       </div>
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
-      <div class="tag-group"><div class="${tagClass}">${escapeHtml(status)}</div>${phaseBadge}</div>
-      <div class="meta">${escapeHtml(detail)}</div>
+      <div class="tag-group"><div class="${tagClass}">${escapeHtml(statusLabel)}</div>${phaseBadge}</div>
+      <div class="meta" title="${escapeHtml(detail)}">${escapeHtml(detail)}</div>
       <div class="row-actions">
         ${viewKey === "failedCd" ? renderRerunButton(row) : ""}
         ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
@@ -2975,14 +2981,14 @@ function renderFinishedCdRow(row, view) {
     : `<p class="review-note">${escapeHtml(summary.lookFor || "Open the run and changed files to inspect this deployment.")}</p>`;
   return `
     <article class="cd-card" data-outcome="${escapeHtml(outcome || "")}" style="${accentVars(view.color)}">
-      <div class="cd-card-head row" data-href="${escapeHtml(row.url || "")}">
+      <div class="cd-card-head row row-cd" data-href="${escapeHtml(row.url || "")}">
         <div class="row-main">
           ${renderRepoLabel(row.repo)}
           <div class="title">${escapeHtml(row.title || row.workflow)}</div>
         </div>
         <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
         <div class="tag tag-${escapeHtml(statusTone)}" role="status" aria-label="${escapeHtml(tagAriaLabel)}">${tagLabel}</div>
-        <div class="meta">${escapeHtml(timeDetail)}</div>
+        <div class="meta" title="${escapeHtml(timeDetail)}">${escapeHtml(timeDetail)}</div>
         <div class="row-actions">
           ${outcome === "failure" ? renderRerunButton(row) : ""}
           ${row.url ? `<a class="open-link" href="${escapeHtml(row.url)}" target="_blank" rel="noreferrer">Open Run</a>` : ""}
