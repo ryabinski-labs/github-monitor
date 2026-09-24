@@ -164,7 +164,7 @@ test("a fingerprint changes when a run appears, ends, or changes state", () => {
     running,
     cdFeedFingerprint([rawRun({ id: 1, status: "completed", conclusion: "success" })])
   );
-  assert.notEqual(running, cdFeedFingerprint([rawRun({ id: 2, status: "in_progress" })])), "a new run is a transition";
+  assert.notEqual(running, cdFeedFingerprint([rawRun({ id: 2, status: "in_progress" })]), "a new run is a transition");
 });
 
 // --- the wiring through the real /api/status ----------------------------------
