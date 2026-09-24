@@ -175,8 +175,11 @@ test("the workflow-run cache outlives a whole scan pass, or it never gets reused
 });
 
 test("the workflow-run TTL stays inside a sane staleness ceiling", async () => {
-  // It defers CD runs started outside the dashboard, so it buys reuse without
-  // letting the CD panel drift arbitrarily far from GitHub.
+  // It defers enriched CD detail for runs whose transition the fresh actions
+  // feed did not observe, so it buys reuse without letting the CD panel drift
+  // arbitrarily far from GitHub. Live running state never waits on it: the
+  // running lane reads the 60s actions feed, and a CD transition invalidates
+  // this cache outright (observeCdFeed).
   assert.ok(Number.isFinite(WORKFLOW_RUN_CACHE_TTL_MS));
   assert.ok(
     WORKFLOW_RUN_CACHE_TTL_MS <= 30 * 60 * 1000,
