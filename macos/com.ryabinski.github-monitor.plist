@@ -10,6 +10,15 @@
   KeepAlive is the fix: launchd restarts it after a crash, a clean exit, or a
   bare `kill`, and RunAtLoad brings it up with the login session.
 
+  This runs node directly instead of ./start.sh: macOS privacy protection
+  silently denies a launchd-spawned /bin/bash any read under ~/Documents
+  ("Operation not permitted" on start.sh, no prompt). node is allowed that
+  access, so node is the program here and --env-file-if-exists replaces
+  start.sh's .env sourcing. start.sh stays the entry point for manual runs
+  with all its preflight checks; under launchd a busy port or bad .env just
+  makes the server exit and launchd retries in 60s. Needs node >= 22.9 for
+  the env-file flag.
+
   Install:
     cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
@@ -29,8 +38,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/cigan/Documents/projects/github-monitor/start.sh</string>
+        <string>/opt/homebrew/bin/node</string>
+        <string>--env-file-if-exists=/Users/cigan/Documents/projects/github-monitor/.env</string>
+        <string>server.js</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -49,8 +59,8 @@
     <key>StandardErrorPath</key>
     <string>/Users/cigan/Library/Logs/github-monitor.log</string>
 
-    <!-- launchd starts with a minimal PATH; start.sh looks up node, gh and
-         lsof by name. -->
+    <!-- launchd starts with a minimal PATH; keep the usual bins on it for
+         anything the server shells out to. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
