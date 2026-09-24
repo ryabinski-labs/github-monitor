@@ -80,11 +80,14 @@ cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
 ```
 
-It runs `./start.sh`, starts with your login session, and `launchd` restarts it
-after a crash or a bare `kill`. Stop it deliberately with
-`launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor`; output goes to
-`~/Library/Logs/github-monitor.log`. The plist hardcodes this machine's
-checkout path, so edit it if your clone lives elsewhere.
+It runs `node --env-file-if-exists=.env server.js` directly — a
+launchd-spawned `/bin/bash` cannot read files under `~/Documents` (macOS blocks
+it silently), so `./start.sh` stays the manual entry point and the agent uses
+node, which gets the same access it needs to serve the app. It starts with your
+login session, and `launchd` restarts it after a crash or a bare `kill`. Stop
+it deliberately with `launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor`;
+output goes to `~/Library/Logs/github-monitor.log`. The plist hardcodes this
+machine's checkout path, so edit it if your clone lives elsewhere.
 
 ## Authentication
 
