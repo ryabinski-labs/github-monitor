@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ## [Unreleased]
 
+### Added
+
+- **`start.sh` controls the LaunchAgent.** `./start.sh start | stop | restart | status | monitor | logs` replaces hand-typed `launchctl` commands. `start` installs the agent for whichever checkout it runs from, substituting that path, your `node` and your `$HOME` into the checked-in plist, then waits for `/api/health` to answer; `restart` waits for a *new* pid, so it cannot report the old process as the reloaded one. `status` shows launchd state, uptime, auth and the tightest quota bucket, flags a server running older code than is on disk, and lists only the current run's log errors; it exits 0/1/2 for healthy/down/needs-attention. `start` refuses to take over an agent installed for another checkout or to fight a foreground server for the port. `./start.sh` with no argument still runs in the foreground as before.
+
 ### Fixed
 
 - **CI Running, Running CD and every repo-scoped lane** no longer drop a whole owner when GitHub fails to list its repositories. The failure was caught and turned into an empty list, so every repo under that owner without an open PR fell out of the scan -- 71 repos became 28 -- and the dashboard showed a handful of PR rows as if nothing else was running. A failed listing now falls back to the last list that succeeded, the scan is marked degraded (`repos`), a warning names the owner and the reason, and the error is logged. `/api/queue` reports a fallback listing as incomplete, since a repo created since cannot be in it.

@@ -19,16 +19,14 @@
   makes the server exit and launchd retries in 60s. Needs node >= 22.9 for
   the env-file flag.
 
-  Install:
-    cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
+  Install, control and watch it with start.sh, which rewrites the paths
+  below for the checkout, node and $HOME it runs from:
+    ./start.sh start | stop | restart | status | monitor | logs
   Stop deliberately (a bare `kill` only triggers a restart):
-    launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor
+    ./start.sh stop
 
   Logs:
     ~/Library/Logs/github-monitor.log
-
-  The paths below are this machine's checkout; edit them if yours differs.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
