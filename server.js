@@ -2309,7 +2309,53 @@ async function fetchPullRequests({ mode, me, jobs, owners: ownerFilter }) {
   return merged;
 }
 
+// Last successful listing per owner, kept past the cache TTL on purpose. The
+// listing is the one request whose failure empties a whole owner: every repo
+// under it drops out of the scan, and the result is indistinguishable from an
+// org where nothing is running. A listing a few minutes old is a far better
+// answer than none, so a failed refresh falls back to it and says so.
+const lastKnownOwnerRepos = new Map();
+
 async function fetchOwnerRepos(owner, me) {
+  const key = `${owner}:${me}`;
+  try {
+    const repos = await loadOwnerRepos(owner, me);
+    lastKnownOwnerRepos.set(key, repos);
+    return repos;
+  } catch (error) {
+    const lastKnown = lastKnownOwnerRepos.get(key);
+    recordRepoListingFailure(owner, error, Boolean(lastKnown));
+    if (lastKnown) return lastKnown;
+    throw error;
+  }
+}
+
+function recordRepoListingFailure(owner, error, usedLastKnown) {
+  const reason = describeRequestError(error);
+  console.error(
+    `[github-monitor] listing ${owner} repositories failed: ${reason}${usedLastKnown ? " (using last known list)" : ""}`
+  );
+  const metrics = scanMetrics.getStore();
+  if (!metrics) return;
+  metrics.repoListingFailures ||= [];
+  if (!metrics.repoListingFailures.some((failure) => failure.owner === owner)) {
+    metrics.repoListingFailures.push({ owner, reason, usedLastKnown });
+  }
+}
+
+function repoListingWarnings(failures) {
+  return (failures || []).map((failure) =>
+    failure.usedLastKnown
+      ? `Could not refresh the ${failure.owner} repository list (${failure.reason}); scanning the last known list, so repos added since may be missing.`
+      : `Could not list ${failure.owner} repositories (${failure.reason}); runs in its repos without an open PR are not shown.`
+  );
+}
+
+function resetLastKnownOwnerRepos() {
+  lastKnownOwnerRepos.clear();
+}
+
+async function loadOwnerRepos(owner, me) {
   return cachedGithubValue(`owner-repos:${owner}:${me}`, OWNER_REPOS_CACHE_TTL_MS, async () => {
     if (APP_AUTH_ENABLED) {
       const installations = await discoverInstallations();
@@ -4128,7 +4174,13 @@ async function buildQueueData(requestUrl, deadlineAt) {
     );
     if (listing.timedOut) expire("Repository listing");
     repos = listing.value.repos;
-    const repoErrors = listing.value.errors;
+    // A listing that fell back to the last known list did not throw, so it is not
+    // in errors -- but a repo created since cannot be in it, and the queue's
+    // `complete` promises more than "probably everything".
+    const staleListings = (scanMetrics.getStore()?.repoListingFailures || [])
+      .filter((failure) => failure.usedLastKnown)
+      .map((failure) => `${failure.owner} repositories: ${failure.reason} (using last known list)`);
+    const repoErrors = [...listing.value.errors, ...staleListings];
     if (repoErrors.length) {
       errors.push(...repoErrors);
       degraded.add("repos");
@@ -4260,6 +4312,8 @@ async function buildDashboardData(requestUrl) {
   let mergedPullRequestsByRepo;
 
   repos = await listRepos({ mode, me, pullRequests, jobs, owners });
+  const repoListingFailures = scanMetrics.getStore()?.repoListingFailures || [];
+  if (repoListingFailures.length) degraded.add("repos");
 
   // The actions pass runs before the CD pass, not beside it, and that ordering is
   // load-bearing: its feed is what tells observeCdFeed a CD run started or
@@ -4365,9 +4419,13 @@ async function buildDashboardData(requestUrl) {
   // the scan came back short only ever appeared when a Dependabot cleanup error
   // happened to coincide with it. The machine-readable `degraded` array below
   // was always correct; this is the human-visible half catching up.
-  if (degraded.size) {
+  // The repo listing gets its own warning, naming the owner and the reason: "repos
+  // did not finish" would not tell anyone which org went missing.
+  warnings.push(...repoListingWarnings(repoListingFailures));
+  const partialSections = [...degraded].filter((section) => section !== "repos").sort();
+  if (partialSections.length) {
     const cause = partialScanCause(scanMetrics.getStore()?.quotaBlockedRequests || 0);
-    warnings.push(`Partial scan: ${[...degraded].sort().join(", ")} ${cause}; those sections may be incomplete.`);
+    warnings.push(`Partial scan: ${partialSections.join(", ")} ${cause}; those sections may be incomplete.`);
   }
 
   return {
@@ -5047,6 +5105,8 @@ export {
   DEPLOYMENT_SCAN_LIMIT,
   fetchCdForRepo,
   fetchActionsForRepo,
+  fetchOwnerRepos,
+  resetLastKnownOwnerRepos,
   observeCdFeed,
   cdFeedFingerprint,
   mergeCdRunningRows,
