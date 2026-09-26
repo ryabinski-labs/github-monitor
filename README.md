@@ -73,21 +73,30 @@ Prefer a config file? Copy [`.env.example`](.env.example) to `.env` and fill in 
 terminal. Anything that polls this dashboard for queue depth sees failed reads
 while it is down and holds its state rather than scaling, so a dashboard that
 died overnight silently stops CI from getting runners. The checked-in
-LaunchAgent keeps it up instead:
+LaunchAgent keeps it up instead, and `start.sh` drives it:
 
 ```bash
-cp macos/com.ryabinski.github-monitor.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.ryabinski.github-monitor.plist
+./start.sh start           # install the LaunchAgent for this checkout, load it, wait until it answers
+./start.sh status          # launchd state, uptime, /api/health quota, stale-code check, this run's log errors
+./start.sh monitor 10      # the same report, refreshed every 10s until Ctrl-C
+./start.sh restart         # reload it, e.g. after pulling a merged change
+./start.sh stop            # unload it (it loads again at your next login)
+./start.sh logs            # follow ~/Library/Logs/github-monitor.log
 ```
 
-It runs `node --env-file-if-exists=.env server.js` directly — a
+`status` exits 0 when healthy, 1 when nothing is serving, and 2 when the server
+is up but needs attention — code on disk newer than the process, GitHub quota
+paused, or the port held by something launchd did not start — so it can be
+scripted.
+
+The agent runs `node --env-file-if-exists=.env server.js` directly — a
 launchd-spawned `/bin/bash` cannot read files under `~/Documents` (macOS blocks
-it silently), so `./start.sh` stays the manual entry point and the agent uses
-node, which gets the same access it needs to serve the app. It starts with your
-login session, and `launchd` restarts it after a crash or a bare `kill`. Stop
-it deliberately with `launchctl bootout gui/$(id -u)/com.ryabinski.github-monitor`;
-output goes to `~/Library/Logs/github-monitor.log`. The plist hardcodes this
-machine's checkout path, so edit it if your clone lives elsewhere.
+it silently), so `start.sh` is never what launchd runs; it only installs and
+controls the job. `start` writes `macos/com.ryabinski.github-monitor.plist` to
+`~/Library/LaunchAgents/` with this checkout's path, your `node` and your
+`$HOME` substituted in, and `start`/`restart` reload the job if that file has
+changed. launchd starts it with your login session and restarts it after a
+crash or a bare `kill`, at most once a minute.
 
 ## Authentication
 
