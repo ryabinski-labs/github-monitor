@@ -1181,6 +1181,20 @@ async function configureServerAutoMerge() {
   return data;
 }
 
+// Loading the page reads auto merge; it does not set it. The setting is one per
+// server, so a page that wrote its own copy on load re-scoped auto merge for
+// everyone -- a second tab or a headless check was enough. Only a server with
+// nothing saved yet takes this page's settings, so a fresh install still starts
+// with auto merge on.
+async function initServerAutoMerge() {
+  const response = await fetch("/api/auto-merge");
+  const snapshot = await response.json().catch(() => null);
+  if (!response.ok || !snapshot) throw new Error(snapshot?.error || "Unable to read auto merge");
+  if (!snapshot.configured) return configureServerAutoMerge();
+  applyAutoMergeSnapshot(snapshot);
+  return snapshot;
+}
+
 function failureDetail(row, fallback = "failed") {
   return row?.failureReason || (row?.failedChecks || []).join(", ") || fallback;
 }
@@ -3815,7 +3829,7 @@ syncFilterUI();
 syncNotificationControl();
 renderInbox();
 ensureCountdownTimer();
-configureServerAutoMerge()
+initServerAutoMerge()
   .catch((error) => {
     setError(error.message);
   })

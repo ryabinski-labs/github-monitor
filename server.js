@@ -364,6 +364,9 @@ class HttpError extends Error {
 
 const autoMergeState = {
   enabled: false,
+  // True once a saved configuration was restored or a client set one. Until
+  // then the server has no opinion, and the first page to load seeds it.
+  configured: false,
   options: {
     mode: "all",
     jobs: 4,
@@ -387,6 +390,53 @@ const dependabotCleanupState = {
   lastResult: null,
   lastError: ""
 };
+
+// Auto merge is one server-wide setting, so it lives on the server. It used to
+// exist only in memory and every page load re-sent its own copy, which made the
+// scope last-writer-wins: any tab, browser or headless check that loaded the
+// dashboard silently re-scoped it, and a restart forgot it until a page loaded.
+// Empty under the test runner so a suite can never overwrite the real setting.
+const AUTO_MERGE_STATE_PATH = process.env.AUTO_MERGE_STATE_PATH
+  ?? (process.env.NODE_ENV === "test" ? "" : join(__dirname, ".cache", "auto-merge.json"));
+
+function loadAutoMergeStateFromDisk(path = AUTO_MERGE_STATE_PATH) {
+  if (!path) return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
+  if (parsed?.version !== 1) return false;
+  autoMergeState.enabled = Boolean(parsed.enabled);
+  autoMergeState.options = {
+    mode: normalizeMode(parsed.mode),
+    jobs: parseJobs(parsed.jobs),
+    owners: parseOwners(parsed.owners)
+  };
+  autoMergeState.configured = true;
+  return true;
+}
+
+async function saveAutoMergeStateToDisk(path = AUTO_MERGE_STATE_PATH) {
+  if (!path) return false;
+  try {
+    await mkdir(join(path, ".."), { recursive: true });
+    const payload = JSON.stringify({
+      version: 1,
+      savedAt: new Date().toISOString(),
+      enabled: autoMergeState.enabled,
+      ...autoMergeState.options
+    });
+    const temporary = `${path}.${process.pid}.tmp`;
+    await writeFile(temporary, payload, "utf8");
+    await rename(temporary, path);
+    return true;
+  } catch {
+    // Unsaved means the next restart falls back to seeding from a page load.
+    return false;
+  }
+}
 
 function sameAutoMergeOwners(a, b) {
   const left = Array.isArray(a) ? a : [];
@@ -4494,6 +4544,7 @@ function autoMergeKey(repo, number) {
 function autoMergeSnapshot() {
   return {
     enabled: autoMergeState.enabled,
+    configured: autoMergeState.configured,
     running: autoMergeState.running,
     mode: autoMergeState.options.mode,
     jobs: autoMergeState.options.jobs,
@@ -4668,7 +4719,9 @@ async function autoMergeConfig(req, res) {
     !sameAutoMergeOwners(autoMergeState.options.owners, nextOptions.owners);
   autoMergeState.enabled = Boolean(body.enabled);
   autoMergeState.options = nextOptions;
+  autoMergeState.configured = true;
   autoMergeState.lastError = "";
+  await saveAutoMergeStateToDisk();
 
   if (autoMergeState.enabled) {
     clearAutoMergeTimer();
@@ -5059,6 +5112,11 @@ if (isMain) {
     console.log(`Dependabot queue cleanup: ${DEPENDABOT_QUEUE_THRESHOLD > 0 ? `enabled at ${DEPENDABOT_QUEUE_THRESHOLD} queued runs` : "disabled"}`);
     const restored = loadEtagCacheFromDisk();
     console.log(`Conditional-request cache: ${restored > 0 ? `${restored} entries restored` : "cold, first scan pays full quota"}`);
+    if (loadAutoMergeStateFromDisk()) {
+      const scope = autoMergeState.options.owners.length ? autoMergeState.options.owners.join(", ") : "all accounts";
+      console.log(`Auto merge: ${autoMergeState.enabled ? `on (${autoMergeState.options.mode}, ${scope})` : "off"}, restored`);
+      if (autoMergeState.enabled) scheduleAutoMergeScan(0);
+    }
     scheduleDependabotQueueScan(0);
   });
 
@@ -5085,6 +5143,8 @@ export {
   AUTH_MODE,
   buildDashboardWarnings,
   loadEtagCacheFromDisk,
+  loadAutoMergeStateFromDisk,
+  saveAutoMergeStateToDisk,
   saveEtagCacheToDisk,
   serializeEtagCache,
   deserializeEtagCache,

@@ -87,6 +87,13 @@ async function openDashboard({ storedSettings = null } = {}) {
       });
     }
     if (p === "/api/auto-merge") {
+      // A fresh server has nothing saved, so the page seeds it with a POST.
+      if (route.request().method() === "GET") {
+        return route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({ enabled: false, configured: false, running: false, candidates: [] })
+        });
+      }
       const body = JSON.parse(route.request().postData() || "{}");
       seen.autoMergeBodies.push(body);
       autoMergeEnabled = Boolean(body.enabled);
