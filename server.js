@@ -418,6 +418,18 @@ function loadAutoMergeStateFromDisk(path = AUTO_MERGE_STATE_PATH) {
   return true;
 }
 
+// Auto merge is on by default, like the dashboard's switch: a server with no
+// saved setting starts it for all accounts rather than waiting, switched off,
+// for some page to load. `configured` stays false, so the first page to load
+// still narrows it to that page's accounts and saves that.
+function restoreAutoMergeAtBoot(path = AUTO_MERGE_STATE_PATH) {
+  if (loadAutoMergeStateFromDisk(path)) return "restored";
+  autoMergeState.enabled = true;
+  autoMergeState.configured = false;
+  autoMergeState.options = { mode: "all", jobs: 4, owners: [] };
+  return "on by default";
+}
+
 async function saveAutoMergeStateToDisk(path = AUTO_MERGE_STATE_PATH) {
   if (!path) return false;
   try {
@@ -5112,11 +5124,10 @@ if (isMain) {
     console.log(`Dependabot queue cleanup: ${DEPENDABOT_QUEUE_THRESHOLD > 0 ? `enabled at ${DEPENDABOT_QUEUE_THRESHOLD} queued runs` : "disabled"}`);
     const restored = loadEtagCacheFromDisk();
     console.log(`Conditional-request cache: ${restored > 0 ? `${restored} entries restored` : "cold, first scan pays full quota"}`);
-    if (loadAutoMergeStateFromDisk()) {
-      const scope = autoMergeState.options.owners.length ? autoMergeState.options.owners.join(", ") : "all accounts";
-      console.log(`Auto merge: ${autoMergeState.enabled ? `on (${autoMergeState.options.mode}, ${scope})` : "off"}, restored`);
-      if (autoMergeState.enabled) scheduleAutoMergeScan(0);
-    }
+    const autoMerge = restoreAutoMergeAtBoot();
+    const scope = autoMergeState.options.owners.length ? autoMergeState.options.owners.join(", ") : "all accounts";
+    console.log(`Auto merge: ${autoMergeState.enabled ? `on (${autoMergeState.options.mode}, ${scope})` : "off"}, ${autoMerge}`);
+    if (autoMergeState.enabled) scheduleAutoMergeScan(0);
     scheduleDependabotQueueScan(0);
   });
 
@@ -5144,6 +5155,7 @@ export {
   buildDashboardWarnings,
   loadEtagCacheFromDisk,
   loadAutoMergeStateFromDisk,
+  restoreAutoMergeAtBoot,
   saveAutoMergeStateToDisk,
   saveEtagCacheToDisk,
   serializeEtagCache,
