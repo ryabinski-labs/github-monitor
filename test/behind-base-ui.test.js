@@ -118,6 +118,7 @@ async function openDashboard({
       localStorage.removeItem("pr-deck:dismissed:v1");
       localStorage.removeItem("pr-deck:notified:v1");
       localStorage.removeItem("pr-deck:inbox:v1");
+      localStorage.removeItem("pr-deck:status:v1");
     },
     [view, theme]
   );
@@ -154,7 +155,10 @@ async function openDashboard({
   });
 
   await page.goto("http://localhost/");
-  await page.waitForSelector("#rail");
+  // #rail is static markup whose counts start at a literal "0", so it exists
+  // before the first /api/status lands. saveStatusCache runs in the same
+  // synchronous block as render(), so the cached payload means the deck drew.
+  await page.waitForFunction(() => localStorage.getItem("pr-deck:status:v1") !== null, null, { timeout: 5000 });
   return { browser, page, posts, statusRequests };
 }
 
