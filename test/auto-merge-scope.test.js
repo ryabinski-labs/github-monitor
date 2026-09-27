@@ -163,3 +163,27 @@ test("a server with nothing saved is seeded by the first page", { skip }, async 
     await browser.close();
   }
 });
+
+// --- boot ------------------------------------------------------------------------
+
+test("a server with nothing saved boots with auto merge on, still open to a page's scope", async () => {
+  const { restoreAutoMergeAtBoot } = await import("../server.js");
+  assert.equal(restoreAutoMergeAtBoot(path.join(stateDir, "never-saved.json")), "on by default");
+  await withServer(async (base) => {
+    const snapshot = await (await realFetch(`${base}/api/auto-merge`)).json();
+    assert.equal(snapshot.enabled, true, "on by default");
+    assert.equal(snapshot.configured, false, "the first page still sets the accounts");
+  });
+});
+
+test("a saved off survives a restart instead of being reset to the default", async () => {
+  const { restoreAutoMergeAtBoot } = await import("../server.js");
+  const saved = path.join(stateDir, "saved-off.json");
+  writeFileSync(saved, JSON.stringify({ version: 1, enabled: false, mode: "all", jobs: 4, owners: ["cigan1"] }));
+  assert.equal(restoreAutoMergeAtBoot(saved), "restored");
+  await withServer(async (base) => {
+    const snapshot = await (await realFetch(`${base}/api/auto-merge`)).json();
+    assert.equal(snapshot.enabled, false);
+    assert.deepEqual(snapshot.owners, ["cigan1"]);
+  });
+});
