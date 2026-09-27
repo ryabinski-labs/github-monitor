@@ -705,12 +705,18 @@ function pruneEtagCache(store, { maxEntries = ETAG_CACHE_MAX_ENTRIES, maxBytes =
   return { entries: kept, bytes };
 }
 
+// Version 2 keys every entry by installation as well as URL (see etagCacheKey).
+// A version 1 file is discarded rather than migrated: its one shared
+// /installation/repositories entry is exactly the poisoned slot, and nothing in
+// it says which installation a body belongs to.
+const ETAG_CACHE_FILE_VERSION = 2;
+
 function serializeEtagCache(store, limits) {
   const { entries } = pruneEtagCache(store, limits);
   return JSON.stringify({
-    version: 1,
+    version: ETAG_CACHE_FILE_VERSION,
     savedAt: new Date().toISOString(),
-    entries: entries.map(([url, entry]) => ({ url, etag: entry.etag, body: entry.body, usedAt: entry.usedAt || 0 }))
+    entries: entries.map(([key, entry]) => ({ key, etag: entry.etag, body: entry.body, usedAt: entry.usedAt || 0 }))
   });
 }
 
@@ -722,11 +728,11 @@ function deserializeEtagCache(raw) {
   } catch {
     return store;
   }
-  if (parsed?.version !== 1 || !Array.isArray(parsed.entries)) return store;
+  if (parsed?.version !== ETAG_CACHE_FILE_VERSION || !Array.isArray(parsed.entries)) return store;
   for (const entry of parsed.entries) {
     // An entry without an etag can never produce a 304, so it is dead weight.
-    if (!entry || typeof entry.url !== "string" || typeof entry.etag !== "string" || !entry.etag) continue;
-    store.set(entry.url, { etag: entry.etag, body: entry.body, usedAt: Number(entry.usedAt) || 0 });
+    if (!entry || typeof entry.key !== "string" || typeof entry.etag !== "string" || !entry.etag) continue;
+    store.set(entry.key, { etag: entry.etag, body: entry.body, usedAt: Number(entry.usedAt) || 0 });
   }
   return store;
 }
@@ -741,7 +747,7 @@ function loadEtagCacheFromDisk(path = ETAG_CACHE_PATH) {
     return 0;
   }
   const restored = deserializeEtagCache(raw);
-  for (const [url, entry] of restored) etagCache.set(url, entry);
+  for (const [key, entry] of restored) etagCache.set(key, entry);
   return restored.size;
 }
 
@@ -785,11 +791,15 @@ function applyConditionalHeaders(headers, store, url, method) {
   return { ...headers, "if-none-match": cached.etag };
 }
 
-function takeCachedConditionalResponse(store, url, method, status) {
+// `sentEtag` is the If-None-Match the request went out with. A 304 vouches for
+// that ETag only; if a concurrent response has since replaced the entry, its body
+// is not the one GitHub just confirmed, so it is not returned.
+function takeCachedConditionalResponse(store, url, method, status, sentEtag) {
   if (status !== 304) return null;
   if (!ETAG_CACHEABLE_METHODS.has(method)) return null;
   const cached = store.get(url);
   if (!cached) return null;
+  if (sentEtag !== undefined && cached.etag !== sentEtag) return null;
   // A 304 is a hit, so keep it away from the eviction end of the cache.
   cached.usedAt = Date.now();
   return cached.body;
@@ -807,11 +817,20 @@ function storeConditionalResponse(store, url, method, response, body) {
   return true;
 }
 
+// The same URL can mean different data per installation: /installation/repositories
+// lists whichever account the token belongs to. Keyed by URL alone, the four
+// installations shared one slot, and a 304 for one could be answered with
+// another's repos -- which the owner filter then emptied, silently dropping that
+// account's repos (and their running CD) from the scan.
+function etagCacheKey(installationKey, url) {
+  return `${installationKey} ${url}`;
+}
+
 async function githubRequest(path, { method = "GET", query = {}, body, ownerHint } = {}) {
   const effectiveOwnerHint = ownerHint || extractOwnerFromPath(path);
   const { token, installationKey } = await getGitHubToken({ ownerHint: effectiveOwnerHint });
   const url = githubUrl(path, query);
-  const cacheKey = url.toString();
+  const cacheKey = etagCacheKey(installationKey, url.toString());
   const baseHeaders = {
     "accept": "application/vnd.github+json",
     "authorization": `Bearer ${token}`,
@@ -822,18 +841,24 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
   const headers = isEtagCacheEnabled()
     ? applyConditionalHeaders(baseHeaders, etagCache, cacheKey, method)
     : baseHeaders;
-  const response = await fetchWithCause(url, {
+  const send = (requestHeaders) => fetchWithCause(url, {
     method,
-    headers,
+    headers: requestHeaders,
     signal: AbortSignal.timeout(GITHUB_REQUEST_TIMEOUT_MS),
     body: body ? JSON.stringify(body) : undefined
   });
+  let response = await send(headers);
 
   recordRateLimit(response, { conditional: response.status === 304, installationKey });
 
-  if (isEtagCacheEnabled()) {
-    const cachedBody = takeCachedConditionalResponse(etagCache, cacheKey, method, response.status);
+  if (isEtagCacheEnabled() && response.status === 304) {
+    const sentEtag = headers["if-none-match"];
+    const cachedBody = takeCachedConditionalResponse(etagCache, cacheKey, method, response.status, sentEtag);
     if (cachedBody !== null) return cachedBody;
+    // The entry changed while this request was in flight, so the body GitHub
+    // confirmed is gone. Ask once more without a condition for the current one.
+    response = await send(baseHeaders);
+    recordRateLimit(response, { conditional: false, installationKey });
   }
 
   const text = await response.text();
