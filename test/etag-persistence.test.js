@@ -44,11 +44,11 @@ test("a cache survives a round trip through disk", async () => {
 
 test("an entry with no ETag is dropped, because it can never produce a 304", () => {
   const restored = deserializeEtagCache(JSON.stringify({
-    version: 1,
+    version: 2,
     entries: [
-      { url: "https://api/keep", etag: 'W/"x"', body: 1 },
-      { url: "https://api/no-etag", etag: "", body: 2 },
-      { url: "https://api/missing-etag", body: 3 },
+      { key: "https://api/keep", etag: 'W/"x"', body: 1 },
+      { key: "https://api/no-etag", etag: "", body: 2 },
+      { key: "https://api/missing-etag", body: 3 },
       { etag: 'W/"y"', body: 4 }
     ]
   }));
@@ -109,9 +109,9 @@ test("the written file is capped, not merely the in-memory copy", () => {
   }
   const written = JSON.parse(serializeEtagCache(store, { maxEntries: 5, maxBytes: Infinity }));
   assert.equal(written.entries.length, 5);
-  assert.equal(written.version, 1);
+  assert.equal(written.version, 2);
   // Highest usedAt wins.
-  assert.deepEqual(written.entries.map((e) => e.url), [
+  assert.deepEqual(written.entries.map((e) => e.key), [
     "https://api/49",
     "https://api/48",
     "https://api/47",
@@ -127,7 +127,7 @@ test("a save replaces the previous file atomically and leaves no temp behind", a
     await saveEtagCacheToDisk(file, new Map([["https://api/second", entry("e2", "second")]]));
 
     const written = JSON.parse(readFileSync(file, "utf8"));
-    assert.deepEqual(written.entries.map((e) => e.url), ["https://api/second"]);
+    assert.deepEqual(written.entries.map((e) => e.key), ["https://api/second"]);
 
     const strays = existsSync(dir)
       ? (await import("node:fs")).readdirSync(dir).filter((name) => name.includes(".tmp"))
