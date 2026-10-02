@@ -134,6 +134,7 @@ Token scopes you need depend on what you want to see:
 - Browser notifications and an in-app inbox for CI/CD completions, new conflicts, and PRs newly blocked on nothing but a branch update
 - Optional **auto-merge** countdown for passing PRs with completed checks
 - One-click reruns for failed CI/CD jobs and their dependent jobs, available on failed run, PR, and pipeline-trace cards
+- Optional **auto rerun** for flaky infrastructure such as reclaimed spot runners: a failed run is rerun once, and an alert fires if the rerun fails too
 - Optional automatic Dependabot cleanup: closes PRs with failing CI, cancels queued runs once they reach the configured threshold, and auto-dismisses failed Dependabot runs from Failing CI
 
 ## How it works
@@ -211,6 +212,7 @@ When repos are skipped, the **Repos** count says how many and why on hover. Set 
 - **Busy runners** — scan owner/org self-hosted runners
 - **Auto refresh** — schedules the next scan adaptively with a live countdown
 - **Auto merge** — counts passing PRs (with completed checks) down for 15s, then merges
+- **Auto rerun** — off by default. A run that failed (`failure` or `timed_out`) on its first attempt in the last 2 hours gets its failed jobs rerun once. It covers failing PRs, failed CI runs and failed CD runs. If the rerun fails too, the run is not retried again: its card shows **Failed after rerun** and the inbox, toast and browser notification raise one alert. Cancelled runs and `startup_failure` are left alone, since a rerun can't fix them. The setting is saved server-side in `.cache/auto-rerun.json`. Reruns happen during dashboard scans, so they need the dashboard open with auto refresh on.
 
 ## API
 
@@ -220,6 +222,8 @@ GET  /api/runners/status?mode=all&includeRepoRunners=0&jobs=4
 POST /api/pull-request/merge
 POST /api/pull-request/close
 POST /api/pull-request/update-branch
+GET  /api/auto-rerun
+POST /api/auto-rerun          {"enabled": true}
 GET  /api/health
 ```
 

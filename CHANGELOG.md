@@ -8,6 +8,8 @@ This project follows [Semantic Versioning](https://semver.org/) where practical.
 
 ### Added
 
+- **Auto rerun.** A new switch reruns a failed workflow's failed jobs once, automatically, for failures like a spot runner being reclaimed mid-build. It is off by default and saved server-side in `.cache/auto-rerun.json`. Only first-attempt `failure`/`timed_out` runs from the last 2 hours qualify, across failing PRs, failed CI and failed CD. A run that fails again on its rerun attempt is never retried a second time. Its card shows *Failed after rerun* and one alert goes to the inbox, a toast and a browser notification. If GitHub refuses a rerun, that is reported once per run, not retried on every scan. Automatic and manual reruns share the existing dedup, so they never double-POST.
+
 - **`start.sh` controls the LaunchAgent.** `./start.sh start | stop | restart | status | monitor | logs` replaces hand-typed `launchctl` commands. `start` installs the agent for whichever checkout it runs from, substituting that path, your `node` and your `$HOME` into the checked-in plist, then waits for `/api/health` to answer; `restart` waits for a *new* pid, so it cannot report the old process as the reloaded one. `status` shows launchd state, uptime, auth and the tightest quota bucket, flags a server running older code than is on disk, and lists only the current run's log errors; it exits 0/1/2 for healthy/down/needs-attention. `start` refuses to take over an agent installed for another checkout or to fight a foreground server for the port. `./start.sh` with no argument still runs in the foreground as before.
 
 ### Fixed

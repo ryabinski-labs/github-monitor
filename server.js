@@ -458,6 +458,57 @@ function sameAutoMergeOwners(a, b) {
   return right.every((value) => set.has(String(value).toLowerCase()));
 }
 
+// Auto rerun: spot runners get reclaimed mid-build, and the run fails through no
+// fault of the change. With the option on, a recently failed run on its first
+// attempt gets its failed jobs rerun once, server-side. A run that fails again on
+// a later attempt is not retried a second time; it is marked `exhausted`, which
+// the dashboard announces as an alert. `cancelled` is left alone because it is
+// mostly concurrency groups superseding a run, and `startup_failure` is a broken
+// workflow file that a rerun cannot fix. Off unless someone turns it on.
+const AUTO_RERUN_CONCLUSIONS = new Set(["failure", "timed_out"]);
+// Only failures this fresh qualify, so switching the option on does not rerun
+// three days of old failures, and an old exhausted run does not alert.
+const AUTO_RERUN_MAX_AGE_MS = 2 * 60 * 60 * 1000;
+// How long a requested rerun is remembered. Covers the gap before GitHub moves
+// the run back to queued, so the next scan does not request it again.
+const AUTO_RERUN_REQUEST_TTL_MS = 6 * 60 * 60 * 1000;
+const AUTO_RERUN_STATE_PATH = process.env.AUTO_RERUN_STATE_PATH
+  ?? (process.env.NODE_ENV === "test" ? "" : join(__dirname, ".cache", "auto-rerun.json"));
+
+const autoRerunState = {
+  enabled: false,
+  // `${repo}:${runId}:${attempt}` -> { at, error }
+  requested: new Map(),
+  lastError: ""
+};
+
+function loadAutoRerunStateFromDisk(path = AUTO_RERUN_STATE_PATH) {
+  if (!path) return false;
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return false;
+  }
+  if (parsed?.version !== 1) return false;
+  autoRerunState.enabled = Boolean(parsed.enabled);
+  return true;
+}
+
+async function saveAutoRerunStateToDisk(path = AUTO_RERUN_STATE_PATH) {
+  if (!path) return false;
+  try {
+    await mkdir(join(path, ".."), { recursive: true });
+    const payload = JSON.stringify({ version: 1, savedAt: new Date().toISOString(), enabled: autoRerunState.enabled });
+    const temporary = `${path}.${process.pid}.tmp`;
+    await writeFile(temporary, payload, "utf8");
+    await rename(temporary, path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 const githubValueCache = new Map();
 
 // The last CD-run state each repo's actions feed showed, keyed repo -> fingerprint
@@ -3318,6 +3369,7 @@ async function fetchCdForRepo(repo) {
           headSha: failedRun.head_sha || failedRun.head_commit?.id || "",
           title: failedRun.display_title || "",
           url: failedRun.html_url || "",
+          runAttempt: Number(failedRun.run_attempt) || 1,
           resolvedBy
         };
       });
@@ -3468,6 +3520,7 @@ async function fetchActionsForRepo(repo) {
         ...(isDependabotWorkflowRun(run) ? { dependabot: true } : {}),
         title: run.display_title || run.name || "",
         url: run.html_url || "",
+        runAttempt: Number(run.run_attempt) || 1,
         failureReason: await fetchWorkflowRunFailureReason(repo, run)
       }));
       return {
@@ -4474,6 +4527,7 @@ async function buildDashboardData(requestUrl) {
     traces = buildPipelineTraces({ pullRequests, includeCd });
   }
 
+  ({ failedActions, failedCd, pullRequests } = await applyAutoRerun({ failedActions, failedCd, pullRequests }));
   const prGroups = groupPullRequests(pullRequests);
   syncAutoMergeFromStatus(pullRequests, { mode, jobs, owners });
   const accounts = await allOwners(me);
@@ -4545,6 +4599,7 @@ async function buildDashboardData(requestUrl) {
       busy: busyRunners.sort((a, b) => `${a.scope}/${a.name}`.localeCompare(`${b.scope}/${b.name}`))
     },
     autoMerge: autoMergeSnapshot(),
+    autoRerun: autoRerunSnapshot(),
     dependabotCleanup: cleanupSnapshot
   };
 }
@@ -4747,6 +4802,123 @@ async function autoMergeConfig(req, res) {
   await sendJson(res, 200, autoMergeSnapshot());
 }
 
+function autoRerunSnapshot() {
+  return {
+    enabled: autoRerunState.enabled,
+    maxAttempts: 2,
+    conclusions: [...AUTO_RERUN_CONCLUSIONS],
+    lastError: autoRerunState.lastError
+  };
+}
+
+// What auto rerun should do with one failed run. Pure, so the policy is testable
+// without GitHub: `rerun` for a fresh first-attempt failure, `exhausted` for a
+// fresh failure that already had its rerun, `null` for anything else.
+function autoRerunDecision(run, { now = Date.now() } = {}) {
+  if (!run || run.status !== "completed") return null;
+  if (!AUTO_RERUN_CONCLUSIONS.has(run.conclusion)) return null;
+  const failedAt = new Date(run.updatedAt || run.createdAt || 0).getTime();
+  if (!Number.isFinite(failedAt) || now - failedAt > AUTO_RERUN_MAX_AGE_MS) return null;
+  const attempt = Number(run.runAttempt) || 1;
+  return attempt >= 2 ? "exhausted" : "rerun";
+}
+
+function pruneAutoRerunRequests(now = Date.now()) {
+  for (const [key, entry] of autoRerunState.requested) {
+    if (now - entry.at >= AUTO_RERUN_REQUEST_TTL_MS) autoRerunState.requested.delete(key);
+  }
+}
+
+// The PR lane reads its failures from GraphQL check rollups, which carry no
+// attempt number, so those runs are looked up over REST. Only failing PRs pay
+// this, only while auto rerun is on, and the ETag cache makes repeats free.
+async function fetchAutoRerunFacts(repo, runId) {
+  try {
+    const run = await githubRequest(`/repos/${repo}/actions/runs/${runId}`);
+    return {
+      status: run?.status || "",
+      conclusion: run?.conclusion || "",
+      runAttempt: Number(run?.run_attempt) || 1,
+      updatedAt: run?.updated_at || "",
+      createdAt: run?.created_at || ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function autoRerunOne(repo, run, now) {
+  if (!repo || !run?.runId || run.autoDismissed) return null;
+  const decision = autoRerunDecision(run, { now });
+  if (!decision) return null;
+  const attempt = Number(run.runAttempt) || 1;
+  if (decision === "exhausted") return { state: "exhausted", attempt };
+  const key = `${repo}:${run.runId}:${attempt}`;
+  const previous = autoRerunState.requested.get(key);
+  if (previous) return previous.error
+    ? { state: "error", attempt, message: previous.error }
+    : { state: "requested", attempt: attempt + 1 };
+  try {
+    await requestRerunFailedJobs(repo, run.runId);
+    autoRerunState.requested.set(key, { at: now, error: "" });
+    if (process.env.NODE_ENV !== "test") console.log(`Auto rerun: ${repo} run ${run.runId} (attempt ${attempt + 1})`);
+    return { state: "requested", attempt: attempt + 1 };
+  } catch (error) {
+    // Remembered too, so a refusal (an expired run, a missing permission) is
+    // reported once per window instead of being retried on every scan.
+    const message = error.message || "Auto rerun failed";
+    autoRerunState.requested.set(key, { at: now, error: message });
+    autoRerunState.lastError = `${repo} run ${run.runId}: ${message}`;
+    return { state: "error", attempt, message };
+  }
+}
+
+const AUTO_RERUN_STATE_RANK = { exhausted: 3, error: 2, requested: 1 };
+
+// Annotates failed rows with `autoRerun` and requests the reruns that are due.
+// Rows are returned as copies; nothing is dropped, so a run that is being
+// rerun still shows as failed until GitHub reports it running again.
+async function applyAutoRerun({ failedActions = [], failedCd = [], pullRequests = [] } = {}, { now = Date.now() } = {}) {
+  if (!autoRerunState.enabled) return { failedActions, failedCd, pullRequests };
+  pruneAutoRerunRequests(now);
+  const annotateRow = async (row) => {
+    const autoRerun = await autoRerunOne(row.repo, { ...row, status: row.status || "completed" }, now);
+    return autoRerun ? { ...row, autoRerun } : row;
+  };
+  const nextActions = await mapLimit(failedActions, 4, annotateRow);
+  const nextCd = await mapLimit(failedCd, 4, annotateRow);
+  const nextPullRequests = await mapLimit(pullRequests, 4, async (pr) => {
+    if (pr.state !== "fail" || !pr.failedRuns?.length) return pr;
+    const failedRuns = await mapLimit(pr.failedRuns, 2, async (run) => {
+      const facts = await fetchAutoRerunFacts(pr.repo, run.runId);
+      if (!facts) return run;
+      const autoRerun = await autoRerunOne(pr.repo, { ...run, ...facts }, now);
+      return autoRerun ? { ...run, runAttempt: facts.runAttempt, autoRerun } : run;
+    });
+    const worst = failedRuns
+      .map((run) => run.autoRerun)
+      .filter(Boolean)
+      .sort((a, b) => AUTO_RERUN_STATE_RANK[b.state] - AUTO_RERUN_STATE_RANK[a.state])[0];
+    return worst ? { ...pr, failedRuns, autoRerun: worst } : { ...pr, failedRuns };
+  });
+  return { failedActions: nextActions, failedCd: nextCd, pullRequests: nextPullRequests };
+}
+
+async function autoRerunConfig(req, res) {
+  if (req.method === "GET") {
+    await sendJson(res, 200, autoRerunSnapshot());
+    return;
+  }
+  if (req.method !== "POST" && req.method !== "PUT") {
+    throw new HttpError(405, "Method not allowed");
+  }
+  const body = await readJsonBody(req);
+  autoRerunState.enabled = Boolean(body.enabled);
+  autoRerunState.lastError = "";
+  await saveAutoRerunStateToDisk();
+  await sendJson(res, 200, autoRerunSnapshot());
+}
+
 function groupPullRequests(pullRequests) {
   // Exclusive lanes, in precedence order: a conflicting PR is a conflict even
   // when it is also behind (DL-005 -- GitHub answers 422 to an update on it),
@@ -4944,14 +5116,9 @@ async function closePullRequest(req, res) {
   });
 }
 
-async function rerunFailedJobs(req, res) {
-  if (req.method !== "POST") {
-    throw new HttpError(405, "Method not allowed");
-  }
-
-  const body = await readJsonBody(req);
-  const { repo } = parseRepo(body.repo);
-  const runId = parseRunId(body.runId);
+// Shared by the Rerun button and auto rerun, so a click and the automatic
+// request for the same run inside the dedup window send GitHub one POST.
+async function requestRerunFailedJobs(repo, runId) {
   const key = `${repo}:${runId}`;
   const now = Date.now();
   for (const [candidate, entry] of recentRerunRequests.entries()) {
@@ -4973,6 +5140,18 @@ async function rerunFailedJobs(req, res) {
     throw error;
   }
   invalidateWorkflowRunCaches(repo);
+  return { duplicate };
+}
+
+async function rerunFailedJobs(req, res) {
+  if (req.method !== "POST") {
+    throw new HttpError(405, "Method not allowed");
+  }
+
+  const body = await readJsonBody(req);
+  const { repo } = parseRepo(body.repo);
+  const runId = parseRunId(body.runId);
+  const { duplicate } = await requestRerunFailedJobs(repo, runId);
   await sendJson(res, 200, {
     queued: true,
     duplicate,
@@ -5084,6 +5263,10 @@ const server = http.createServer(async (req, res) => {
       await closePullRequest(req, res);
       return;
     }
+    if (requestUrl.pathname === "/api/auto-rerun") {
+      await autoRerunConfig(req, res);
+      return;
+    }
     if (requestUrl.pathname === "/api/actions/rerun-failed") {
       await rerunFailedJobs(req, res);
       return;
@@ -5128,6 +5311,8 @@ if (isMain) {
     const scope = autoMergeState.options.owners.length ? autoMergeState.options.owners.join(", ") : "all accounts";
     console.log(`Auto merge: ${autoMergeState.enabled ? `on (${autoMergeState.options.mode}, ${scope})` : "off"}, ${autoMerge}`);
     if (autoMergeState.enabled) scheduleAutoMergeScan(0);
+    loadAutoRerunStateFromDisk();
+    console.log(`Auto rerun: ${autoRerunState.enabled ? "on (once per failed run)" : "off"}`);
     scheduleDependabotQueueScan(0);
   });
 
@@ -5155,6 +5340,12 @@ export {
   buildDashboardWarnings,
   loadEtagCacheFromDisk,
   loadAutoMergeStateFromDisk,
+  loadAutoRerunStateFromDisk,
+  saveAutoRerunStateToDisk,
+  autoRerunState,
+  autoRerunDecision,
+  applyAutoRerun,
+  AUTO_RERUN_MAX_AGE_MS,
   restoreAutoMergeAtBoot,
   saveAutoMergeStateToDisk,
   saveEtagCacheToDisk,
