@@ -92,6 +92,8 @@ const state = {
   dismissed: loadDismissed(),
   showDismissed: false,
   autoMerge: persisted.autoMerge !== false,
+  // Owned by the server (/api/auto-rerun); this mirrors it for the switch.
+  autoRerun: false,
   merging: new Set(),
   merged: new Set(),
   updating: new Set(),
@@ -201,6 +203,7 @@ const els = {
   includeRunners: document.querySelector("#includeRunners"),
   autoRefresh: document.querySelector("#autoRefresh"),
   autoMerge: document.querySelector("#autoMerge"),
+  autoRerun: document.querySelector("#autoRerun"),
   notifications: document.querySelector("#notifications"),
   refresh: document.querySelector("#refresh"),
   refreshPauseNotice: document.querySelector("#refreshPauseNotice"),
@@ -1195,6 +1198,94 @@ async function initServerAutoMerge() {
   return snapshot;
 }
 
+function applyAutoRerunSnapshot(snapshot) {
+  if (!snapshot) return;
+  state.autoRerun = Boolean(snapshot.enabled);
+  els.autoRerun.checked = state.autoRerun;
+}
+
+async function initServerAutoRerun() {
+  const response = await fetch("/api/auto-rerun");
+  const snapshot = await response.json().catch(() => null);
+  if (!response.ok || !snapshot) throw new Error(snapshot?.error || "Unable to read auto rerun");
+  applyAutoRerunSnapshot(snapshot);
+  return snapshot;
+}
+
+async function configureServerAutoRerun() {
+  const response = await fetch("/api/auto-rerun", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enabled: state.autoRerun })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || "Unable to configure auto rerun");
+  applyAutoRerunSnapshot(data);
+  return data;
+}
+
+// The pill that says what auto rerun did with a failed row. `requested` is the
+// one automatic retry in flight; `exhausted` means it already had that retry
+// and failed again, which is the case someone has to look at.
+function renderAutoRerunBadge(row) {
+  const info = row?.autoRerun;
+  if (!info?.state) return "";
+  if (info.state === "exhausted") {
+    return `<span class="rerun-pill rerun-pill-exhausted" title="${escapeHtml(`Failed again on attempt ${info.attempt} after an automatic rerun. Not retried again.`)}">Failed after rerun</span>`;
+  }
+  if (info.state === "error") {
+    return `<span class="rerun-pill rerun-pill-exhausted" title="${escapeHtml(`GitHub refused the automatic rerun: ${info.message || "unknown error"}`)}">Auto rerun refused</span>`;
+  }
+  return `<span class="rerun-pill" title="${escapeHtml(`Failed jobs were rerun automatically as attempt ${info.attempt}.`)}">Auto rerun #${escapeHtml(info.attempt)}</span>`;
+}
+
+function autoRerunRows(data) {
+  return [
+    ...(data?.pullRequests?.fail || []),
+    ...(data?.actions?.failed || []),
+    ...(data?.cd?.failed || [])
+  ].filter((row) => row?.autoRerun?.state && !row.autoDismissed);
+}
+
+// Unlike notifyCompletedActions this runs on the first load too: a run that
+// failed twice while the page was closed is exactly the one to hear about. The
+// server only marks failures from the last couple of hours, and the tag dedup
+// stops a still-failed run from alerting on every scan.
+function notifyAutoRerunOutcomes(data) {
+  for (const row of autoRerunRows(data)) {
+    const info = row.autoRerun;
+    const runs = row.kind === "workflowRun" || row.runId
+      ? [{ runId: row.runId, autoRerun: info }]
+      : (row.failedRuns || []).filter((run) => run.autoRerun);
+    const subject = row.numberLabel
+      ? `${row.repo} ${row.numberLabel}: ${row.title}`
+      : `${row.repo} ${[row.workflow, row.runNumber].filter(Boolean).join(" ")}: ${row.title || row.branch || ""}`;
+    for (const run of runs) {
+      const state = run.autoRerun?.state;
+      if (state === "exhausted" || state === "error") {
+        sendPopup(
+          state === "exhausted" ? "Failed again after auto rerun" : "Auto rerun refused",
+          `${subject}. ${state === "exhausted" ? `Attempt ${run.autoRerun.attempt} failed too` : run.autoRerun.message || ""}. Reason: ${failureDetail(row)}`,
+          `auto-rerun:${row.repo}:${run.runId}:${state}`,
+          { url: row.url, kind: "ci", tone: "danger" }
+        );
+      } else if (state === "requested") {
+        const tag = `auto-rerun:${row.repo}:${run.runId}:requested:${run.autoRerun.attempt}`;
+        if (wasNotified(tag)) continue;
+        markNotified(tag);
+        recordInbox({
+          title: "Auto rerun requested",
+          body: `${subject}. Reason: ${failureDetail(row)}`,
+          tag,
+          url: row.url,
+          kind: "ci",
+          tone: "warning"
+        });
+      }
+    }
+  }
+}
+
 function failureDetail(row, fallback = "failed") {
   return row?.failureReason || (row?.failedChecks || []).join(", ") || fallback;
 }
@@ -1826,8 +1917,10 @@ async function refresh({ source = "manual" } = {}) {
       throw new Error(data.error || "Unable to refresh dashboard");
     }
     if (data.autoMerge) applyAutoMergeSnapshot(data.autoMerge);
+    if (data.autoRerun) applyAutoRerunSnapshot(data.autoRerun);
     const mergedData = mergeTraceData(data);
     notifyCompletedActions(state.activitySnapshot, mergedData);
+    notifyAutoRerunOutcomes(mergedData);
     state.activitySnapshot = buildActivitySnapshot(mergedData);
     state.data = mergedData;
     state.staleSince = null;
@@ -2531,6 +2624,7 @@ function renderPrRow(row, view) {
         ${behindBadge}
         ${draftBadge}
         ${phaseBadge}
+        ${row.state === "fail" ? renderAutoRerunBadge(row) : ""}
       </div>
       <div class="meta">${escapeHtml(detail)}</div>
       ${renderPrActions(row, dismissButton)}
@@ -2579,7 +2673,7 @@ function renderCdRow(row, view, viewKey) {
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
       </div>
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
-      <div class="tag-group"><div class="${tagClass}">${escapeHtml(statusLabel)}</div>${phaseBadge}</div>
+      <div class="tag-group"><div class="${tagClass}">${escapeHtml(statusLabel)}</div>${phaseBadge}${viewKey === "failedCd" ? renderAutoRerunBadge(row) : ""}</div>
       <div class="meta" title="${escapeHtml(detail)}">${escapeHtml(detail)}</div>
       <div class="row-actions">
         ${viewKey === "failedCd" ? renderRerunButton(row) : ""}
@@ -3055,7 +3149,7 @@ function renderWorkflowRunRow(row, view) {
         <div class="title">${escapeHtml(row.title || row.workflow)}</div>
       </div>
       <div class="meta">${escapeHtml(row.workflow)} ${escapeHtml(row.runNumber)}</div>
-      <div class="tag-group"><div class="tag">${escapeHtml(status)}</div>${phaseBadge}</div>
+      <div class="tag-group"><div class="tag">${escapeHtml(status)}</div>${phaseBadge}${row.conclusion ? renderAutoRerunBadge(row) : ""}</div>
       <div class="meta">${escapeHtml(detail)}</div>
       <div class="row-actions">
         ${row.conclusion ? renderRerunButton(row) : ""}
@@ -3620,6 +3714,17 @@ els.autoMerge.addEventListener("change", () => {
       showToast("Auto merge failed", error.message);
     });
 });
+els.autoRerun.addEventListener("change", () => {
+  state.autoRerun = els.autoRerun.checked;
+  configureServerAutoRerun()
+    .then(() => refreshAfterMutation("auto-rerun"))
+    .catch((error) => {
+      els.autoRerun.checked = !state.autoRerun;
+      state.autoRerun = !state.autoRerun;
+      setError(error.message);
+      showToast("Auto rerun failed", error.message);
+    });
+});
 els.notifications.addEventListener("change", async () => {
   state.notifications = els.notifications.checked;
   persist();
@@ -3829,6 +3934,7 @@ syncFilterUI();
 syncNotificationControl();
 renderInbox();
 ensureCountdownTimer();
+initServerAutoRerun().catch(() => {});
 initServerAutoMerge()
   .catch((error) => {
     setError(error.message);

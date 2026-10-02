@@ -1106,6 +1106,7 @@ test("dashboard includes running non-CD workflow runs in CI running work", async
         branch: "main",
         title: "Merge pull request #12 from acme/fix",
         url: "https://github.com/acme/app/actions/runs/45",
+        runAttempt: 1,
         failureReason: "engine — pytest failed"
       }
     ]);
