@@ -1501,7 +1501,7 @@ button.metric.active .metric-dot {
   justify-self: end;
 }
 
-.open-link, .merge-button, .close-button, .rerun-button, .update-button {
+.open-link, .merge-button, .close-button, .rerun-button, .update-button, .approve-button {
   display: inline-flex;
   gap: 4px;
   justify-content: center;
@@ -1541,6 +1541,35 @@ button.metric.active .metric-dot {
 }
 .rerun-button[data-state="loading"] svg { animation: spin 0.9s linear infinite; }
 .rerun-button[data-state="queued"] {
+  border-color: color-mix(in srgb, var(--green) 58%, var(--line-strong));
+  background: var(--green-soft);
+  color: var(--green);
+  cursor: default;
+  opacity: 1;
+}
+/* Fork-PR workflow approval. Violet, not blue: a failing PR can carry both an
+   Approve and a Rerun control, and two same-coloured buttons read as one. */
+.approve-button {
+  border-color: var(--violet);
+  background: var(--violet);
+  color: var(--paper-strong);
+  white-space: nowrap;
+}
+.approve-button svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+.approve-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--violet) 82%, black);
+  background: color-mix(in srgb, var(--violet) 82%, black);
+}
+.approve-button:disabled {
+  cursor: wait;
+  opacity: 0.82;
+}
+.approve-button[data-state="loading"] svg { animation: spin 0.9s linear infinite; }
+.approve-button[data-state="approved"] {
   border-color: color-mix(in srgb, var(--green) 58%, var(--line-strong));
   background: var(--green-soft);
   color: var(--green);
@@ -1656,7 +1685,8 @@ button.metric.active .metric-dot {
 .merge-button:focus-visible,
 .close-button:focus-visible,
 .rerun-button:focus-visible,
-.update-button:focus-visible {
+.update-button:focus-visible,
+.approve-button:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
 }
@@ -2515,6 +2545,29 @@ button.metric.active .metric-dot {
   letter-spacing: 0.14em;
   text-transform: uppercase;
   white-space: nowrap;
+}
+
+.approval-pill {
+  display: inline-flex;
+  gap: 5px;
+  align-items: center;
+  padding: 3px 8px 3px 6px;
+  border: 1px solid color-mix(in srgb, var(--violet) 32%, transparent);
+  border-radius: var(--radius-pill);
+  background: var(--violet-soft);
+  color: var(--violet-on-soft);
+  font-family: var(--sans);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.approval-pill svg {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 auto;
+  stroke: currentColor;
 }
 
 .phase-pill {

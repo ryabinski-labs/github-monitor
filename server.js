@@ -122,6 +122,19 @@ const PR_SEARCH_GRAPHQL = `
                     }
                   }
                 }
+                checkSuites(first: 100) {
+                  nodes {
+                    status
+                    conclusion
+                    workflowRun {
+                      databaseId
+                      url
+                      workflow {
+                        name
+                      }
+                    }
+                  }
+                }
               }
             }
           }
@@ -181,6 +194,19 @@ const PR_BY_NUMBER_GRAPHQL = `
                     ... on StatusContext {
                       context
                       state
+                    }
+                  }
+                }
+              }
+              checkSuites(first: 100) {
+                nodes {
+                  status
+                  conclusion
+                  workflowRun {
+                    databaseId
+                    url
+                    workflow {
+                      name
                     }
                   }
                 }
@@ -272,6 +298,7 @@ const RUNNING_DEPLOYMENT_CACHE_TTL_MS = 60 * 1000;
 // deployments did not finish" on the dashboard beside a healthy quota.
 const DEPLOYMENT_SCAN_LIMIT = 20;
 const RERUN_DEDUP_TTL_MS = 60 * 1000;
+const APPROVE_DEDUP_TTL_MS = 60 * 1000;
 const OWNER_REPOS_CACHE_TTL_MS = 5 * 60 * 1000;
 // A repo nobody has pushed to in a week still costs a full slice of every scan
 // -- workflows, runs, deployments, runners -- to return the same empty answer it
@@ -291,6 +318,7 @@ const MERGED_PR_CACHE_TTL_MS = 10 * 60 * 1000;
 const RECENT_COMMIT_CACHE_TTL_MS = 5 * 60 * 1000;
 const RUNNING_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const recentRerunRequests = new Map();
+const recentApproveRequests = new Map();
 const DEPENDABOT_LOGIN = "dependabot[bot]";
 const DEPENDABOT_QUEUE_MAX_THRESHOLD = 5000;
 const DEPENDABOT_QUEUE_THRESHOLD = parseDependabotQueueThreshold(process.env.DEPENDABOT_QUEUE_THRESHOLD);
@@ -1647,6 +1675,27 @@ function failedWorkflowRunsFromChecks(checks) {
   return [...runs.values()];
 }
 
+// A fork pull request's workflow runs are held until a maintainer approves them.
+// GitHub records the hold as a completed check suite with the ACTION_REQUIRED
+// conclusion -- and, crucially, creates no check run for it, so it never appears
+// in statusCheckRollup. The suite still carries its workflowRun, which is exactly
+// the id the approve endpoint needs.
+function awaitingApprovalWorkflowRunsFromCheckSuites(checkSuites) {
+  const runs = new Map();
+  for (const suite of checkSuites || []) {
+    if (suite?.conclusion !== "ACTION_REQUIRED") continue;
+    const workflowRun = suite.workflowRun;
+    const runId = Number(workflowRun?.databaseId);
+    if (!Number.isSafeInteger(runId) || runId < 1 || runs.has(runId)) continue;
+    runs.set(runId, {
+      runId,
+      workflow: workflowRun.workflow?.name || "Workflow",
+      url: workflowRun.url || ""
+    });
+  }
+  return [...runs.values()];
+}
+
 function cdFailureReason(conclusion) {
   return `Workflow ${failureLabel(conclusion)}`;
 }
@@ -2307,9 +2356,14 @@ function buildUpdateBranchRequest(repo, number) {
 
 function classifyPullRequest(pr) {
   const checks = pr.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes?.filter(Boolean) || [];
+  const checkSuites = pr.commits?.nodes?.[0]?.commit?.checkSuites?.nodes || [];
+  const awaitingApprovalRuns = awaitingApprovalWorkflowRunsFromCheckSuites(checkSuites);
   const mergeable = pr.mergeable || "UNKNOWN";
   const hasConflict = mergeable === "CONFLICTING";
   const base = {
+    ...(awaitingApprovalRuns.length
+      ? { awaitingApprovalRuns, awaitingApprovalCount: awaitingApprovalRuns.length }
+      : {}),
     repo: pr.repository.nameWithOwner,
     number: pr.number,
     numberLabel: `#${pr.number}`,
@@ -5161,6 +5215,53 @@ async function rerunFailedJobs(req, res) {
   });
 }
 
+// Approving a fork pull request's held workflow runs is one POST per run id --
+// GitHub has no bulk endpoint. Like reruns, the request is deduped so a
+// double-click (or a retry after a lost response) does not send GitHub the same
+// approval twice.
+async function requestApproveWorkflowRun(repo, runId) {
+  const key = `${repo}:${runId}`;
+  const now = Date.now();
+  for (const [candidate, entry] of recentApproveRequests.entries()) {
+    if (now - entry.startedAt >= APPROVE_DEDUP_TTL_MS) recentApproveRequests.delete(candidate);
+  }
+  let entry = recentApproveRequests.get(key);
+  const duplicate = Boolean(entry);
+  if (!entry) {
+    entry = {
+      startedAt: now,
+      promise: githubRequest(`/repos/${repo}/actions/runs/${runId}/approve`, { method: "POST" })
+    };
+    recentApproveRequests.set(key, entry);
+  }
+  try {
+    await entry.promise;
+  } catch (error) {
+    if (recentApproveRequests.get(key) === entry) recentApproveRequests.delete(key);
+    throw error;
+  }
+  invalidateWorkflowRunCaches(repo);
+  return { duplicate };
+}
+
+async function approveWorkflowRun(req, res) {
+  if (req.method !== "POST") {
+    throw new HttpError(405, "Method not allowed");
+  }
+
+  const body = await readJsonBody(req);
+  const { repo } = parseRepo(body.repo);
+  const runId = parseRunId(body.runId);
+  const { duplicate } = await requestApproveWorkflowRun(repo, runId);
+  await sendJson(res, 200, {
+    approved: true,
+    duplicate,
+    message: "Workflow approved to run.",
+    repo,
+    runId
+  });
+}
+
 async function sendStatic(req, res) {
   const requestUrl = new URL(req.url, `http://${req.headers.host}`);
   const pathname = requestUrl.pathname === "/" ? "/index.html" : requestUrl.pathname;
@@ -5271,6 +5372,10 @@ const server = http.createServer(async (req, res) => {
       await rerunFailedJobs(req, res);
       return;
     }
+    if (requestUrl.pathname === "/api/actions/approve-run") {
+      await approveWorkflowRun(req, res);
+      return;
+    }
     if (requestUrl.pathname === "/api/health") {
       // Reads the in-memory bucket cache only -- no GitHub request -- so asking
       // how much quota is left does not itself spend quota. That circularity was
@@ -5356,6 +5461,7 @@ export {
   bestProductionUrlCandidate,
   buildChangeSummary,
   classifyPullRequest,
+  awaitingApprovalWorkflowRunsFromCheckSuites,
   compareHeadRef,
   normalizeBehindBy,
   isBehindBase,

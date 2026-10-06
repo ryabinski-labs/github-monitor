@@ -51,6 +51,8 @@ const QUOTA_ABSOLUTE_LIMIT_FLOOR = 1000;
 const DISMISSED_KEY = "pr-deck:dismissed:v1";
 const RERUN_REQUESTED_KEY = "pr-deck:rerun-requested:v1";
 const RERUN_REQUESTED_TTL_MS = 60 * 1000;
+const APPROVE_REQUESTED_KEY = "pr-deck:approve-requested:v1";
+const APPROVE_REQUESTED_TTL_MS = 60 * 1000;
 // Dismissals are a local per-user view preference (no server/cloud state — see
 // the state-architecture note in the README). They auto-expire so the list
 // can't grow forever and a brand-new run for the same lane reappears on its own.
@@ -102,6 +104,8 @@ const state = {
   closed: new Set(),
   rerunning: new Set(),
   rerunRequested: loadRecentReruns(),
+  approving: new Set(),
+  approveRequested: loadRecentApprovals(),
   autoMerges: new Map(),
   autoMergeTicker: null,
   autoMergeFollowUpTimer: null
@@ -440,6 +444,35 @@ function markRerunRequested(key) {
   state.rerunRequested[key] = new Date().toISOString();
   try {
     sessionStorage.setItem(RERUN_REQUESTED_KEY, JSON.stringify(state.rerunRequested));
+  } catch {}
+}
+
+function loadRecentApprovals() {
+  try {
+    const raw = JSON.parse(sessionStorage.getItem(APPROVE_REQUESTED_KEY) || "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    const cutoff = Date.now() - APPROVE_REQUESTED_TTL_MS;
+    const pruned = {};
+    for (const [key, at] of Object.entries(raw)) {
+      const time = new Date(at).getTime();
+      if (Number.isFinite(time) && time >= cutoff) pruned[key] = at;
+    }
+    sessionStorage.setItem(APPROVE_REQUESTED_KEY, JSON.stringify(pruned));
+    return pruned;
+  } catch {
+    return {};
+  }
+}
+
+function approveWasRequested(key) {
+  const time = new Date(state.approveRequested[key] || 0).getTime();
+  return Number.isFinite(time) && time >= Date.now() - APPROVE_REQUESTED_TTL_MS;
+}
+
+function markApproveRequested(key) {
+  state.approveRequested[key] = new Date().toISOString();
+  try {
+    sessionStorage.setItem(APPROVE_REQUESTED_KEY, JSON.stringify(state.approveRequested));
   } catch {}
 }
 
@@ -2477,6 +2510,64 @@ function renderRerunButton(row) {
   </button>`;
 }
 
+function approvalRunsForRow(row) {
+  const source = Array.isArray(row?.awaitingApprovalRuns) ? row.awaitingApprovalRuns : [];
+  const seen = new Set();
+  return source.filter((run) => {
+    const runId = Number(run?.runId);
+    if (!Number.isSafeInteger(runId) || runId < 1 || seen.has(runId)) return false;
+    seen.add(runId);
+    return true;
+  }).map((run) => ({ ...run, runId: Number(run.runId) }));
+}
+
+// Fork pull requests hold their workflows until a maintainer approves them. The
+// button POSTs one approval per held run id, exactly like the rerun control.
+function renderApproveButton(row) {
+  const runs = approvalRunsForRow(row);
+  if (!row?.repo || !runs.length) return "";
+  const keys = runs.map((run) => rerunKey(row.repo, run.runId));
+  const isApproving = keys.some((key) => state.approving.has(key));
+  const isApproved = keys.every(approveWasRequested);
+  const label = isApproved
+    ? "Approved"
+    : isApproving
+    ? "Approving"
+    : runs.length > 1 ? `Approve ${runs.length} workflows` : "Approve workflow";
+  const target = runs.length > 1
+    ? `${runs.length} workflows awaiting approval in ${row.repo}`
+    : `${runs[0].workflow || row.workflow || "workflow"} in ${row.repo}`;
+  const ariaLabel = isApproved
+    ? `Approval sent for ${target}`
+    : isApproving
+    ? `Approving ${target}`
+    : `Approve ${target} to run`;
+  return `<button
+    class="approve-button"
+    type="button"
+    data-repo="${escapeHtml(row.repo)}"
+    data-run-ids="${escapeHtml(runs.map((run) => run.runId).join(","))}"
+    data-approve-label="${escapeHtml(target)}"
+    data-state="${isApproved ? "approved" : isApproving ? "loading" : "ready"}"
+    aria-label="${escapeHtml(ariaLabel)}"
+    title="${escapeHtml(isApproved ? "GitHub accepted the approval" : isApproving ? "Approving held workflows on GitHub" : `Approve ${target} to run`)}"
+    ${isApproved || isApproving ? "disabled" : ""}
+  >
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 12.4l2.2 2.2 4.3-4.7M12 3.5 4.5 6.6v5c0 4.5 3.2 7.6 7.5 8.9 4.3-1.3 7.5-4.4 7.5-8.9v-5L12 3.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <span>${escapeHtml(label)}</span>
+  </button>`;
+}
+
+function renderApprovalBadge(row) {
+  const count = approvalRunsForRow(row).length;
+  if (!count) return "";
+  const noun = count === 1 ? "workflow" : "workflows";
+  return `<span class="approval-pill" title="${escapeHtml(`${count} ${noun} awaiting a maintainer approval before they can run`)}">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.5v4m0 3.5h.01M12 3.5 4.5 6.6v5c0 4.5 3.2 7.6 7.5 8.9 4.3-1.3 7.5-4.4 7.5-8.9v-5L12 3.5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    ${count} awaiting approval
+  </span>`;
+}
+
 // The three colour roles a lane hands its cards: the accent, the soft background
 // the accent sits on, and the text colour that is actually legible on that soft
 // background. The third is not always the first. In the light theme --amber on
@@ -2567,6 +2658,7 @@ function renderPrActions(row, dismissButton = "") {
     : "";
   return `
     <div class="row-actions">
+      ${renderApproveButton(row)}
       ${row.state === "fail" ? renderRerunButton(row) : ""}
       ${renderUpdateButton(row)}
       ${mergeButton}
@@ -2623,6 +2715,7 @@ function renderPrRow(row, view) {
         ${conflictBadge}
         ${behindBadge}
         ${draftBadge}
+        ${renderApprovalBadge(row)}
         ${phaseBadge}
         ${row.state === "fail" ? renderAutoRerunBadge(row) : ""}
       </div>
@@ -3621,6 +3714,48 @@ async function rerunFailedJobs(button) {
   await refreshAfterMutation("rerun");
 }
 
+async function approveWorkflowRuns(button) {
+  const repo = button.dataset.repo;
+  const runIds = String(button.dataset.runIds || "")
+    .split(",")
+    .map(Number)
+    .filter((runId) => Number.isSafeInteger(runId) && runId > 0);
+  const label = button.dataset.approveLabel || repo;
+  const pending = runIds.filter((runId) => {
+    const key = rerunKey(repo, runId);
+    return !state.approving.has(key) && !approveWasRequested(key);
+  });
+  if (!repo || !pending.length) return;
+
+  pending.forEach((runId) => state.approving.add(rerunKey(repo, runId)));
+  setError("");
+  render();
+  const results = await Promise.allSettled(pending.map(async (runId) => {
+    const response = await fetch("/api/actions/approve-run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ repo, runId })
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.approved) {
+      throw new Error(data.error || data.message || `Unable to approve workflow run ${runId}`);
+    }
+    markApproveRequested(rerunKey(repo, runId));
+    return runId;
+  }));
+
+  pending.forEach((runId) => state.approving.delete(rerunKey(repo, runId)));
+  const errors = results.filter((result) => result.status === "rejected").map((result) => result.reason?.message || "Approval failed");
+  render();
+  if (errors.length) {
+    const message = errors.length === 1 ? errors[0] : `${errors.length} approval requests failed. ${errors[0]}`;
+    setError(message);
+    return;
+  }
+  showToast("Workflows approved", `${label}. GitHub will start the held workflows.`);
+  await refreshAfterMutation("approve");
+}
+
 /* —— wiring —— */
 document.querySelectorAll(".segment").forEach((button) => {
   button.addEventListener("click", () => setMode(button.dataset.mode));
@@ -3807,6 +3942,14 @@ els.content.addEventListener("click", (event) => {
   event.preventDefault();
   event.stopPropagation();
   rerunFailedJobs(button);
+});
+
+els.content.addEventListener("click", (event) => {
+  const button = event.target.closest(".approve-button");
+  if (!button) return;
+  event.preventDefault();
+  event.stopPropagation();
+  approveWorkflowRuns(button);
 });
 
 els.content.addEventListener("click", (event) => {
