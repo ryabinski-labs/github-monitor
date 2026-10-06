@@ -114,7 +114,7 @@ Token scopes you need depend on what you want to see:
 |---|---|
 | Read-only PR & Actions monitoring | Repository read |
 | Self-hosted runner visibility | Actions runner access (owner or repo) |
-| Rerunning failed CI/CD jobs | Actions write |
+| Rerunning failed CI/CD jobs and approving held fork workflows | Actions write |
 | Merging PRs from the dashboard | Write to the target repository |
 | Optional deep-queue Dependabot cleanup | Actions and pull requests write |
 
@@ -134,6 +134,7 @@ Token scopes you need depend on what you want to see:
 - Browser notifications and an in-app inbox for CI/CD completions, new conflicts, and PRs newly blocked on nothing but a branch update
 - Optional **auto-merge** countdown for passing PRs with completed checks
 - One-click reruns for failed CI/CD jobs and their dependent jobs, available on failed run, PR, and pipeline-trace cards
+- One-click **approval for held fork-PR workflows**: a pull request whose workflows are waiting on a maintainer shows an *awaiting approval* pill and an **Approve workflow(s)** button, approving every held run for that PR at once
 - Optional **auto rerun** for flaky infrastructure such as reclaimed spot runners: a failed run is rerun once, and an alert fires if the rerun fails too
 - Optional automatic Dependabot cleanup: closes PRs with failing CI, cancels queued runs once they reach the configured threshold, and auto-dismisses failed Dependabot runs from Failing CI
 
@@ -167,6 +168,8 @@ flowchart LR
 **Dismissing runs.** Only the *latest* completed run per lane (workflow + branch) surfaces under Failing CI, so a retried-and-passed run resolves the failure and stale older failures don't pile up. Remaining failing runs (post-merge CI, Dependabot, etc.) can be dismissed to clear them from the list; use **Show** in the dismissed bar to review or **Restore** them. Dismissals are a per-user view preference kept in your browser's `localStorage` and auto-expire after 30 days — there is deliberately **no server-side or external database** (e.g. DynamoDB), keeping the tool local-first and zero-dependency. Because they live in `localStorage`, dismissals **survive restarting the server and reloading the page**, but are scoped to that one browser profile — a different browser, machine, or incognito window starts with a clean slate. A dismissed lane reappears on its own if a brand-new run later fails.
 
 **Rerunning failed jobs.** Failed GitHub Actions runs expose **Rerun failed**, which asks GitHub to rerun only failed jobs and their dependent jobs. A failed PR with more than one failed workflow queues each workflow from the same control. The button changes to **Rerun queued** after GitHub accepts the request; the normal adaptive refresh then replaces the stale failure with the new run state. The credential needs Actions write access.
+
+**Approving held workflows.** A pull request from a fork holds its workflows until a maintainer approves them, and GitHub records the hold as a check suite with an `ACTION_REQUIRED` conclusion — with no check run, so it never shows up in the status rollup. The scan reads those suites off the PR's head commit, the card shows an **awaiting approval** pill, and **Approve workflow(s)** asks GitHub to release every held run for that PR. Approval is one request per run id (GitHub has no bulk endpoint), deduplicated like reruns, and needs Actions write access. Runs held on an environment's deployment protection rules (`waiting` status) are a different mechanism and are not touched.
 
 **Dependabot cleanup.** This destructive server-side policy is **disabled by default**. Set `DEPENDABOT_QUEUE_THRESHOLD` to a positive integer to opt in. Once enabled, the server checks the selected owners every minute and does two things:
 
@@ -222,6 +225,8 @@ GET  /api/runners/status?mode=all&includeRepoRunners=0&jobs=4
 POST /api/pull-request/merge
 POST /api/pull-request/close
 POST /api/pull-request/update-branch
+POST /api/actions/rerun-failed  {"repo":"owner/name","runId":123}
+POST /api/actions/approve-run   {"repo":"owner/name","runId":123}
 GET  /api/auto-rerun
 POST /api/auto-rerun          {"enabled": true}
 GET  /api/health
