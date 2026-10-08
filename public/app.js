@@ -1996,8 +1996,8 @@ function dismissedInLane(rows, keyFn) {
 // no knowledge of locally dismissed rows. Subtract the user's dismissals so a
 // dismissed item also drops its tile/nav count — keeping the number in sync with
 // the filtered list. Only lanes with dismissable rows are adjusted (see
-// dismissKey): Failing CI and running CI workflow runs/PRs, failed CD runs,
-// and flagged/unknown pipeline traces.
+// dismissKey): Failing CI and running CI workflow runs/PRs, running and failed
+// CD runs, and flagged/unknown pipeline traces.
 function adjustedSummary(data) {
   const summary = (data && data.summary) || {};
   const failDismissed =
@@ -2010,6 +2010,7 @@ function adjustedSummary(data) {
     ...summary,
     failingPrs: Math.max(0, (summary.failingPrs ?? 0) - failDismissed),
     runningPrs: Math.max(0, (summary.runningPrs ?? 0) - runningDismissed),
+    runningCd: Math.max(0, (summary.runningCd ?? 0) - dismissedInLane(data?.cd?.running, actionKey)),
     failedCd: Math.max(0, (summary.failedCd ?? 0) - dismissedInLane(data?.cd?.failed, actionKey)),
     flaggedJourneys: Math.max(0, (summary.flaggedJourneys ?? 0) - dismissedInLane(data?.traces?.flagged, traceDismissKeys)),
     tracingUnknown: Math.max(0, (summary.tracingUnknown ?? 0) - dismissedInLane(data?.traces?.unknown, traceDismissKeys))
@@ -2046,7 +2047,7 @@ function displayCounts(data) {
       [...(data?.pullRequests?.running || []), ...(data?.actions?.running || [])],
       (row) => (row.kind === "workflowRun" ? actionKey(row) : prKey(row))
     ).length,
-    runningCd: filteredVisibleRows(data?.cd?.running).length,
+    runningCd: filteredVisibleRows(data?.cd?.running, actionKey).length,
     finishedCd: filteredVisibleRows(data?.cd?.finished).length,
     failedCd: filteredVisibleRows(data?.cd?.failed, actionKey).length,
     runningDeployments: filteredVisibleRows(data?.deployments?.running).length,
@@ -2326,16 +2327,18 @@ function render() {
 }
 
 // Returns stable dismiss keys for a dismissable row, else an empty array.
-// Failing-CI and running-CI workflow runs/PRs are dismissable; so are failed CD
-// runs and flagged/unknown pipeline traces. Trace rows also recognize legacy key
-// shapes so older localStorage dismissals keep hiding the same PR journey
-// after app updates.
+// Failing-CI and running-CI workflow runs/PRs are dismissable; so are failed and
+// in-progress CD runs and flagged/unknown pipeline traces. A running CD run
+// needs it because a queued run GitHub will not cancel (a stale/held concurrency
+// group) has no other escape: without a Dismiss the row pins the lane and its
+// tile forever. Trace rows also recognize legacy key shapes so older
+// localStorage dismissals keep hiding the same PR journey after app updates.
 function dismissKeys(row) {
   if (!row) return [];
   if (["fail", "running", "behind"].includes(state.view)) {
     return normalizeDismissKeys(row.kind === "workflowRun" ? actionKey(row) : prKey(row));
   }
-  if (state.view === "failedCd") return normalizeDismissKeys(actionKey(row));
+  if (state.view === "failedCd" || state.view === "runningCd") return normalizeDismissKeys(actionKey(row));
   if (state.view === "pipelineTraces" && (row.status === "flagged" || row.status === "unknown")) {
     return traceDismissKeys(row);
   }
@@ -2748,7 +2751,7 @@ function renderCdRow(row, view, viewKey) {
     : timeDetail;
   const tagClass = viewKey === "failedCd" ? `tag tag-${statusClass(status)}` : "tag";
   const phaseBadge = renderPhaseBadge(row);
-  const keys = viewKey === "failedCd" ? dismissKeys(row) : [];
+  const keys = dismissKeys(row);
   // An auto-dismissed CD row gets the same treatment as an auto-dismissed
   // workflow run: the dimmed state and a label saying why, never a Dismiss
   // button, because pressing it would write a localStorage key for a row the
