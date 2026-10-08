@@ -225,10 +225,10 @@ kbd {
   top: 0;
   z-index: 50;
   display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 18px;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 16px;
   align-items: center;
-  padding: 10px 0;
+  padding: 9px 0;
   background: linear-gradient(to bottom, var(--paper) 60%, color-mix(in srgb, var(--paper) 92%, transparent));
   backdrop-filter: saturate(120%) blur(6px);
   border-bottom: 1px solid var(--line);
@@ -238,6 +238,7 @@ kbd {
   display: inline-flex;
   gap: 10px;
   align-items: center;
+  min-width: 0;
   color: var(--ink);
 }
 
@@ -259,11 +260,43 @@ kbd {
 
 .controls {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  flex-wrap: nowrap;
+  gap: 5px;
   align-items: center;
   justify-content: flex-end;
+  min-width: 0;
 }
+
+/* One tight rail: the automation toggles stay on the same line as the
+   view-scope controls. They share a single bordered capsule so the row reads
+   as one control rather than six loose chips. */
+.toggle-group {
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 2px;
+  align-items: center;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+  height: 32px;
+  padding: 2px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--paper-strong);
+}
+
+.toggle-group .switch {
+  gap: 5px;
+  height: 100%;
+  min-height: 0;
+  padding: 0 8px;
+  border: 0;
+  background: transparent;
+  border-radius: 4px;
+}
+.toggle-group .switch:hover { background: var(--paper); }
+.toggle-group .switch:has(input:checked) { background: var(--surface-hover); color: var(--ink); }
+.toggle-group .switch:has(input:checked):hover { background: var(--surface-hover); }
+.toggle-group .switch:not(:has(input:checked)) { color: var(--muted-strong); }
 
 .segmented {
   display: flex;
@@ -305,9 +338,9 @@ kbd {
 
 .switch {
   display: inline-flex;
-  gap: 7px;
+  gap: 6px;
   align-items: center;
-  padding: 0 11px;
+  padding: 0 9px;
   color: var(--ink);
   font-size: 12px;
   font-weight: 600;
@@ -320,7 +353,7 @@ kbd {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
+  width: 32px;
   padding: 0;
   color: var(--paper-strong);
   background: var(--ink);
@@ -330,7 +363,11 @@ kbd {
 .refresh:hover:not(:disabled) { background: var(--ink-deep); }
 .refresh:active { transform: translateY(1px); }
 .refresh:disabled { opacity: 0.55; cursor: not-allowed; }
+/* `is-loading` is the current modifier; `loading` is kept so a browser still
+   running a pre-fix app.js keeps its spinner (and stays on the baseline). */
+.refresh.is-loading,
 .refresh.loading { cursor: progress; }
+.refresh.is-loading svg,
 .refresh.loading svg { animation: spin 0.9s linear infinite; }
 .refresh.quota-blocked {
   opacity: 1;
@@ -448,7 +485,7 @@ kbd {
   display: inline-flex;
   gap: 8px;
   align-items: center;
-  padding: 0 11px;
+  padding: 0 9px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   background: var(--paper-strong);
@@ -869,7 +906,7 @@ button.metric.active .metric-dot {
   align-items: center;
   gap: 7px;
   min-height: 32px;
-  padding: 0 11px;
+  padding: 0 9px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   background: var(--paper-strong);
@@ -890,10 +927,10 @@ button.metric.active .metric-dot {
 
 .appearance-picker {
   display: inline-flex;
-  gap: 7px;
+  gap: 6px;
   align-items: center;
   min-height: 32px;
-  padding: 0 7px 0 11px;
+  padding: 0 6px 0 9px;
   border: 1px solid var(--line-strong);
   border-radius: var(--radius);
   background: var(--paper-strong);
@@ -980,7 +1017,10 @@ button.metric.active .metric-dot {
 }
 
 /* —————————————————————— LOADING + ERROR —————————————————————— */
-.loading, .error-panel {
+/* The scan panel is the only element that may take these styles, so it is
+   keyed by id. A bare `.loading` selector would also catch the refresh
+   button's in-flight `loading` class and lift it off the toolbar baseline. */
+#loading, .error-panel {
   display: flex;
   gap: 10px;
   align-items: center;
@@ -2402,6 +2442,22 @@ button.metric.active .metric-dot {
   .trace-card-head > .trace-head-actions { grid-column: 1 / -1; }
 }
 
+/* Keep the toolbar to a single line. On narrower desktops the wordmark yields
+   to the controls instead of pushing them to a second row; below that the rail
+   scrolls horizontally rather than folding into an orphan line. */
+@media (max-width: 1499px) and (min-width: 721px) {
+  .brand-name { display: none; }
+}
+
+@media (max-width: 1339px) and (min-width: 721px) {
+  .controls {
+    justify-content: flex-start;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .controls::-webkit-scrollbar { display: none; }
+}
+
 @media (max-width: 1180px) {
   /* Below the one-row width, let clusters wrap — each takes a full row. */
   .scoreboard { flex-wrap: wrap; }
@@ -2430,8 +2486,33 @@ button.metric.active .metric-dot {
   .filter-notice { flex-wrap: wrap; }
   .filter-notice-text { flex-basis: calc(100% - 26px); }
   .filter-notice-clear { margin-left: 26px; }
-  .topbar { position: static; grid-template-columns: 1fr; gap: 10px; }
-  .controls { justify-content: flex-start; }
+  .topbar {
+    position: static;
+    grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .controls { flex-wrap: wrap; justify-content: flex-start; }
+  .toggle-group {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    height: auto;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    gap: 5px;
+  }
+  .toggle-group .switch {
+    height: auto;
+    min-height: 32px;
+    padding: 0 9px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius);
+    background: var(--paper-strong);
+  }
+  .toggle-group .switch:has(input:checked),
+  .toggle-group .switch:hover { background: var(--paper-strong); }
+  .toggle-group .switch:not(:has(input:checked)) { color: var(--ink); }
   .refresh-pause-notice {
     grid-column: 1;
     grid-template-columns: auto minmax(0, 1fr);
@@ -2638,7 +2719,7 @@ button.metric.active .metric-dot {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
+  width: 32px;
   min-height: 32px;
   padding: 0;
   border: 1px solid var(--line-strong);
