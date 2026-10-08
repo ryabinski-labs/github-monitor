@@ -132,6 +132,19 @@ function cdRun(repo, runNumber) {
   };
 }
 
+function runningCdRun(repo, runNumber) {
+  return {
+    repo,
+    workflow: "Deploy",
+    runNumber,
+    title: `Deploy ${runNumber} on ${repo}`,
+    branch: "main",
+    status: "queued",
+    createdAt: "2026-06-04T11:00:00Z",
+    url: `https://github.com/${repo}/actions/runs/${runNumber}`
+  };
+}
+
 function failingPr(repo, number, author = "dependabot[bot]") {
   return {
     repo,
@@ -145,7 +158,7 @@ function failingPr(repo, number, author = "dependabot[bot]") {
   };
 }
 
-async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedPrs = [], failedCdRuns = [], runningRuns = [], runningPrs = [] } = {}) {
+async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedPrs = [], failedCdRuns = [], runningCdRuns = [], runningRuns = [], runningPrs = [] } = {}) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
 
@@ -164,6 +177,7 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedP
       ...statusFixture.summary,
       ...(totalFailing ? { failingPrs: totalFailing } : {}),
       ...(failedCdRuns.length ? { failedCd: failedCdRuns.length } : {}),
+      ...(runningCdRuns.length ? { runningCd: runningCdRuns.length } : {}),
       ...(totalRunning ? { runningPrs: totalRunning } : {})
     },
     pullRequests: {
@@ -178,7 +192,8 @@ async function openDashboard({ view = "pipelineTraces", failedRuns = [], failedP
     },
     cd: {
       ...statusFixture.cd,
-      ...(failedCdRuns.length ? { failed: failedCdRuns } : {})
+      ...(failedCdRuns.length ? { failed: failedCdRuns } : {}),
+      ...(runningCdRuns.length ? { running: runningCdRuns } : {})
     }
   };
 
@@ -318,6 +333,36 @@ test("Dismissing a single Failed CD run hides it and updates the nav count", { s
     await page.locator("[data-dismiss-key]").first().click();
     await page.waitForFunction(() => document.querySelectorAll("[data-dismiss-key]").length === 0);
     assert.equal(await page.locator("#navFailedCd").innerText(), "0", "nav count drops to 0 after both dismissed");
+  } finally {
+    await browser.close();
+  }
+});
+
+test("Dismissing a stuck running CD run hides it and drops the running CD count", { skip }, async () => {
+  // A queued CD run GitHub will not cancel (stale/held concurrency group) would
+  // otherwise pin "Deploy and release workflows in progress" and its tile
+  // forever. Dismiss is the only escape, so prove it works on that lane.
+  const { browser, page } = await openDashboard({
+    view: "runningCd",
+    runningCdRuns: [runningCdRun("acme/alpha", "#1"), runningCdRun("acme/bravo", "#2")]
+  });
+  try {
+    await page.waitForSelector("[data-dismiss-key]");
+    assert.equal(await page.locator("[data-dismiss-key]").count(), 2, "both running CD runs show a per-row Dismiss");
+    assert.equal(await page.locator("#navRunningCd").innerText(), "2", "nav count starts at 2");
+
+    await page.locator("[data-dismiss-key]").first().click();
+    await page.waitForFunction(() => document.querySelectorAll("#content .row").length === 1);
+    assert.equal(await page.locator("#navRunningCd").innerText(), "1", "nav count drops after a single dismiss");
+
+    await page.locator("[data-dismiss-key]").first().click();
+    await page.waitForFunction(() => document.querySelectorAll("#content .row").length === 0);
+    assert.equal(await page.locator("#navRunningCd").innerText(), "0", "nav count drops to 0 after both are dismissed");
+
+    await page.click("[data-restore-all]");
+    await page.waitForSelector("[data-dismiss-key]");
+    assert.equal(await page.locator("#content .row").count(), 2, "both running CD runs restored");
+    assert.equal(await page.locator("#navRunningCd").innerText(), "2", "nav count restored");
   } finally {
     await browser.close();
   }
