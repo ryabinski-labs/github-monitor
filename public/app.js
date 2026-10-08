@@ -1694,7 +1694,7 @@ function updateRefreshButtonState() {
   const quotaBlock = quotaRefreshBlock();
   const disabled = Boolean(state.loading || quotaBlock);
   els.refresh.disabled = disabled;
-  els.refresh.classList.toggle("loading", Boolean(state.loading));
+  els.refresh.classList.toggle("is-loading", Boolean(state.loading));
   els.refresh.classList.toggle("quota-blocked", Boolean(quotaBlock && !state.loading));
   els.refresh.setAttribute(
     "aria-label",
