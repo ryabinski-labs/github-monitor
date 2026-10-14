@@ -46,6 +46,6 @@
   "devDependencies": {
     "axe-core": "^4.13.0",
     "fast-check": "^4.10.2",
-    "playwright": "^1.62.1"
+    "playwright": "^1.64.0"
   }
 }
