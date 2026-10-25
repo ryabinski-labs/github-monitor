@@ -316,6 +316,27 @@ const DEPLOYMENT_TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
 const PRODUCTION_TARGET_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const MERGED_PR_CACHE_TTL_MS = 10 * 60 * 1000;
 const RECENT_COMMIT_CACHE_TTL_MS = 5 * 60 * 1000;
+// Dependabot alerts are advisory data, not a live feed. Six hours is enough to
+// answer "which project has an open critical/high alert" and keeps a ~200-repo
+// account to about 33 requests an hour. A failed read is retried after five
+// minutes so a newly granted App permission (or a repo that just enabled
+// Dependabot) recovers without waiting out the full day.
+const DEPENDABOT_ALERTS_CACHE_TTL_MS = Math.max(
+  0,
+  Number(process.env.DEPENDABOT_ALERTS_CACHE_TTL_SECONDS || 6 * 60 * 60)
+) * 1000;
+const DEPENDABOT_ALERTS_ERROR_TTL_MS = Math.max(
+  0,
+  Number(process.env.DEPENDABOT_ALERTS_ERROR_TTL_SECONDS || 5 * 60)
+) * 1000;
+// The alert pass fans out over every accessible repo, not just the active scan
+// set, so it runs on its own smaller lane and with its own budget. The dashboard
+// itself must not wait on a cold 200-repo security pass.
+const DEPENDABOT_ALERTS_JOBS = Math.max(1, Number(process.env.DEPENDABOT_ALERTS_JOBS || 2));
+const DEPENDABOT_ALERTS_DEADLINE_MS = Math.max(
+  0,
+  Number(process.env.DEPENDABOT_ALERTS_DEADLINE_MS || 30000)
+);
 const RUNNING_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const recentRerunRequests = new Map();
 const recentApproveRequests = new Map();
@@ -538,6 +559,7 @@ async function saveAutoRerunStateToDisk(path = AUTO_RERUN_STATE_PATH) {
 }
 
 const githubValueCache = new Map();
+const dependabotAlertsCache = new Map();
 
 // The last CD-run state each repo's actions feed showed, keyed repo -> fingerprint
 // (see cdFeedFingerprint). A change here means a CD run started, changed state, or
@@ -967,7 +989,7 @@ function etagCacheKey(installationKey, url) {
   return `${installationKey} ${url}`;
 }
 
-async function githubRequest(path, { method = "GET", query = {}, body, ownerHint } = {}) {
+async function githubRequest(path, { method = "GET", query = {}, body, ownerHint, etag = true, returnHeaders = false } = {}) {
   const effectiveOwnerHint = ownerHint || extractOwnerFromPath(path);
   const { token, installationKey } = await getGitHubToken({ ownerHint: effectiveOwnerHint });
   const url = githubUrl(path, query);
@@ -979,7 +1001,8 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
     "user-agent": "github-monitor-local",
     "x-github-api-version": "2022-11-28"
   };
-  const headers = isEtagCacheEnabled()
+  const useEtag = etag && isEtagCacheEnabled();
+  const headers = useEtag
     ? applyConditionalHeaders(baseHeaders, etagCache, cacheKey, method)
     : baseHeaders;
   const send = (requestHeaders) => fetchWithCause(url, {
@@ -992,10 +1015,12 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
 
   recordRateLimit(response, { conditional: response.status === 304, installationKey });
 
-  if (isEtagCacheEnabled() && response.status === 304) {
+  if (useEtag && response.status === 304) {
     const sentEtag = headers["if-none-match"];
     const cachedBody = takeCachedConditionalResponse(etagCache, cacheKey, method, response.status, sentEtag);
-    if (cachedBody !== null) return cachedBody;
+    if (cachedBody !== null) {
+      return returnHeaders ? { json: cachedBody, headers: null } : cachedBody;
+    }
     // The entry changed while this request was in flight, so the body GitHub
     // confirmed is gone. Ask once more without a condition for the current one.
     response = await send(baseHeaders);
@@ -1008,10 +1033,10 @@ async function githubRequest(path, { method = "GET", query = {}, body, ownerHint
     const message = json?.message || text || `GitHub API returned ${response.status}`;
     throw new HttpError(response.status, message);
   }
-  if (isEtagCacheEnabled()) {
+  if (useEtag) {
     storeConditionalResponse(etagCache, cacheKey, method, response, json);
   }
-  return json;
+  return returnHeaders ? { json, headers: response.headers } : json;
 }
 
 function createScanMetrics() {
@@ -1121,6 +1146,7 @@ function snapshotRateLimit(metrics) {
 function resetGithubValueCache() {
   githubValueCache.clear();
   cdFeedFingerprints.clear();
+  dependabotAlertsCache.clear();
 }
 
 async function cachedGithubValue(key, ttlMs, loader) {
@@ -1321,6 +1347,45 @@ async function githubRestAll(path, pickItems, perPage = 100, query = {}, ownerHi
     if (!items.length) break;
     results.push(...items);
     if (items.length < perPage) break;
+  }
+  return results;
+}
+
+// Dependabot alerts reject `page` and use the cursor in the Link header
+// instead ("Pagination using the `page` parameter is not supported"). This
+// follows rel="next" until the cursor runs out. ETags are deliberately off for
+// this reader: a 304 has no Link header, so it cannot tell us where page two is.
+function nextLinkCursor(linkHeader) {
+  for (const part of String(linkHeader || "").split(",")) {
+    if (!/;\s*rel="next"/.test(part)) continue;
+    const target = part.match(/<([^>]+)>/)?.[1];
+    if (!target) return "";
+    try {
+      return new URL(target).searchParams.get("after") || "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+async function githubRestAllByLink(path, pickItems, perPage = 100, query = {}, ownerHint) {
+  const results = [];
+  let after = "";
+  for (let page = 1; page <= 50; page += 1) {
+    const params = { ...query, per_page: perPage };
+    if (after) params.after = after;
+    const { json, headers } = await githubRequest(path, {
+      query: params,
+      ownerHint,
+      etag: false,
+      returnHeaders: true
+    });
+    const items = pickItems(json);
+    results.push(...items);
+    const next = nextLinkCursor(headers?.get("link") || "");
+    if (!next || items.length < perPage) break;
+    after = next;
   }
   return results;
 }
@@ -2639,6 +2704,226 @@ async function listRepos({ mode, me, pullRequests, jobs, owners: ownerFilter }) 
     metrics.reposScanned = selected.length;
   }
   return selected;
+}
+
+// The vulnerability view is deliberately broader than the active scan set: an
+// open critical alert is not less real because nobody pushed to the repo in the
+// last week. Reuse the cached owner listing (archived repos are already filtered
+// out by loadOwnerRepos), and ignore the All/Owned/Mine PR author filter -- that
+// filter narrows pull requests, not projects.
+async function listDependabotRepos({ me, owners: ownerFilter, jobs = DEFAULT_SCAN_JOBS } = {}) {
+  const owners = await selectedOwners(me, ownerFilter);
+  const listingErrors = [];
+  const groups = await mapLimit(owners, jobs, async (owner) => {
+    try {
+      return await fetchOwnerRepos(owner, me);
+    } catch (error) {
+      listingErrors.push(`${owner}: ${describeRequestError(error)}`);
+      return [];
+    }
+  });
+  const repos = [...new Set(groups.flat().map((entry) => entry?.fullName).filter(Boolean))].sort();
+  return {
+    repos,
+    error: listingErrors.length
+      ? `Some account repository lists could not be read (${listingErrors.join("; ")}).`
+      : ""
+  };
+}
+
+function dependabotRepoUrl(repo) {
+  return `https://github.com/${repo}/security/dependabot`;
+}
+
+function dependabotAlertSeverity(alert) {
+  return alert?.security_vulnerability?.severity || alert?.security_advisory?.severity || "";
+}
+
+// Counts the two severities the view is responsible for. The query already asks
+// GitHub for state=open and severity=critical,high; filtering again here keeps a
+// stubbed or future response from inflating a project's count with medium/low or
+// dismissed alerts.
+function summarizeDependabotAlerts(alerts) {
+  let critical = 0;
+  let high = 0;
+  let oldestAt = "";
+  for (const alert of Array.isArray(alerts) ? alerts : []) {
+    if (alert?.state && alert.state !== "open") continue;
+    const severity = dependabotAlertSeverity(alert);
+    if (severity !== "critical" && severity !== "high") continue;
+    if (severity === "critical") critical += 1;
+    else high += 1;
+    const createdAt = alert?.created_at || "";
+    if (createdAt && (!oldestAt || createdAt < oldestAt)) oldestAt = createdAt;
+  }
+  return { critical, high, oldestAt };
+}
+
+function dependabotUncheckedReason(error) {
+  const status = Number(error?.status || 0);
+  const detail = describeRequestError(error);
+  if (status === 403 && /dependabot alerts are disabled/i.test(detail)) {
+    return "Dependabot alerts are disabled for this repository.";
+  }
+  if (status === 403) {
+    return `Permission to read Dependabot alerts was denied (${detail}). Grant the GitHub App "Dependabot alerts: Read", or use a PAT with Dependabot alerts access (classic: security_events).`;
+  }
+  if (status === 404) return "Dependabot alerts are not available for this repository.";
+  if (status === 429) return "GitHub API quota is too low for Dependabot alerts.";
+  return detail;
+}
+
+// The generic cachedGithubValue gives one TTL for every outcome. A missing App
+// permission is a negative result that must not be retried on every 45-second
+// refresh, but it also must recover quickly once the permission is granted, so
+// this cache picks the TTL after the outcome is known.
+async function cachedDependabotAlerts(repo, loader) {
+  const now = Date.now();
+  const cached = dependabotAlertsCache.get(repo);
+  if (cached?.value !== undefined && cached.expiresAt > now) return cached.value;
+  if (cached?.promise) return cached.promise;
+
+  const promise = Promise.resolve()
+    .then(loader)
+    .then((value) => {
+      dependabotAlertsCache.set(repo, {
+        value,
+        expiresAt: Date.now() + (value?.ok ? DEPENDABOT_ALERTS_CACHE_TTL_MS : DEPENDABOT_ALERTS_ERROR_TTL_MS)
+      });
+      return value;
+    })
+    .catch((error) => {
+      dependabotAlertsCache.delete(repo);
+      throw error;
+    });
+  dependabotAlertsCache.set(repo, { promise, expiresAt: now + 30 * 1000 });
+  return promise;
+}
+
+async function fetchDependabotAlertsForRepo(repo) {
+  return cachedDependabotAlerts(repo, async () => {
+    try {
+      if (currentQuotaIsBlocked()) {
+        throw new HttpError(429, "GitHub API quota is too low for Dependabot alerts.");
+      }
+      const owner = String(repo).split("/")[0];
+      const alerts = await githubRestAllByLink(
+        `/repos/${repo}/dependabot/alerts`,
+        (json) => {
+          // A 200 with anything other than an array is a shape we do not
+          // understand. Treat it as an unchecked repo, not as a clean one.
+          if (!Array.isArray(json)) throw new Error("Unexpected Dependabot alerts response shape.");
+          return json;
+        },
+        100,
+        { state: "open", severity: "critical,high" },
+        owner
+      );
+      return {
+        ok: true,
+        ...summarizeDependabotAlerts(alerts),
+        url: dependabotRepoUrl(repo),
+        checkedAt: new Date().toISOString()
+      };
+    } catch (error) {
+      // A denied or disabled repository is a result the view must report, not
+      // an exception that marks the whole pass degraded. The negative result
+      // is cached for the shorter TTL by cachedDependabotAlerts.
+      return {
+        ok: false,
+        reason: dependabotUncheckedReason(error),
+        url: dependabotRepoUrl(repo),
+        checkedAt: new Date().toISOString()
+      };
+    }
+  });
+}
+
+function compareDependabotRows(a, b) {
+  if (b.critical !== a.critical) return b.critical - a.critical;
+  if (b.high !== a.high) return b.high - a.high;
+  if (a.oldestAt !== b.oldestAt) return String(a.oldestAt || "").localeCompare(String(b.oldestAt || ""));
+  return String(a.repo || "").localeCompare(String(b.repo || ""));
+}
+
+function emptyDependabotSnapshot({ error = "", checking = false } = {}) {
+  return {
+    repos: [],
+    unchecked: [],
+    checkedAt: "",
+    checking,
+    error,
+    counts: {
+      vulnerableRepos: 0,
+      criticalAlerts: 0,
+      highAlerts: 0,
+      reposChecked: 0,
+      reposTotal: 0,
+      uncheckedRepos: 0
+    }
+  };
+}
+
+async function scanDependabotAlerts({ me, owners: ownerFilter, jobs = DEFAULT_SCAN_JOBS } = {}) {
+  const listing = await listDependabotRepos({ me, owners: ownerFilter, jobs });
+  const repos = listing.repos;
+  const pass = await settledScanPass(
+    repos,
+    DEPENDABOT_ALERTS_JOBS,
+    (repo) => fetchDependabotAlertsForRepo(repo),
+    () => null,
+    DEPENDABOT_ALERTS_DEADLINE_MS
+  );
+
+  const rows = [];
+  const unchecked = [];
+  let criticalAlerts = 0;
+  let highAlerts = 0;
+  let reposChecked = 0;
+  let oldestCheckedAt = "";
+
+  for (let index = 0; index < repos.length; index += 1) {
+    const repo = repos[index];
+    const result = pass.results[index];
+    if (!result) {
+      unchecked.push({ repo, reason: "Not checked yet — the scan budget ran out." });
+      continue;
+    }
+    if (!result.ok) {
+      unchecked.push({ repo, reason: result.reason || "Dependabot alerts could not be read." });
+      continue;
+    }
+    reposChecked += 1;
+    if (!oldestCheckedAt || result.checkedAt < oldestCheckedAt) oldestCheckedAt = result.checkedAt;
+    if (!result.critical && !result.high) continue;
+    rows.push({
+      repo,
+      critical: result.critical,
+      high: result.high,
+      oldestAt: result.oldestAt,
+      url: result.url || dependabotRepoUrl(repo),
+      checkedAt: result.checkedAt
+    });
+    criticalAlerts += result.critical;
+    highAlerts += result.high;
+  }
+
+  rows.sort(compareDependabotRows);
+  return {
+    repos: rows,
+    unchecked,
+    checkedAt: oldestCheckedAt,
+    checking: pass.failed,
+    error: listing.error,
+    counts: {
+      vulnerableRepos: rows.length,
+      criticalAlerts,
+      highAlerts,
+      reposChecked,
+      reposTotal: repos.length,
+      uncheckedRepos: unchecked.length
+    }
+  };
 }
 
 function isCdWorkflow(workflow) {
@@ -4487,6 +4772,11 @@ async function buildDashboardData(requestUrl) {
   const includeRepoRunners = parseBool(params.get("includeRepoRunners"), false);
   const owners = parseOwners(params.get("owners"));
   const me = await getAccount();
+  // Start the security pass before the PR search so its fan-out overlaps the
+  // rest of the scan. It has its own cache and deadline; a cold or denied pass
+  // can only make the view partial, never fail the dashboard.
+  const dependabotPromise = scanDependabotAlerts({ me, owners, jobs })
+    .catch((error) => emptyDependabotSnapshot({ error: dependabotUncheckedReason(error) }));
   let pullRequests = await fetchPullRequests({ mode, me, jobs, owners });
   let repos = [];
   let failedCd = [];
@@ -4585,6 +4875,8 @@ async function buildDashboardData(requestUrl) {
   const prGroups = groupPullRequests(pullRequests);
   syncAutoMergeFromStatus(pullRequests, { mode, jobs, owners });
   const accounts = await allOwners(me);
+  const dependabot = await dependabotPromise;
+  if (dependabot.error || dependabot.checking) degraded.add("dependabot");
   const summary = {
     repos: repos.length || new Set(pullRequests.map((pr) => pr.repo)).size,
     passingPrs: prGroups.pass.length,
@@ -4602,7 +4894,11 @@ async function buildDashboardData(requestUrl) {
     flaggedJourneys: traces.flagged.length,
     activeJourneys: traces.active.length,
     shippedJourneys: traces.completed.length,
-    tracingUnknown: traces.unknown.length
+    tracingUnknown: traces.unknown.length,
+    vulnerableRepos: dependabot.counts.vulnerableRepos,
+    criticalAlerts: dependabot.counts.criticalAlerts,
+    highAlerts: dependabot.counts.highAlerts,
+    uncheckedVulnerableRepos: dependabot.counts.uncheckedRepos
   };
   const rateLimit = snapshotRateLimit(scanMetrics.getStore() || createScanMetrics());
   const warnings = buildDashboardWarnings(rateLimit, summary, { mode, jobs, includeCd, includeRunners, includeRepoRunners });
@@ -4652,6 +4948,7 @@ async function buildDashboardData(requestUrl) {
     runners: {
       busy: busyRunners.sort((a, b) => `${a.scope}/${a.name}`.localeCompare(`${b.scope}/${b.name}`))
     },
+    dependabot,
     autoMerge: autoMergeSnapshot(),
     autoRerun: autoRerunSnapshot(),
     dependabotCleanup: cleanupSnapshot
@@ -5531,6 +5828,20 @@ export {
   signAppJwt,
   installationTokenIsValid,
   parseOwners,
+  DEPENDABOT_ALERTS_CACHE_TTL_MS,
+  DEPENDABOT_ALERTS_ERROR_TTL_MS,
+  DEPENDABOT_ALERTS_JOBS,
+  DEPENDABOT_ALERTS_DEADLINE_MS,
+  nextLinkCursor,
+  githubRestAllByLink,
+  dependabotRepoUrl,
+  dependabotAlertSeverity,
+  summarizeDependabotAlerts,
+  dependabotUncheckedReason,
+  compareDependabotRows,
+  fetchDependabotAlertsForRepo,
+  scanDependabotAlerts,
+  listDependabotRepos,
   parseDependabotQueueThreshold,
   isDependabotLogin,
   isDependabotWorkflowRun,

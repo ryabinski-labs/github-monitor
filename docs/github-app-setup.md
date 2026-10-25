@@ -43,9 +43,12 @@ The App is yours: each operator stands up their own. The project does not run a 
    | Checks | Read-only | CheckRun data in the PR `statusCheckRollup` GraphQL field |
    | Commit statuses | Read-only | Legacy StatusContext data in the PR `statusCheckRollup` GraphQL field |
    | Contents | Read & write | Read commits, trees, file content; delete merged PR head branches |
+   | Dependabot alerts | Read-only | Open critical/high alerts for the Vulnerabilities view |
    | Deployments | Read-only | Running deployments view |
    | Metadata | Read-only | Mandatory; repository discovery |
    | Pull requests | Read-only, or Read & write | List PRs; write is required for merge/close actions and deep-queue cleanup |
+
+   Adding Dependabot alerts to an existing App makes GitHub ask each installation to approve the update. Until it is approved, the **Vulnerabilities** view names those repositories as not checked rather than showing a clean zero.
 
 6. **Organization permissions**:
 

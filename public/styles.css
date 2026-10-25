@@ -1541,6 +1541,80 @@ button.metric.active .metric-dot {
   justify-self: end;
 }
 
+/* Dependabot vulnerability rows answer four questions in the same card the rest
+   of the deck uses: which project, how bad, how old, and where to fix it. The
+   accent bar is red when the project has a critical alert and amber when only
+   high alerts remain, so severity is never carried by the badges alone. */
+.row-vulnerability {
+  grid-template-columns: minmax(180px, 1.2fr) minmax(150px, auto) minmax(110px, 0.5fr) auto;
+}
+
+.vuln-counts {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  justify-self: start;
+}
+
+.vuln-counts .tag { justify-self: auto; }
+
+.vuln-status {
+  padding: 0 4px 10px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--muted-strong);
+  overflow-wrap: anywhere;
+}
+
+.vuln-notice {
+  margin: 0 4px 12px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--amber) 32%, transparent);
+  border-radius: var(--radius);
+  background: var(--amber-soft);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.vuln-notice summary {
+  cursor: pointer;
+  color: color-mix(in srgb, var(--amber) 70%, var(--ink));
+}
+
+.vuln-notice summary:focus-visible {
+  outline: 2px solid var(--amber);
+  outline-offset: 2px;
+}
+
+.vuln-unchecked-list {
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.vuln-unchecked-item {
+  display: grid;
+  gap: 2px;
+  padding: 7px 0;
+  border-top: 1px solid color-mix(in srgb, var(--amber) 22%, transparent);
+  overflow-wrap: anywhere;
+}
+
+.vuln-reason { font-weight: 600; }
+
+.vuln-repos {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--muted-strong);
+}
+
 .open-link, .merge-button, .close-button, .rerun-button, .update-button, .approve-button {
   display: inline-flex;
   gap: 4px;
@@ -2963,4 +3037,22 @@ button.metric.active .metric-dot {
 .inbox-toggle.has-unread svg {
   animation: inbox-bell-shake 0.9s ease;
   transform-origin: 50% 20%;
+}
+
+/* Between desktop and the single-column row layout, the vulnerability card
+   keeps the age in the upper-right corner and lets the severity badges and the
+   GitHub link use the full width. The selectors outrank the generic
+   .row > :nth-child rules in the 1300px breakpoint above. */
+@media (max-width: 1300px) and (min-width: 1001px) {
+  .row.row-vulnerability { grid-template-columns: minmax(0, 1fr) auto; }
+  .row.row-vulnerability > .vuln-counts { grid-column: 1; grid-row: 2; }
+  .row.row-vulnerability > .meta {
+    grid-column: 2;
+    grid-row: 1;
+    text-align: right;
+  }
+  .row.row-vulnerability > .row-actions {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
 }

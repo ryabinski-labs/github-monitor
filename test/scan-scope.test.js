@@ -97,7 +97,7 @@ test("scanScopeSnapshot never reports a negative skip count", () => {
   assert.equal(scanScopeSnapshot({ reposConsidered: 2, reposScanned: 5 }).reposSkipped, 0);
 });
 
-test("a dormant repo costs the scan no requests end to end", async () => {
+test("a dormant repo costs the PR/CD scan no requests, but the security pass still checks it", async () => {
   const previousFetch = globalThis.fetch;
   const previousToken = process.env.GITHUB_TOKEN;
   process.env.GITHUB_TOKEN = "test-token";
@@ -153,7 +153,15 @@ test("a dormant repo costs the scan no requests end to end", async () => {
     assert.equal(data.summary.repos, 1);
 
     const dormantRequests = requested.filter((path) => path.includes("/dormant") || path.includes("/abandoned"));
-    assert.deepEqual(dormantRequests, [], `dormant repos were still fetched: ${dormantRequests.join(", ")}`);
+    // The vulnerability view is intentionally broader than the active scan set:
+    // a quiet repo can still carry an open critical alert (DL-002). The PR/CD
+    // fan-out must stay exactly as narrow as before.
+    const dormantWorkRequests = dormantRequests.filter((path) => !path.endsWith("/dependabot/alerts"));
+    assert.deepEqual(dormantWorkRequests, [], `dormant repos were still fetched: ${dormantWorkRequests.join(", ")}`);
+    assert.ok(
+      dormantRequests.includes("/repos/acme/dormant/dependabot/alerts"),
+      "the security pass still checks a dormant repo"
+    );
     assert.ok(requested.includes("/repos/acme/live/actions/runs"), "the live repo is still scanned");
   } finally {
     await new Promise((resolve, reject) => testServer.close((error) => (error ? reject(error) : resolve())));
