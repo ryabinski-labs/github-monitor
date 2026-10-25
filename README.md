@@ -116,6 +116,7 @@ Token scopes you need depend on what you want to see:
 | Self-hosted runner visibility | Actions runner access (owner or repo) |
 | Rerunning failed CI/CD jobs and approving held fork workflows | Actions write |
 | Merging PRs from the dashboard | Write to the target repository |
+| The Vulnerabilities view | Dependabot alerts read (fine-grained PAT) or `security_events` (classic PAT); `public_repo` covers public repos only |
 | Optional deep-queue Dependabot cleanup | Actions and pull requests write |
 
 > GitHub App permissions for the equivalent capabilities are documented in [docs/github-app-setup.md](docs/github-app-setup.md).
@@ -126,6 +127,7 @@ Token scopes you need depend on what you want to see:
 - Running non-CD GitHub Actions workflow runs, including jobs not represented by an open-PR status rollup
 - Optional **CD/deploy/release/publish** workflow audit, plus CD runs finished in the last 24h and the latest failed CD runs from the last 3 days
 - **Pipeline Traces** for PR journeys that have not completed from CI/merge through successful production CD
+- **Vulnerabilities**: every accessible project with an open critical or high Dependabot alert, with the two severity counts, the oldest alert's age, and a link to GitHub's alert page; projects that could not be read are named instead of looking clean
 - Running GitHub deployments
 - Busy org and (optional) repository-level self-hosted runners
 - GitHub API request count, remaining quota, and reset time, with **adaptive next-refresh timing**
@@ -194,6 +196,10 @@ All optional except your chosen auth path. Set via environment or `.env`.
 | `SCAN_REPO_FLOOR` | Always scan this many most-recently-pushed repos, whatever the window says (default `10`) |
 | `DEPENDABOT_QUEUE_THRESHOLD` | Enables Dependabot cleanup (disabled by default); its value (`1`–`5000`) is the queued workflow-run depth that additionally triggers run cancellation |
 | `DEPENDABOT_QUEUE_OWNERS` | Optional comma-separated owner allowlist for automatic cleanup |
+| `DEPENDABOT_ALERTS_CACHE_TTL_SECONDS` | How long one repo's open critical/high alert result is reused (default `21600`, six hours) |
+| `DEPENDABOT_ALERTS_ERROR_TTL_SECONDS` | How long a denied or disabled repo is remembered before retrying (default `300`, five minutes) |
+| `DEPENDABOT_ALERTS_JOBS` | Parallelism for the vulnerability pass (default `2`; deliberately lower than the PR scan) |
+| `DEPENDABOT_ALERTS_DEADLINE_MS` | Ceiling for a cold vulnerability pass (default `30000`); past it the view marks the rest as not checked |
 | `AUTO_DISMISS_CANCELLED_RUNS` | Set to `0` to keep cancelled workflow runs in the actionable Failing CI and Failed CD lists (auto-dismissed by default) |
 | `ETAG_CACHE_DISABLED` | Set to `1` to disable conditional-request caching (debugging) |
 

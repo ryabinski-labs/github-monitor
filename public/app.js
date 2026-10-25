@@ -111,6 +111,20 @@ const state = {
   autoMergeFollowUpTimer: null
 };
 
+// Adds the words the operator is likely to type -- "critical", "high" -- to the
+// text the shared filter reads. Only severities actually present on the row are
+// added, so filtering "critical" never returns a project that has only highs.
+function vulnerabilityLaneRows(data) {
+  const rows = data?.dependabot?.repos;
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => ({
+    ...row,
+    search: [row.repo, row.critical ? "critical" : "", row.high ? "high" : "", "dependabot"]
+      .filter(Boolean)
+      .join(" ")
+  }));
+}
+
 const views = {
   fail: {
     kicker: "Failing CI",
@@ -195,10 +209,17 @@ const views = {
     empty: "No PR journeys in this trace filter.",
     color: "red",
     rows: (data) => traceRows(data)
+  },
+  vulnerabilities: {
+    kicker: "Dependabot alerts",
+    title: "Projects with open critical and high vulnerabilities",
+    empty: "No open critical or high Dependabot alerts.",
+    color: "red",
+    rows: (data) => vulnerabilityLaneRows(data)
   }
 };
 
-const viewOrder = ["fail", "conflicts", "behind", "running", "pass", "noCi", "pipelineTraces", "runningCd", "finishedCd", "deployments", "runners", "failedCd"];
+const viewOrder = ["fail", "conflicts", "behind", "running", "pass", "noCi", "pipelineTraces", "runningCd", "finishedCd", "deployments", "runners", "failedCd", "vulnerabilities"];
 
 const els = {
   account: document.querySelector("#account"),
@@ -276,7 +297,8 @@ const navIds = {
   deployments: "navDeployments",
   runners: "navRunners",
   failedCd: "navFailedCd",
-  pipelineTraces: "navPipelineTraces"
+  pipelineTraces: "navPipelineTraces",
+  vulnerabilities: "navVulnerabilities"
 };
 
 let lastGeneratedAt = null;
@@ -2033,6 +2055,7 @@ function displayCounts(data) {
   const traceActive = filteredVisibleRows(data?.traces?.active).length;
   const traceCompleted = filteredVisibleRows(data?.traces?.completed).length;
   const traceUnknown = filteredVisibleRows(data?.traces?.unknown, traceDismissKeys).length;
+  const vulnerabilityMatches = filteredVisibleRows(vulnerabilityLaneRows(data));
   return {
     ...counts,
     passingPrs: filteredVisibleRows(data?.pullRequests?.pass).length,
@@ -2055,7 +2078,8 @@ function displayCounts(data) {
     flaggedJourneys: traceFlagged,
     activeJourneys: traceActive,
     shippedJourneys: traceCompleted,
-    tracingUnknown: traceUnknown
+    tracingUnknown: traceUnknown,
+    vulnerableRepos: vulnerabilityMatches.length
   };
 }
 
@@ -2168,7 +2192,8 @@ function renderMetrics(data) {
     deployments: counts.runningDeployments,
     runners: counts.busyRunners,
     failedCd: counts.failedCd,
-    pipelineTraces: currentTraceCount(counts)
+    pipelineTraces: currentTraceCount(counts),
+    vulnerabilities: counts.vulnerableRepos
   };
   const navTotals = {
     pass: totals.passingPrs,
@@ -2182,7 +2207,8 @@ function renderMetrics(data) {
     deployments: totals.runningDeployments,
     runners: totals.busyRunners,
     failedCd: totals.failedCd,
-    pipelineTraces: currentTraceCount(totals)
+    pipelineTraces: currentTraceCount(totals),
+    vulnerabilities: totals.vulnerableRepos
   };
   // Each rail item is its own grid, so a wide "of 1420" would push its count
   // left while a narrow "of 4" would not, leaving the column of numbers ragged.
@@ -2266,11 +2292,31 @@ function clearFilter({ focus = false, blur = false } = {}) {
   if (blur) els.filter.blur();
 }
 
-function renderEmptyState(view, allCount) {
+function renderEmptyState(view, allCount, data = null) {
   const raw = state.filter.trim();
   const query = raw.length > 72 ? `${raw.slice(0, 72)}\u2026` : raw;
   if (query && allCount > 0) {
     return `<div class="empty">No rows match "${escapeHtml(query)}". Clear the filter to show ${escapeHtml(allCount)} ${allCount === 1 ? "item" : "items"}.</div>`;
+  }
+  if (state.view === "vulnerabilities") {
+    const section = data?.dependabot;
+    if (!section) {
+      return '<div class="empty">Dependabot alerts have not been checked yet. Refresh to scan.</div>';
+    }
+    if (section.error) {
+      return '<div class="empty">No projects could be listed. The account error is above.</div>';
+    }
+    const total = Number(section.counts?.reposTotal || 0);
+    if (total === 0 && !section.checking) {
+      return '<div class="empty">No projects are in scope for this account selection.</div>';
+    }
+    const unchecked = section?.unchecked?.length || 0;
+    if (section?.checking) {
+      return '<div class="empty">Checking projects for open critical and high Dependabot alerts&hellip;</div>';
+    }
+    if (unchecked > 0) {
+      return `<div class="empty">No readable project has an open critical or high alert. ${escapeHtml(unchecked)} ${unchecked === 1 ? "project" : "projects"} could not be checked &mdash; see the note above.</div>`;
+    }
   }
   return `<div class="empty">${escapeHtml(view.empty)}</div>`;
 }
@@ -2298,6 +2344,9 @@ function render() {
   const view = views[state.view];
   els.viewKicker.textContent = view.kicker;
   els.viewTitle.textContent = view.title;
+  els.filter.placeholder = state.view === "vulnerabilities"
+    ? "Filter repo, critical, high\u2026"
+    : "Filter repo, title, author, branch\u2026";
   syncAutoMerges(data);
 
   const query = state.filter.trim().toLowerCase();
@@ -2320,10 +2369,15 @@ function render() {
 
   const body = rows.length
     ? rows.map((row) => renderRow(row, state.view, view)).join("")
-    : renderEmptyState(view, all.length);
+    : renderEmptyState(view, all.length, data);
   const dismissBar = renderDismissBar(dismissedCount, activeDismissable);
+  const header = state.view === "vulnerabilities"
+    ? renderDependabotHeader(data)
+    : state.view === "pipelineTraces"
+    ? renderTraceFilterBar(data)
+    : "";
   els.content.dataset.view = state.view;
-  els.content.innerHTML = `${state.view === "pipelineTraces" ? renderTraceFilterBar(data) : ""}${dismissBar}${body}`;
+  els.content.innerHTML = `${header}${dismissBar}${body}`;
 }
 
 // Returns stable dismiss keys for a dismissable row, else an empty array.
@@ -2437,7 +2491,96 @@ function renderRow(row, viewKey, view) {
   if (viewKey === "finishedCd") return renderFinishedCdRow(row, view);
   if (["runningCd", "finishedCd", "failedCd"].includes(viewKey)) return renderCdRow(row, view, viewKey);
   if (viewKey === "deployments") return renderDeploymentRow(row, view);
+  if (viewKey === "vulnerabilities") return renderVulnerabilityRow(row);
   return renderRunnerRow(row, view);
+}
+
+function formatAlertAge(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const days = Math.floor(Math.max(0, Date.now() - date.getTime()) / 86400000);
+  if (days >= 1) return `${days}d`;
+  return formatRelative(value);
+}
+
+// The header carries the one number the rail badge cannot: how much of the
+// account was actually checked. It is deliberately a status line rather than a
+// silent zero, because a denied permission and a clean account look identical
+// in the row list.
+function renderDependabotHeader(data) {
+  const section = data?.dependabot;
+  if (!section) return "";
+  const counts = section.counts || {};
+  const checked = Number(counts.reposChecked || 0);
+  const total = Number(counts.reposTotal || 0);
+  const critical = Number(counts.criticalAlerts || 0);
+  const high = Number(counts.highAlerts || 0);
+  const unchecked = Array.isArray(section.unchecked) ? section.unchecked : [];
+  const severityTotals = checked > 0 ? ` \u00b7 ${critical} critical \u00b7 ${high} high` : "";
+  let status;
+  if (section.error) {
+    status = `Dependabot alerts could not be read: ${section.error}`;
+  } else if (section.checking) {
+    status = total
+      ? `Checking ${checked} of ${total} projects\u2026`
+      : "Checking projects for open critical and high alerts\u2026";
+  } else if (section.checkedAt) {
+    status = `Checked ${formatRelative(section.checkedAt)} \u00b7 ${checked} of ${total} ${total === 1 ? "project" : "projects"}${severityTotals}`;
+  } else if (unchecked.length) {
+    status = `No projects could be checked \u2014 the reasons are below.`;
+  } else {
+    status = "Projects have not been checked yet.";
+  }
+  const notice = unchecked.length
+    ? `<details class="vuln-notice">
+         <summary><strong>${escapeHtml(unchecked.length)} ${unchecked.length === 1 ? "project" : "projects"} not checked</strong> \u2014 the counts and rows below only cover projects that returned an answer.</summary>
+         ${renderUncheckedGroups(unchecked)}
+       </details>`
+    : "";
+  return `<div class="vuln-status" role="status">${escapeHtml(status)}</div>${notice}`;
+}
+
+function renderUncheckedGroups(unchecked) {
+  const groups = new Map();
+  for (const item of unchecked) {
+    const reason = item?.reason || "Unknown reason";
+    if (!groups.has(reason)) groups.set(reason, []);
+    const repo = item?.repo;
+    if (repo) groups.get(reason).push(repo);
+  }
+  const items = [...groups.entries()].map(([reason, repos]) => {
+    const shown = repos.slice(0, 12).join(", ");
+    const more = repos.length > 12 ? ` and ${repos.length - 12} more` : "";
+    return `<li class="vuln-unchecked-item">
+      <span class="vuln-reason">${escapeHtml(reason)}</span>
+      <span class="vuln-repos">${escapeHtml(shown)}${escapeHtml(more)}</span>
+    </li>`;
+  }).join("");
+  return `<ul class="vuln-unchecked-list">${items}</ul>`;
+}
+
+function renderVulnerabilityRow(row) {
+  const critical = Number(row?.critical || 0);
+  const high = Number(row?.high || 0);
+  const total = critical + high;
+  const oldest = row?.oldestAt ? formatAlertAge(row.oldestAt) : "";
+  const severity = critical > 0 ? "red" : "amber";
+  return `
+    <article class="row row-vulnerability" data-href="${escapeHtml(row?.url || "")}" style="${accentVars(severity)}">
+      <div class="row-main">
+        ${renderRepoLabel(row?.repo)}
+        <div class="title">${escapeHtml(total === 1 ? "1 open critical or high alert" : `${total} open critical or high alerts`)}</div>
+      </div>
+      <div class="vuln-counts" role="group" aria-label="${escapeHtml(`${critical} critical, ${high} high`)}">
+        ${critical ? `<span class="tag tag-danger">${escapeHtml(critical)} critical</span>` : ""}
+        ${high ? `<span class="tag tag-warning">${escapeHtml(high)} high</span>` : ""}
+      </div>
+      <div class="meta">${oldest ? `Oldest ${escapeHtml(oldest)}` : "Alert age unavailable"}</div>
+      <div class="row-actions">
+        <a class="open-link" href="${escapeHtml(row?.url || "")}" target="_blank" rel="noreferrer">Open alerts</a>
+      </div>
+    </article>
+  `;
 }
 
 // Mirrors the server's isBehindBase: anything that is not a positive integer
