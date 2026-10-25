@@ -96,7 +96,19 @@ async function openDashboard() {
     let pathname = new URL(request.url()).pathname;
     if (pathname === "/") pathname = "/index.html";
     if (files[pathname]) return route.fulfill({ contentType: files[pathname][0], body: files[pathname][1] });
-    if (pathname === "/api/status") return route.fulfill({ contentType: "application/json", body: JSON.stringify(statusFixture) });
+    // The status payload and the auto-rerun endpoint are two views of the same
+    // server setting. Serving a static `enabled: true` here let the refresh
+    // that follows the toggle PUT re-check the switch, so the assertion was
+    // decided by whether that refresh landed before or after the check.
+    if (pathname === "/api/status") {
+      return route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          ...statusFixture,
+          autoRerun: { ...statusFixture.autoRerun, enabled: serverEnabled }
+        })
+      });
+    }
     if (pathname === "/api/auto-rerun") {
       if (request.method() === "POST") {
         const body = request.postDataJSON();
