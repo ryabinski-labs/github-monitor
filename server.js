@@ -345,7 +345,11 @@ const DEPENDABOT_ALERTS_DEADLINE_MS = Math.max(
 const RUNNING_RUN_STATUSES = new Set(["queued", "in_progress", "waiting", "requested", "pending"]);
 const recentRerunRequests = new Map();
 const recentApproveRequests = new Map();
-const DEPENDABOT_LOGIN = "dependabot[bot]";
+// The same bot has three logins depending on the API: REST workflow and PR
+// payloads report `dependabot[bot]`, GraphQL's `author.login` reports
+// `dependabot`, and gh prints `app/dependabot`. Auto-merge's exemption and the
+// queue cleanup both need to recognise all three.
+const DEPENDABOT_LOGINS = new Set(["dependabot", "dependabot[bot]", "app/dependabot"]);
 const DEPENDABOT_QUEUE_MAX_THRESHOLD = 5000;
 const DEPENDABOT_QUEUE_THRESHOLD = parseDependabotQueueThreshold(process.env.DEPENDABOT_QUEUE_THRESHOLD);
 const DEPENDABOT_QUEUE_OWNERS = parseOwners(process.env.DEPENDABOT_QUEUE_OWNERS);
@@ -435,6 +439,10 @@ const autoMergeState = {
     requireLabel: DEFAULT_AUTO_MERGE_LABEL
   },
   candidates: new Map(),
+  // Pull requests GitHub refused to merge (policy, permissions, not mergeable)
+  // keyed by repo/number. They stay out of the countdown until their head SHA
+  // changes, so a rejected PR is never retried on every scan.
+  rejected: new Map(),
   running: false,
   timer: null,
   lastScanAt: null,
@@ -1521,7 +1529,7 @@ function parseDependabotQueueThreshold(value, fallback = 0) {
 }
 
 function isDependabotLogin(value) {
-  return String(value || "").toLowerCase() === DEPENDABOT_LOGIN;
+  return DEPENDABOT_LOGINS.has(String(value || "").trim().toLowerCase());
 }
 
 function isDependabotWorkflowRun(run) {
@@ -5000,6 +5008,17 @@ function autoMergeSnapshot() {
         deadline: new Date(candidate.deadline).toISOString(),
         error: candidate.error || ""
       }))
+      .sort(sortByRepoAndNumber),
+    rejected: [...autoMergeState.rejected.values()]
+      .map((rejection) => ({
+        repo: rejection.repo,
+        number: rejection.number,
+        numberLabel: rejection.numberLabel,
+        title: rejection.title,
+        url: rejection.url,
+        error: rejection.error,
+        at: rejection.at
+      }))
       .sort(sortByRepoAndNumber)
   };
 }
@@ -5018,9 +5037,19 @@ function scheduleAutoMergeScan(delayMs = 0) {
 function syncAutoMergeCandidates(pullRequests) {
   const now = Date.now();
   const eligibleKeys = new Set();
+  const present = new Map(pullRequests.map((pr) => [autoMergeKey(pr.repo, pr.number), pr]));
+
+  // A rejection belongs to one head commit. New commits (or a closed PR) make
+  // the decision stale, so the next scan may consider it again.
+  for (const [key, rejection] of [...autoMergeState.rejected]) {
+    const pr = present.get(key);
+    if (!pr || pr.headSha !== rejection.headSha) autoMergeState.rejected.delete(key);
+  }
+
   for (const pr of pullRequests) {
     if (!isAutoMergeCandidate(pr)) continue;
     const key = autoMergeKey(pr.repo, pr.number);
+    if (autoMergeRejectionFor(pr)) continue;
     eligibleKeys.add(key);
     const existing = autoMergeState.candidates.get(key);
     autoMergeState.candidates.set(key, {
@@ -5029,6 +5058,7 @@ function syncAutoMergeCandidates(pullRequests) {
       numberLabel: pr.numberLabel,
       title: pr.title,
       url: pr.url,
+      headSha: pr.headSha,
       deadline: existing?.deadline || now + AUTO_MERGE_DELAY_MS,
       error: ""
     });
@@ -5125,7 +5155,21 @@ async function runAutoMergeScan() {
             error: error.message || "Auto merge failed"
           });
         } else {
-          autoMergeState.lastError = error.message || "Auto merge failed";
+          // GitHub will answer the same way for this head commit. Park it
+          // instead of re-attempting the merge on every scan; a new commit or
+          // a settings change makes it eligible again.
+          const message = error.message || "GitHub rejected the merge.";
+          autoMergeState.rejected.set(key, {
+            repo: candidate.repo,
+            number: candidate.number,
+            numberLabel: candidate.numberLabel,
+            title: candidate.title,
+            url: candidate.url,
+            headSha: candidate.headSha || "",
+            error: message,
+            at: new Date().toISOString()
+          });
+          autoMergeState.lastError = `${candidate.numberLabel} ${candidate.repo}: ${message}`;
         }
       }
     }
@@ -5151,7 +5195,12 @@ async function autoMergeConfig(req, res) {
     mode: normalizeMode(body.mode),
     jobs: parseJobs(body.jobs),
     owners: parseOwners(body.owners),
-    requireLabel: parseRequireLabel(body.requireLabel)
+    // The dashboard toggle does not send this field. Preserve an explicit ""
+    // (gate deliberately lifted) instead of silently restoring the default
+    // every time the switch or account picker is used.
+    requireLabel: body.requireLabel === undefined
+      ? autoMergeState.options.requireLabel
+      : parseRequireLabel(body.requireLabel)
   };
   const optionsChanged =
     autoMergeState.options.mode !== nextOptions.mode ||
@@ -5166,7 +5215,10 @@ async function autoMergeConfig(req, res) {
 
   if (autoMergeState.enabled) {
     clearAutoMergeTimer();
-    if (optionsChanged) autoMergeState.candidates.clear();
+    if (optionsChanged) {
+      autoMergeState.candidates.clear();
+      autoMergeState.rejected.clear();
+    }
     scheduleAutoMergeScan(0);
   } else {
     clearAutoMergeTimer();
@@ -5330,8 +5382,27 @@ function autoMergeLabelSatisfied(pr) {
   return labels.some((label) => String(label).trim().toLowerCase() === required);
 }
 
+function autoMergeRejectionFor(pr) {
+  if (!pr) return null;
+  const rejection = autoMergeState.rejected.get(autoMergeKey(pr.repo, pr.number));
+  if (!rejection) return null;
+  return rejection.headSha === pr.headSha ? rejection : null;
+}
+
 function isAutoMergeCandidate(pr) {
-  return !mergeBlockReason(pr) && pr.checkCount > 0 && autoMergeLabelSatisfied(pr);
+  if (!pr || pr.isArchived) return false;
+  if (mergeBlockReason(pr)) return false;
+  // A clean bill of health means every check finished successfully, the branch
+  // is mergeable, and it already contains the current base. A behind PR would
+  // otherwise count down and then be refused by branch protection.
+  if (pr.checkCount === 0) return false;
+  if (pr.mergeable !== "MERGEABLE") return false;
+  if (isBehindBase(pr)) return false;
+  // A held workflow has not run yet, so the build is not fully healthy even
+  // when every completed check passed.
+  if (pr.awaitingApprovalCount > 0 || (pr.awaitingApprovalRuns || []).length > 0) return false;
+  if (autoMergeRejectionFor(pr)) return false;
+  return autoMergeLabelSatisfied(pr);
 }
 
 function sortByRepoAndNumber(a, b) {
@@ -5805,6 +5876,8 @@ export {
   publicRouteFromFile,
   isBackendUrl,
   isAutoMergeCandidate,
+  autoMergeRejectionFor,
+  autoMergeState,
   mergeBlockReason,
   openPullRequestSearchQuery,
   quotaState,
