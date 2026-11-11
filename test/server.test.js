@@ -298,13 +298,17 @@ test("no-CI pull requests must be mergeable before merging", () => {
 });
 
 test("auto merge only targets passing pull requests with reported checks", () => {
+  // The label is required as well; that gate has its own cases in
+  // auto-merge-label.test.js. Here it is supplied so this test keeps
+  // asserting what it is named for: state and reported-check gating.
   assert.equal(
     isAutoMergeCandidate({
       state: "pass",
       checkCount: 1,
       isDraft: false,
       hasConflict: false,
-      mergeable: "MERGEABLE"
+      mergeable: "MERGEABLE",
+      labels: ["automerge"]
     }),
     true
   );
@@ -314,7 +318,8 @@ test("auto merge only targets passing pull requests with reported checks", () =>
       checkCount: 0,
       isDraft: false,
       hasConflict: false,
-      mergeable: "MERGEABLE"
+      mergeable: "MERGEABLE",
+      labels: ["automerge"]
     }),
     false
   );
