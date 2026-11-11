@@ -37,8 +37,11 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # The hosted image already carries Chromium's shared libraries. Skip
+      # `--with-deps`: its apt-get pass repeatedly fails DNS on the runner and
+      # takes the whole job down before any test runs.
       - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Run checks
         run: npm test
