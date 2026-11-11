@@ -90,6 +90,11 @@ const PR_SEARCH_GRAPHQL = `
           author {
             login
           }
+          labels(first: 20) {
+            nodes {
+              name
+            }
+          }
           repository {
             nameWithOwner
             isArchived
@@ -411,6 +416,13 @@ class HttpError extends Error {
   }
 }
 
+// Auto-merge is opt-in per pull request. Before this, every green PR in the
+// watched orgs merged itself within minutes, including infrastructure changes
+// with no human review — one of them took production down. An empty value
+// restores the old merge-anything behaviour, so the gate can be lifted
+// deliberately rather than by forgetting to set it.
+const DEFAULT_AUTO_MERGE_LABEL = "automerge";
+
 const autoMergeState = {
   enabled: false,
   // True once a saved configuration was restored or a client set one. Until
@@ -419,7 +431,8 @@ const autoMergeState = {
   options: {
     mode: "all",
     jobs: 4,
-    owners: []
+    owners: [],
+    requireLabel: DEFAULT_AUTO_MERGE_LABEL
   },
   candidates: new Map(),
   running: false,
@@ -461,7 +474,8 @@ function loadAutoMergeStateFromDisk(path = AUTO_MERGE_STATE_PATH) {
   autoMergeState.options = {
     mode: normalizeMode(parsed.mode),
     jobs: parseJobs(parsed.jobs),
-    owners: parseOwners(parsed.owners)
+    owners: parseOwners(parsed.owners),
+    requireLabel: parseRequireLabel(parsed.requireLabel)
   };
   autoMergeState.configured = true;
   return true;
@@ -475,7 +489,7 @@ function restoreAutoMergeAtBoot(path = AUTO_MERGE_STATE_PATH) {
   if (loadAutoMergeStateFromDisk(path)) return "restored";
   autoMergeState.enabled = true;
   autoMergeState.configured = false;
-  autoMergeState.options = { mode: "all", jobs: 4, owners: [] };
+  autoMergeState.options = { mode: "all", jobs: 4, owners: [], requireLabel: DEFAULT_AUTO_MERGE_LABEL };
   return "on by default";
 }
 
@@ -1494,6 +1508,11 @@ function parseJobs(value) {
   return Math.min(jobs, MAX_SCAN_JOBS);
 }
 
+function parseRequireLabel(value) {
+  if (value === undefined) return DEFAULT_AUTO_MERGE_LABEL;
+  return String(value).trim().toLowerCase();
+}
+
 function parseDependabotQueueThreshold(value, fallback = 0) {
   if (value == null || value === "") return fallback;
   const threshold = Number(value);
@@ -2439,6 +2458,7 @@ function classifyPullRequest(pr) {
     updatedAt: pr.updatedAt || "",
     isArchived: Boolean(pr.repository.isArchived),
     isDraft: Boolean(pr.isDraft),
+    labels: (pr.labels?.nodes || []).map((label) => label.name).filter(Boolean),
     mergeable,
     hasConflict,
     headSha: pr.headRefOid || "",
@@ -4967,6 +4987,7 @@ function autoMergeSnapshot() {
     mode: autoMergeState.options.mode,
     jobs: autoMergeState.options.jobs,
     owners: autoMergeState.options.owners || [],
+    requireLabel: autoMergeState.options.requireLabel ?? "",
     lastScanAt: autoMergeState.lastScanAt,
     lastError: autoMergeState.lastError,
     candidates: [...autoMergeState.candidates.values()]
@@ -5129,11 +5150,13 @@ async function autoMergeConfig(req, res) {
   const nextOptions = {
     mode: normalizeMode(body.mode),
     jobs: parseJobs(body.jobs),
-    owners: parseOwners(body.owners)
+    owners: parseOwners(body.owners),
+    requireLabel: parseRequireLabel(body.requireLabel)
   };
   const optionsChanged =
     autoMergeState.options.mode !== nextOptions.mode ||
     autoMergeState.options.jobs !== nextOptions.jobs ||
+    autoMergeState.options.requireLabel !== nextOptions.requireLabel ||
     !sameAutoMergeOwners(autoMergeState.options.owners, nextOptions.owners);
   autoMergeState.enabled = Boolean(body.enabled);
   autoMergeState.options = nextOptions;
@@ -5299,8 +5322,16 @@ function mergeBlockReason(pr) {
   return "";
 }
 
+function autoMergeLabelSatisfied(pr) {
+  const required = String(autoMergeState.options.requireLabel || "").trim().toLowerCase();
+  if (!required) return true;             // gate deliberately lifted
+  if (isDependabotLogin(pr.author)) return true;
+  const labels = Array.isArray(pr.labels) ? pr.labels : [];
+  return labels.some((label) => String(label).trim().toLowerCase() === required);
+}
+
 function isAutoMergeCandidate(pr) {
-  return !mergeBlockReason(pr) && pr.checkCount > 0;
+  return !mergeBlockReason(pr) && pr.checkCount > 0 && autoMergeLabelSatisfied(pr);
 }
 
 function sortByRepoAndNumber(a, b) {
