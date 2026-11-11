@@ -85,7 +85,7 @@ const skip = browserMissing ? "Playwright Chromium not installed — run: npx pl
 const publicDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "public");
 const asset = (name) => readFileSync(path.join(publicDir, name), "utf8");
 
-async function loadPage({ serverAutoMerge, storedSettings }) {
+async function loadPage({ serverAutoMerge, storedSettings, pullRequests = {} }) {
   const browser = await chromium.launch();
   const page = await browser.newPage();
   const posts = [];
@@ -111,7 +111,7 @@ async function loadPage({ serverAutoMerge, storedSettings }) {
     if (p === "/api/status") {
       return route.fulfill({
         contentType: "application/json",
-        body: JSON.stringify({ account: "acme", accounts: ["cigan1", "ryabinski-labs"], warnings: [], options: {}, autoMerge: serverAutoMerge, summary: {}, pullRequests: {}, actions: {}, cd: {} })
+        body: JSON.stringify({ account: "acme", accounts: ["cigan1", "ryabinski-labs"], warnings: [], options: {}, autoMerge: serverAutoMerge, summary: {}, pullRequests, actions: {}, cd: {} })
       });
     }
     if (p.startsWith("/api/")) return route.fulfill({ contentType: "application/json", body: "{}" });
@@ -159,6 +159,77 @@ test("a server with nothing saved is seeded by the first page", { skip }, async 
     assert.equal(posts.length, 1);
     assert.equal(posts[0].enabled, true);
     assert.deepEqual(posts[0].owners, ["ryabinski-labs"]);
+  } finally {
+    await browser.close();
+  }
+});
+
+// --- card hints ------------------------------------------------------------------
+
+function readyPr(overrides = {}) {
+  return {
+    repo: "ryabinski-labs/echothread",
+    number: 1404,
+    numberLabel: "#1404",
+    title: "fix(admin): raise the badge readout log cap",
+    url: "https://github.com/ryabinski-labs/echothread/pull/1404",
+    author: "cigan1",
+    state: "pass",
+    checkCount: 11,
+    runningChecks: [],
+    failedChecks: [],
+    labels: [],
+    mergeable: "MERGEABLE",
+    hasConflict: false,
+    isDraft: false,
+    isArchived: false,
+    baseRefName: "main",
+    headRefName: "feature",
+    headSha: "abc123",
+    baseSha: "def456",
+    ...overrides
+  };
+}
+
+test("a green PR missing the opt-in label says why auto merge is waiting", { skip }, async () => {
+  const { browser, page } = await loadPage({
+    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, requireLabel: "automerge", candidates: [], rejected: [] },
+    storedSettings: { view: "pass", owners: [], autoMerge: true },
+    pullRequests: { pass: [readyPr()], noCi: [], fail: [], running: [], conflicts: [], behind: [] }
+  });
+  try {
+    await page.waitForSelector(".row");
+    const pill = page.locator(".label-gate-pill");
+    assert.equal(await pill.count(), 1);
+    assert.match(await pill.innerText(), /Needs automerge label/i);
+  } finally {
+    await browser.close();
+  }
+});
+
+test("a merge GitHub rejected shows a Merge rejected pill with the reason", { skip }, async () => {
+  const rejection = {
+    repo: "cigan1/leafread",
+    number: 14,
+    numberLabel: "#14",
+    title: "chore(deps): bump the actions group",
+    url: "https://github.com/cigan1/leafread/pull/14",
+    error: "Merge commits are not allowed on this repository.",
+    at: "2026-11-11T14:03:00.000Z"
+  };
+  const { browser, page } = await loadPage({
+    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, requireLabel: "automerge", candidates: [], rejected: [rejection] },
+    storedSettings: { view: "pass", owners: [], autoMerge: true },
+    pullRequests: {
+      pass: [readyPr({ repo: rejection.repo, number: rejection.number, numberLabel: rejection.numberLabel, title: rejection.title, url: rejection.url, author: "dependabot", labels: ["dependencies"] })],
+      noCi: [], fail: [], running: [], conflicts: [], behind: []
+    }
+  });
+  try {
+    await page.waitForSelector(".row");
+    const pill = page.locator(".merge-rejected-pill");
+    assert.equal(await pill.count(), 1);
+    assert.match(await pill.getAttribute("title"), /Merge commits are not allowed/);
   } finally {
     await browser.close();
   }

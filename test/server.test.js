@@ -344,9 +344,14 @@ test("deep queue threshold is configurable and can be disabled", () => {
 test("Dependabot workflow detection is exact and queue depth deduplicates runs", () => {
   assert.equal(isDependabotLogin("dependabot[bot]"), true);
   assert.equal(isDependabotLogin("Dependabot[bot]"), true);
+  // GraphQL author.login and gh's rendering of the same bot.
+  assert.equal(isDependabotLogin("dependabot"), true);
+  assert.equal(isDependabotLogin("app/dependabot"), true);
   assert.equal(isDependabotLogin("dependabot-preview[bot]"), false);
+  assert.equal(isDependabotLogin("not-dependabot"), false);
   assert.equal(isDependabotWorkflowRun({ actor: { login: "dependabot[bot]" } }), true);
   assert.equal(isDependabotWorkflowRun({ triggering_actor: { login: "dependabot[bot]" } }), true);
+  assert.equal(isDependabotWorkflowRun({ actor: { login: "dependabot" } }), true);
   assert.equal(isDependabotWorkflowRun({ actor: { login: "maintainer" } }), false);
   assert.equal(dependabotQueueDepth([
     { repo: "acme/app", runId: 1, status: "queued" },
