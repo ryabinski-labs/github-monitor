@@ -94,7 +94,6 @@ const state = {
   dismissed: loadDismissed(),
   showDismissed: false,
   autoMerge: persisted.autoMerge !== false,
-  autoMergeRequireLabel: "",
   // Owned by the server (/api/auto-rerun); this mirrors it for the switch.
   autoRerun: false,
   merging: new Set(),
@@ -1219,7 +1218,6 @@ function syncAutoMerges(data) {
 function applyAutoMergeSnapshot(snapshot) {
   if (!snapshot) return;
   state.autoMerge = Boolean(snapshot.enabled);
-  state.autoMergeRequireLabel = String(snapshot.requireLabel || "");
   state.autoMergeRejected = new Map(
     (snapshot.rejected || []).map((entry) => [
       mergeKey(entry.repo, entry.number),
@@ -1229,9 +1227,7 @@ function applyAutoMergeSnapshot(snapshot) {
   els.autoMerge.checked = state.autoMerge;
   const switchLabel = els.autoMerge.closest(".switch");
   if (switchLabel) {
-    switchLabel.title = state.autoMergeRequireLabel
-      ? `Automatically merge passing PRs after a server-side 15-second countdown; PRs need the "${state.autoMergeRequireLabel}" label (Dependabot exempt)`
-      : "Automatically merge passing PRs after a server-side 15-second countdown";
+    switchLabel.title = "Automatically merge passing PRs after a server-side 15-second countdown";
   }
   syncAutoMerges({ autoMerge: snapshot });
   persist();
@@ -2719,40 +2715,11 @@ function renderApproveButton(row) {
   </button>`;
 }
 
-// The same bot is reported as `dependabot` by the GraphQL PR search, as
-// `dependabot[bot]` by REST, and as `app/dependabot` by gh.
-const DEPENDABOT_AUTHORS = new Set(["dependabot", "dependabot[bot]", "app/dependabot"]);
-
-function isDependabotAuthor(login) {
-  return DEPENDABOT_AUTHORS.has(String(login || "").trim().toLowerCase());
-}
-
-// Auto merge is opt-in by label for human PRs. A green PR that is otherwise
-// ready but carries no label looks silently stuck; say why on the card.
-function autoMergeLabelHold(row) {
-  const required = String(state.autoMergeRequireLabel || "").trim();
-  if (!state.autoMerge || !required) return "";
-  if (row.state !== "pass" || row.checkCount === 0) return "";
-  if (row.isDraft || row.hasConflict || isBehindBase(row)) return "";
-  if (row.mergeable !== "MERGEABLE") return "";
-  if (isDependabotAuthor(row.author)) return "";
-  const labels = Array.isArray(row.labels) ? row.labels : [];
-  const hasLabel = labels.some((label) => String(label).trim().toLowerCase() === required.toLowerCase());
-  return hasLabel ? "" : required;
-}
-
 function renderAutoMergeRejectedBadge(row) {
   if (!state.autoMerge) return "";
   const error = state.autoMergeRejected.get(mergeKey(row.repo, row.number));
   if (!error) return "";
   return `<span class="merge-rejected-pill" title="${escapeHtml(`GitHub rejected auto merge: ${error}. Push a new commit or change the auto-merge settings to retry.`)}">Merge rejected</span>`;
-}
-
-function renderAutoMergeGateBadge(row) {
-  const required = autoMergeLabelHold(row);
-  if (!required) return "";
-  const title = `Auto merge skips green PRs without the "${required}" label. Add it on GitHub to start the 15-second countdown.`;
-  return `<span class="label-gate-pill" title="${escapeHtml(title)}">Needs ${escapeHtml(required)} label</span>`;
 }
 
 function renderApprovalBadge(row) {
@@ -2913,7 +2880,6 @@ function renderPrRow(row, view) {
         ${behindBadge}
         ${draftBadge}
         ${renderAutoMergeRejectedBadge(row)}
-        ${renderAutoMergeGateBadge(row)}
         ${renderApprovalBadge(row)}
         ${phaseBadge}
         ${row.state === "fail" ? renderAutoRerunBadge(row) : ""}
