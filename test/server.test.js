@@ -15,6 +15,7 @@ import {
   productionTargetFromCodeFiles,
   isAutoMergeCandidate,
   mergeBlockReason,
+  mergeMethodsFromRepo,
   openPullRequestSearchQuery,
   quotaState,
   recordRateLimit,
@@ -298,17 +299,13 @@ test("no-CI pull requests must be mergeable before merging", () => {
 });
 
 test("auto merge only targets passing pull requests with reported checks", () => {
-  // The label is required as well; that gate has its own cases in
-  // auto-merge-label.test.js. Here it is supplied so this test keeps
-  // asserting what it is named for: state and reported-check gating.
   assert.equal(
     isAutoMergeCandidate({
       state: "pass",
       checkCount: 1,
       isDraft: false,
       hasConflict: false,
-      mergeable: "MERGEABLE",
-      labels: ["automerge"]
+      mergeable: "MERGEABLE"
     }),
     true
   );
@@ -318,11 +315,46 @@ test("auto merge only targets passing pull requests with reported checks", () =>
       checkCount: 0,
       isDraft: false,
       hasConflict: false,
-      mergeable: "MERGEABLE",
-      labels: ["automerge"]
+      mergeable: "MERGEABLE"
     }),
     false
   );
+});
+
+test("auto merge uses a merge method the repository allows", () => {
+  assert.deepEqual(
+    mergeMethodsFromRepo({ allow_merge_commit: true, allow_squash_merge: true, allow_rebase_merge: true }),
+    ["merge", "squash", "rebase"]
+  );
+  assert.deepEqual(
+    mergeMethodsFromRepo({ allow_merge_commit: false, allow_squash_merge: true, allow_rebase_merge: false }),
+    ["squash"]
+  );
+  assert.deepEqual(
+    mergeMethodsFromRepo({ allow_merge_commit: false, allow_squash_merge: false, allow_rebase_merge: true }),
+    ["rebase"]
+  );
+  // A branch ruleset can forbid a method the repository settings allow.
+  assert.deepEqual(
+    mergeMethodsFromRepo(
+      { allow_merge_commit: true, allow_squash_merge: true, allow_rebase_merge: true },
+      [{ type: "pull_request", parameters: { allowed_merge_methods: ["squash", "rebase"] } }]
+    ),
+    ["squash", "rebase"]
+  );
+  assert.deepEqual(
+    mergeMethodsFromRepo(
+      { allow_merge_commit: true, allow_squash_merge: true, allow_rebase_merge: true },
+      [
+        { type: "pull_request", parameters: { allowed_merge_methods: ["squash", "rebase"] } },
+        { type: "pull_request", parameters: { allowed_merge_methods: ["rebase"] } }
+      ]
+    ),
+    ["rebase"]
+  );
+  // A settings payload that cannot be read keeps the historical default
+  // instead of guessing a method GitHub may reject.
+  assert.deepEqual(mergeMethodsFromRepo({}), ["merge"]);
 });
 
 test("open pull request searches exclude archived repositories", () => {

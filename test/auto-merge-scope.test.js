@@ -191,17 +191,18 @@ function readyPr(overrides = {}) {
   };
 }
 
-test("a green PR missing the opt-in label says why auto merge is waiting", { skip }, async () => {
+test("a green PR without a label is not held back by a label gate", { skip }, async () => {
   const { browser, page } = await loadPage({
-    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, requireLabel: "automerge", candidates: [], rejected: [] },
+    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, candidates: [], rejected: [] },
     storedSettings: { view: "pass", owners: [], autoMerge: true },
     pullRequests: { pass: [readyPr()], noCi: [], fail: [], running: [], conflicts: [], behind: [] }
   });
   try {
     await page.waitForSelector(".row");
     const pill = page.locator(".label-gate-pill");
-    assert.equal(await pill.count(), 1);
-    assert.match(await pill.innerText(), /Needs automerge label/i);
+    assert.equal(await pill.count(), 0);
+    const mergeButton = page.locator(".merge-button").first();
+    assert.equal(await mergeButton.count(), 1);
   } finally {
     await browser.close();
   }
@@ -218,7 +219,7 @@ test("a merge GitHub rejected shows a Merge rejected pill with the reason", { sk
     at: "2026-11-11T14:03:00.000Z"
   };
   const { browser, page } = await loadPage({
-    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, requireLabel: "automerge", candidates: [], rejected: [rejection] },
+    serverAutoMerge: { enabled: true, configured: true, mode: "all", jobs: 4, owners: [], running: false, candidates: [], rejected: [rejection] },
     storedSettings: { view: "pass", owners: [], autoMerge: true },
     pullRequests: {
       pass: [readyPr({ repo: rejection.repo, number: rejection.number, numberLabel: rejection.numberLabel, title: rejection.title, url: rejection.url, author: "dependabot", labels: ["dependencies"] })],

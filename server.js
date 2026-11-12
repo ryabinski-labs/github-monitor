@@ -90,11 +90,6 @@ const PR_SEARCH_GRAPHQL = `
           author {
             login
           }
-          labels(first: 20) {
-            nodes {
-              name
-            }
-          }
           repository {
             nameWithOwner
             isArchived
@@ -420,13 +415,6 @@ class HttpError extends Error {
   }
 }
 
-// Auto-merge is opt-in per pull request. Before this, every green PR in the
-// watched orgs merged itself within minutes, including infrastructure changes
-// with no human review — one of them took production down. An empty value
-// restores the old merge-anything behaviour, so the gate can be lifted
-// deliberately rather than by forgetting to set it.
-const DEFAULT_AUTO_MERGE_LABEL = "automerge";
-
 const autoMergeState = {
   enabled: false,
   // True once a saved configuration was restored or a client set one. Until
@@ -435,8 +423,7 @@ const autoMergeState = {
   options: {
     mode: "all",
     jobs: 4,
-    owners: [],
-    requireLabel: DEFAULT_AUTO_MERGE_LABEL
+    owners: []
   },
   candidates: new Map(),
   // Pull requests GitHub refused to merge (policy, permissions, not mergeable)
@@ -482,8 +469,7 @@ function loadAutoMergeStateFromDisk(path = AUTO_MERGE_STATE_PATH) {
   autoMergeState.options = {
     mode: normalizeMode(parsed.mode),
     jobs: parseJobs(parsed.jobs),
-    owners: parseOwners(parsed.owners),
-    requireLabel: parseRequireLabel(parsed.requireLabel)
+    owners: parseOwners(parsed.owners)
   };
   autoMergeState.configured = true;
   return true;
@@ -497,7 +483,7 @@ function restoreAutoMergeAtBoot(path = AUTO_MERGE_STATE_PATH) {
   if (loadAutoMergeStateFromDisk(path)) return "restored";
   autoMergeState.enabled = true;
   autoMergeState.configured = false;
-  autoMergeState.options = { mode: "all", jobs: 4, owners: [], requireLabel: DEFAULT_AUTO_MERGE_LABEL };
+  autoMergeState.options = { mode: "all", jobs: 4, owners: [] };
   return "on by default";
 }
 
@@ -1516,11 +1502,6 @@ function parseJobs(value) {
   return Math.min(jobs, MAX_SCAN_JOBS);
 }
 
-function parseRequireLabel(value) {
-  if (value === undefined) return DEFAULT_AUTO_MERGE_LABEL;
-  return String(value).trim().toLowerCase();
-}
-
 function parseDependabotQueueThreshold(value, fallback = 0) {
   if (value == null || value === "") return fallback;
   const threshold = Number(value);
@@ -2466,7 +2447,6 @@ function classifyPullRequest(pr) {
     updatedAt: pr.updatedAt || "",
     isArchived: Boolean(pr.repository.isArchived),
     isDraft: Boolean(pr.isDraft),
-    labels: (pr.labels?.nodes || []).map((label) => label.name).filter(Boolean),
     mergeable,
     hasConflict,
     headSha: pr.headRefOid || "",
@@ -4995,7 +4975,6 @@ function autoMergeSnapshot() {
     mode: autoMergeState.options.mode,
     jobs: autoMergeState.options.jobs,
     owners: autoMergeState.options.owners || [],
-    requireLabel: autoMergeState.options.requireLabel ?? "",
     lastScanAt: autoMergeState.lastScanAt,
     lastError: autoMergeState.lastError,
     candidates: [...autoMergeState.candidates.values()]
@@ -5088,6 +5067,64 @@ function nextAutoMergeDelay() {
   return Math.min(nextDeadline, AUTO_MERGE_SCAN_MS);
 }
 
+const REPO_MERGE_METHOD_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const MERGE_METHOD_ORDER = ["merge", "squash", "rebase"];
+const repoMergeMethodsCache = new Map();
+
+// GitHub only accepts a merge method the repository and its branch rules
+// allow. Prefer a merge commit, then squash, then rebase; a repository or a
+// ruleset that disables merge commits (common for bots) would otherwise reject
+// every auto merge with "Merge commits are not allowed on this repository."
+// A pull-request rule's allowed_merge_methods is an allowlist, so the
+// effective set is the intersection of every rule that carries one.
+function mergeMethodsFromRepo(settings, rules = []) {
+  let allowed = MERGE_METHOD_ORDER.filter((method) => {
+    if (method === "merge") return settings?.allow_merge_commit === true;
+    if (method === "squash") return settings?.allow_squash_merge === true;
+    return settings?.allow_rebase_merge === true;
+  });
+  const restrictions = rules
+    .filter((rule) => rule?.type === "pull_request")
+    .map((rule) => rule.parameters?.allowed_merge_methods)
+    .filter((methods) => Array.isArray(methods) && methods.length);
+  if (restrictions.length) {
+    allowed = allowed.filter((method) => restrictions.every((methods) => methods.includes(method)));
+  }
+  return allowed.length ? allowed : ["merge"];
+}
+
+function repoMergeCacheKey(repo, branch) {
+  return `${repo}#${branch || ""}`;
+}
+
+async function repoMergeMethods(repo, branch = "") {
+  const key = repoMergeCacheKey(repo, branch);
+  const cached = repoMergeMethodsCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.methods;
+  try {
+    const [settings, rules] = await Promise.all([
+      githubRequest(`/repos/${repo}`),
+      branch
+        ? githubRequest(`/repos/${repo}/rules/branches/${encodeURIComponent(branch)}`).catch(() => [])
+        : Promise.resolve([])
+    ]);
+    const methods = mergeMethodsFromRepo(settings, Array.isArray(rules) ? rules : []);
+    repoMergeMethodsCache.set(key, {
+      methods,
+      expiresAt: Date.now() + REPO_MERGE_METHOD_CACHE_TTL_MS
+    });
+    return methods;
+  } catch {
+    // A metadata read must never block a merge. The merge attempt itself
+    // reports the real error if the requested method is not permitted.
+    return [...MERGE_METHOD_ORDER];
+  }
+}
+
+function isMergeMethodRejection(error) {
+  return error?.status === 405 && /not allowed on this repository/i.test(error.message || "");
+}
+
 async function executeMergePullRequest(repo, number, methodValue) {
   const pr = await fetchPullRequestByNumber(repo, number);
   const reason = mergeBlockReason(pr);
@@ -5095,12 +5132,40 @@ async function executeMergePullRequest(repo, number, methodValue) {
     throw new HttpError(409, reason);
   }
 
-  const result = await githubRequest(`/repos/${repo}/pulls/${number}/merge`, {
-    method: "PUT",
-    body: {
-      merge_method: mergeMethod(methodValue)
+  const explicit = mergeMethod(methodValue);
+  const cacheKey = repoMergeCacheKey(repo, pr.baseRefName);
+  // An explicit method is a caller decision and is never second-guessed. An
+  // automatic merge starts with the allowed methods and still tries the
+  // remaining ones once when GitHub refuses the method, because a ruleset can
+  // restrict the branch even when the repository settings allow all three.
+  const ordered = explicit
+    ? [explicit]
+    : [...new Set([...(await repoMergeMethods(repo, pr.baseRefName)), ...MERGE_METHOD_ORDER])];
+
+  let result;
+  let used;
+  for (let index = 0; index < ordered.length; index += 1) {
+    const method = ordered[index];
+    try {
+      result = await githubRequest(`/repos/${repo}/pulls/${number}/merge`, {
+        method: "PUT",
+        body: { merge_method: method }
+      });
+      used = method;
+      break;
+    } catch (error) {
+      // Only a method-policy refusal is safe to retry: GitHub rejected the
+      // request before merging anything. Every other error is reported as is.
+      if (explicit || !isMergeMethodRejection(error) || index === ordered.length - 1) throw error;
+      repoMergeMethodsCache.delete(cacheKey);
     }
-  });
+  }
+  if (used && !explicit) {
+    repoMergeMethodsCache.set(cacheKey, {
+      methods: [used, ...MERGE_METHOD_ORDER.filter((method) => method !== used)],
+      expiresAt: Date.now() + REPO_MERGE_METHOD_CACHE_TTL_MS
+    });
+  }
   const merged = Boolean(result?.merged);
   const branchDelete = merged
     ? await deletePullRequestBranch(pr)
@@ -5194,18 +5259,11 @@ async function autoMergeConfig(req, res) {
   const nextOptions = {
     mode: normalizeMode(body.mode),
     jobs: parseJobs(body.jobs),
-    owners: parseOwners(body.owners),
-    // The dashboard toggle does not send this field. Preserve an explicit ""
-    // (gate deliberately lifted) instead of silently restoring the default
-    // every time the switch or account picker is used.
-    requireLabel: body.requireLabel === undefined
-      ? autoMergeState.options.requireLabel
-      : parseRequireLabel(body.requireLabel)
+    owners: parseOwners(body.owners)
   };
   const optionsChanged =
     autoMergeState.options.mode !== nextOptions.mode ||
     autoMergeState.options.jobs !== nextOptions.jobs ||
-    autoMergeState.options.requireLabel !== nextOptions.requireLabel ||
     !sameAutoMergeOwners(autoMergeState.options.owners, nextOptions.owners);
   autoMergeState.enabled = Boolean(body.enabled);
   autoMergeState.options = nextOptions;
@@ -5374,14 +5432,6 @@ function mergeBlockReason(pr) {
   return "";
 }
 
-function autoMergeLabelSatisfied(pr) {
-  const required = String(autoMergeState.options.requireLabel || "").trim().toLowerCase();
-  if (!required) return true;             // gate deliberately lifted
-  if (isDependabotLogin(pr.author)) return true;
-  const labels = Array.isArray(pr.labels) ? pr.labels : [];
-  return labels.some((label) => String(label).trim().toLowerCase() === required);
-}
-
 function autoMergeRejectionFor(pr) {
   if (!pr) return null;
   const rejection = autoMergeState.rejected.get(autoMergeKey(pr.repo, pr.number));
@@ -5402,7 +5452,7 @@ function isAutoMergeCandidate(pr) {
   // when every completed check passed.
   if (pr.awaitingApprovalCount > 0 || (pr.awaitingApprovalRuns || []).length > 0) return false;
   if (autoMergeRejectionFor(pr)) return false;
-  return autoMergeLabelSatisfied(pr);
+  return true;
 }
 
 function sortByRepoAndNumber(a, b) {
@@ -5961,5 +6011,6 @@ export {
   resetDependabotCleanupState,
   dependabotCleanupSnapshot,
   sameAutoMergeOwners,
+  mergeMethodsFromRepo,
   server
 };
