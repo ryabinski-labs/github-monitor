@@ -238,12 +238,12 @@ test("a merge GitHub rejected shows a Merge rejected pill with the reason", { sk
 
 // --- boot ------------------------------------------------------------------------
 
-test("a server with nothing saved boots with auto merge on, still open to a page's scope", async () => {
+test("a server with nothing saved boots with auto merge off, still open to a page's scope", async () => {
   const { restoreAutoMergeAtBoot } = await import("../server.js");
-  assert.equal(restoreAutoMergeAtBoot(path.join(stateDir, "never-saved.json")), "on by default");
+  assert.equal(restoreAutoMergeAtBoot(path.join(stateDir, "never-saved.json")), "off by default");
   await withServer(async (base) => {
     const snapshot = await (await realFetch(`${base}/api/auto-merge`)).json();
-    assert.equal(snapshot.enabled, true, "on by default");
+    assert.equal(snapshot.enabled, false, "off by default");
     assert.equal(snapshot.configured, false, "the first page still sets the accounts");
   });
 });

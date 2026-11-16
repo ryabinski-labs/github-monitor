@@ -475,16 +475,17 @@ function loadAutoMergeStateFromDisk(path = AUTO_MERGE_STATE_PATH) {
   return true;
 }
 
-// Auto merge is on by default, like the dashboard's switch: a server with no
-// saved setting starts it for all accounts rather than waiting, switched off,
-// for some page to load. `configured` stays false, so the first page to load
-// still narrows it to that page's accounts and saves that.
+// Auto merge is off by default. A server with no saved setting must not start
+// merging org-wide PRs just because someone opened the dashboard; the README
+// and the security model both promise an explicit opt-in. `configured` stays
+// false, so the first page to load seeds the scope without silently turning
+// the feature on.
 function restoreAutoMergeAtBoot(path = AUTO_MERGE_STATE_PATH) {
   if (loadAutoMergeStateFromDisk(path)) return "restored";
-  autoMergeState.enabled = true;
+  autoMergeState.enabled = false;
   autoMergeState.configured = false;
   autoMergeState.options = { mode: "all", jobs: 4, owners: [] };
-  return "on by default";
+  return "off by default";
 }
 
 async function saveAutoMergeStateToDisk(path = AUTO_MERGE_STATE_PATH) {
@@ -5588,6 +5589,39 @@ async function updatePullRequestBranch(req, res) {
   });
 }
 
+function dashboardOperator() {
+  const configured = String(process.env.DASHBOARD_OPERATOR || "").trim();
+  return configured || "local dashboard";
+}
+
+function normalizeCloseReason(value) {
+  const reason = String(value || "").trim();
+  if (!reason) throw new HttpError(400, "A reason is required to close a pull request.");
+  if (reason.length > 500) throw new HttpError(400, "Close reason must be 500 characters or fewer.");
+  return reason;
+}
+
+function closeAuditComment(reason, operator = dashboardOperator()) {
+  return `Closed via github-monitor (${operator}): ${reason}`;
+}
+
+// Post the audit comment FIRST. If GitHub refuses the comment, the close is
+// refused too, so no pull request can be closed from here without a visible
+// reason in its timeline. The API actor is the App/PAT, not the operator, so
+// this comment is the only durable human-readable attribution.
+async function closePullRequestWithReason(repo, number, reason, operator = dashboardOperator()) {
+  const comment = closeAuditComment(reason, operator);
+  await githubRequest(`/repos/${repo}/issues/${number}/comments`, {
+    method: "POST",
+    body: { body: comment }
+  });
+  const result = await githubRequest(`/repos/${repo}/pulls/${number}`, {
+    method: "PATCH",
+    body: { state: "closed" }
+  });
+  return { result, comment };
+}
+
 async function closePullRequest(req, res) {
   if (req.method !== "POST") {
     throw new HttpError(405, "Method not allowed");
@@ -5596,19 +5630,16 @@ async function closePullRequest(req, res) {
   const body = await readJsonBody(req);
   const { repo } = parseRepo(body.repo);
   const number = parsePullNumber(body.number);
+  const reason = normalizeCloseReason(body.reason);
   autoMergeState.candidates.delete(autoMergeKey(repo, number));
   const pr = await fetchPullRequestByNumber(repo, number);
 
-  const result = await githubRequest(`/repos/${repo}/pulls/${number}`, {
-    method: "PATCH",
-    body: {
-      state: "closed"
-    }
-  });
+  const { result, comment } = await closePullRequestWithReason(repo, number, reason);
 
   await sendJson(res, 200, {
     closed: result?.state === "closed",
     message: result?.state === "closed" ? "Pull request closed." : "GitHub did not close the pull request.",
+    auditComment: comment,
     pr: {
       repo: pr.repo,
       number: pr.number,
@@ -6011,6 +6042,10 @@ export {
   resetDependabotCleanupState,
   dependabotCleanupSnapshot,
   sameAutoMergeOwners,
+  dashboardOperator,
+  normalizeCloseReason,
+  closeAuditComment,
+  closePullRequestWithReason,
   mergeMethodsFromRepo,
   server
 };

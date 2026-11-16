@@ -242,11 +242,13 @@ GET  /api/health
 - `POST /api/pull-request/update-branch` takes `{ repo, number }` and merges the base branch into the PR's head. It never rebases, so the contributor's head branch is never force-pushed. GitHub's own refusal is passed through verbatim: a branch-protection rule that blocks the App and a fork nobody can push to are different problems.
 
 - The runner endpoint returns only busy self-hosted runners; set `includeRepoRunners=1` to include repo-level runners.
-- Merge/close requests take JSON like `{"repo":"owner/name","number":123}`. Merge re-checks the PR (see [guarded merges](#how-it-works)) and deletes the head branch on success; close skips CI requirements.
+- Merge requests take JSON like `{"repo":"owner/name","number":123}`. Merge re-checks the PR (see [guarded merges](#how-it-works)) and deletes the head branch on success. Close requires `{"repo":"owner/name","number":123,"reason":"why"}`; a blank reason is rejected, and the reason plus `DASHBOARD_OPERATOR` is posted as a PR comment before the close. Closing still skips CI requirements.
 
 ## Security
 
 The server binds to `127.0.0.1` and is meant for a trusted local machine. It uses your token (or App installation tokens) for API calls and dashboard-triggered merges, so **don't expose it to an untrusted network**.
+
+Auto merge starts off and is an explicit opt-in. Closing a PR requires a reason, which is posted as a comment; set `DASHBOARD_OPERATOR` to a name or handle so that comment identifies the person operating the dashboard. Install the GitHub App only on the repositories you need and grant only the permissions in [docs/github-app-setup.md](docs/github-app-setup.md); `Administration: write` is not required.
 
 Never commit `.env` files, real tokens, GitHub App private keys (`*.pem`), screenshots containing private repo data, or logs with private repo names. Store App private keys outside this repo with mode `0600` and treat them as sensitive as the PAT they replace.
 
