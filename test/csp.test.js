@@ -89,10 +89,9 @@ async function openAgainstServer({ storedSettings = null, blockAppJs = false } =
   await page.route("**/api/status*", (route) =>
     route.fulfill({ contentType: "application/json", body: JSON.stringify(emptyStatus()) })
   );
-  // Auto merge is on by default, so simply loading the page posts enabled:true
-  // and the real server would start a live auto-merge scan against GitHub --
-  // which reaches the network and never lets the listener close. Stub it so
-  // this test stays about the content security policy and nothing else.
+  // Auto merge is off by default, but a stored preference could still ask the
+  // real server to start a live scan against GitHub. Stub it so this test stays
+  // about the content security policy and nothing else.
   await page.route("**/api/auto-merge", (route) =>
     route.fulfill({
       contentType: "application/json",

@@ -39,14 +39,14 @@ The App is yours: each operator stands up their own. The project does not run a 
 
    | Permission | Access | Why |
    | --- | --- | --- |
-   | Actions | Read-only, or Read & write | Read workflow runs and runners; write is required for failed-job reruns or deep-queue cleanup |
+   | Actions | Read-only, or Read & write | Read workflow runs and runners; write is required only for failed-job reruns or deep-queue cleanup |
    | Checks | Read-only | CheckRun data in the PR `statusCheckRollup` GraphQL field |
    | Commit statuses | Read-only | Legacy StatusContext data in the PR `statusCheckRollup` GraphQL field |
-   | Contents | Read & write | Read commits, trees, file content; delete merged PR head branches |
+   | Contents | Read-only, or Read & write | Read commits, trees, file content; write is required only to delete merged PR head branches or update a branch |
    | Dependabot alerts | Read-only | Open critical/high alerts for the Vulnerabilities view |
    | Deployments | Read-only | Running deployments view |
    | Metadata | Read-only | Mandatory; repository discovery |
-   | Pull requests | Read-only, or Read & write | List PRs; write is required for merge/close actions and deep-queue cleanup |
+   | Pull requests | Read-only, or Read & write | List PRs; write is required only for merge/close actions and deep-queue cleanup |
 
    Adding Dependabot alerts to an existing App makes GitHub ask each installation to approve the update. Until it is approved, the **Vulnerabilities** view names those repositories as not checked rather than showing a clean zero.
 
@@ -66,8 +66,10 @@ The App is yours: each operator stands up their own. The project does not run a 
 
 1. On the App's settings page, click **Install App** in the sidebar.
 2. For each account (personal account or organization) whose repos you want to monitor, click **Install** and choose:
-   - **All repositories** — recommended if you frequently add or rename repos; the App will automatically have access to new repositories.
-   - **Selected repositories** — explicit list. To approach the 12,500/hr cap, install on at least 20 repositories.
+   - **Selected repositories** — recommended for least privilege. Add only the repositories you actually monitor; the App cannot read or write anything else.
+   - **All repositories** — use this only when you expect the repository set to change often. It gives the App access to every current and future repository in the account.
+
+Do not grant **Administration: write**. GitHub Monitor does not need it, and it lets the App change repository settings. Grant write permissions only for the actions you use: Pull requests for merge/close, Actions for reruns/cleanup, and Contents only if you want merged branch deletion or branch updates.
 
 You can install the App on as many accounts as you want; each installation has an independent rate-limit bucket.
 

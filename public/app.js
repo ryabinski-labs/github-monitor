@@ -93,7 +93,7 @@ const state = {
   notified: loadNotified(),
   dismissed: loadDismissed(),
   showDismissed: false,
-  autoMerge: persisted.autoMerge !== false,
+  autoMerge: persisted.autoMerge === true,
   // Owned by the server (/api/auto-rerun); this mirrors it for the switch.
   autoRerun: false,
   merging: new Set(),
@@ -3802,6 +3802,19 @@ async function closePullRequest(button) {
   if (!repo || !Number.isInteger(number)) return;
   if (state.closing.has(key) || state.closed.has(key) || state.merging.has(key) || state.merged.has(key)) return;
 
+  // The API and the PR timeline both require a reason. Prompt before any state
+  // changes so closing is never a silent one-click action.
+  const reason = window.prompt(
+    `Why are you closing ${repo} ${title}? A reason is required and will be posted as a comment on the PR.`,
+    ""
+  );
+  if (reason === null) return;
+  const trimmedReason = String(reason).trim();
+  if (!trimmedReason) {
+    showToast("Close cancelled", "A reason is required to close a pull request.");
+    return;
+  }
+
   clearAutoMerge(key);
   state.closing.add(key);
   state.closed.delete(key);
@@ -3811,7 +3824,7 @@ async function closePullRequest(button) {
     const response = await fetch("/api/pull-request/close", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ repo, number })
+      body: JSON.stringify({ repo, number, reason: trimmedReason })
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {

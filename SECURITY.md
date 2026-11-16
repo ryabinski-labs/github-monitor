@@ -19,7 +19,9 @@ Include:
 
 ## Security Model
 
-GitHub Monitor is intended to run on a trusted local machine and binds to `127.0.0.1` by default. It authenticates to GitHub with either a personal access token (PAT) read from `GITHUB_TOKEN` / `GH_TOKEN` / `gh auth token`, or with installation tokens minted from a GitHub App you control. Both paths are used for API reads and dashboard-initiated merge/close actions. Automatic Dependabot PR closure and workflow cancellation is disabled by default and runs in the background only when `DEPENDABOT_QUEUE_THRESHOLD` is set to a positive integer; `DEPENDABOT_QUEUE_OWNERS` can restrict its owner scope. Treat the local dashboard as privileged whenever the active credential has write access.
+GitHub Monitor is intended to run on a trusted local machine and binds to `127.0.0.1` by default. It authenticates to GitHub with either a personal access token (PAT) read from `GITHUB_TOKEN` / `GH_TOKEN` / `gh auth token`, or with installation tokens minted from a GitHub App you control. Both paths are used for API reads and dashboard-initiated merge/close actions. Auto merge is off by default and must be enabled explicitly. Closing a PR requires a reason, and the reason plus `DASHBOARD_OPERATOR` is posted as a comment before the close. Automatic Dependabot PR closure and workflow cancellation is disabled by default and runs in the background only when `DEPENDABOT_QUEUE_THRESHOLD` is set to a positive integer; `DEPENDABOT_QUEUE_OWNERS` can restrict its owner scope. Treat the local dashboard as privileged whenever the active credential has write access.
+
+Install the GitHub App only on the repositories you need and grant only the permissions the views require. `Administration: write` is not needed by the dashboard; `Contents: write` is only needed for deleting merged branches or updating a branch. See [docs/github-app-setup.md](docs/github-app-setup.md).
 
 Do not expose the server directly to an untrusted network.
 

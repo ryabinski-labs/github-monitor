@@ -1,10 +1,8 @@
-// The five control-bar switches -- CD, Runners, Auto (refresh), Auto merge and
-// Notify -- all start on for a fresh dashboard, and CD/Runners/Auto reset to on
-// every restart because they are deliberately not persisted.
-//
-// Auto merge and Notify *are* persisted, so "on by default" must still mean
-// "off stays off": an explicit opt-out has to survive a reload, or the switch
-// is not a switch. That distinction is the point of the last test here.
+// CD, Runners and Auto (refresh) start on for a fresh dashboard and reset to on
+// every restart because they are deliberately not persisted. Auto merge now
+// starts off and Notify still starts on; both are persisted, so an explicit
+// choice has to survive a reload. That distinction is the point of the last
+// tests here.
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -32,7 +30,7 @@ const statusFixture = {
   generatedAt: "2026-09-06T12:00:00Z",
   warnings: [],
   options: {},
-  autoMerge: { enabled: true, running: false, candidates: [] },
+  autoMerge: { enabled: false, running: false, candidates: [] },
   scan: { reposConsidered: 1, reposScanned: 1, reposSkipped: 0, pushedWithinHours: 168, repoFloor: 10 },
   summary: {
     repos: 1,
@@ -59,7 +57,7 @@ async function openDashboard({ storedSettings = null } = {}) {
   // The server owns auto-merge state and echoes it back on /api/status, which
   // the client then applies. Mirror that here so the two mocked endpoints do
   // not contradict each other.
-  let autoMergeEnabled = true;
+  let autoMergeEnabled = false;
 
   await page.addInitScript((settings) => {
     localStorage.clear();
@@ -116,18 +114,19 @@ async function openDashboard({ storedSettings = null } = {}) {
 
 const checked = (page, id) => page.locator(`#${id}`).isChecked();
 
-test("a fresh dashboard starts with all five switches on", { skip }, async () => {
+test("a fresh dashboard starts with refresh, CD, runners and notify on, auto merge off", { skip }, async () => {
   const { browser, page } = await openDashboard();
   try {
-    for (const id of ["includeCd", "includeRunners", "autoRefresh", "autoMerge", "notifications"]) {
+    for (const id of ["includeCd", "includeRunners", "autoRefresh", "notifications"]) {
       assert.equal(await checked(page, id), true, `${id} should default to on`);
     }
+    assert.equal(await checked(page, "autoMerge"), false, "auto merge must be an explicit opt-in");
   } finally {
     await browser.close();
   }
 });
 
-test("the on-by-default switches reach the server on the first scan", { skip }, async () => {
+test("the default switches reach the server on the first scan", { skip }, async () => {
   const { browser, page, seen } = await openDashboard();
   try {
     await page.waitForFunction(() => document.querySelector("#account")?.textContent === "acme");
@@ -136,7 +135,7 @@ test("the on-by-default switches reach the server on the first scan", { skip }, 
     assert.match(seen.statusQueries[0], /includeRunners=1/);
 
     assert.ok(seen.autoMergeBodies.length >= 1, "auto merge was configured");
-    assert.equal(seen.autoMergeBodies[0].enabled, true);
+    assert.equal(seen.autoMergeBodies[0].enabled, false, "the server is not asked to merge by default");
   } finally {
     await browser.close();
   }
