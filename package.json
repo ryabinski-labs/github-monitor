@@ -44,7 +44,7 @@
     "node": ">=22"
   },
   "devDependencies": {
-    "axe-core": "^4.13.0",
+    "axe-core": "^4.14.1",
     "fast-check": "^4.10.3",
     "playwright": "^1.65.0"
   }
